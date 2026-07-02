@@ -141,7 +141,7 @@
 <div class="container">
     <div class="full-width">
         <h1 style="margin: 0 0 5px 0; font-size: 1.8rem;">ShiftIQ Fleet Monitor Console</h1>
-        <p style="color: var(--text-muted); margin: 0; font-size: 0.95rem;">GitHub Pages Decoupled Control Terminal.</p>
+        <p style="color: var(--text-muted); margin: 0; font-size: 0.95rem;">Direct console output stream and automatic log timing calculations.</p>
     </div>
 
     <div class="card">
@@ -156,7 +156,7 @@
             <button class="btn-snapshot" onclick="sendControl('/snapshot')">Snapshot File Output</button>
         </div>
 
-        <div id="terminal" class="terminal-box">Connecting to local rig metrics hook on http://localhost:8080...</div>
+        <div id="terminal" class="terminal-box">Connecting to local rig metrics hook...</div>
     </div>
 
     <div style="display: flex; flex-direction: column; gap: 25px;">
@@ -179,8 +179,8 @@
 </div>
 
 <script>
-    // Point directly to your active local execution thread
-    const API_BASE = "http://localhost:8080";
+    // Point directly to your active local execution thread or Ngrok address
+    const API_BASE = "http://127.0.0.1:8080";
 
     function parseAnsi(text) {
         let html = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -195,19 +195,31 @@
     }
 
     async function sendControl(endpoint) {
-        try { await fetch(API_BASE + endpoint); fetchUpdates(); } catch (e) { console.error("Control target failed", e); }
+        try { 
+            await fetch(API_BASE + endpoint, {
+                mode: 'cors',
+                headers: { "ngrok-skip-browser-warning": "true" }
+            }); 
+            fetchUpdates(); 
+        } catch (e) { console.error("Control instruction offline", e); }
     }
 
     async function fetchUpdates() {
         try {
-            const logRes = await fetch(API_BASE + '/logs');
+            const logRes = await fetch(API_BASE + '/logs', {
+                mode: 'cors',
+                headers: { "ngrok-skip-browser-warning": "true" }
+            });
             const logs = await logRes.json();
             const terminalEl = document.getElementById('terminal');
             
             terminalEl.innerHTML = logs.map(l => parseAnsi(l)).join('\n');
             terminalEl.scrollTop = terminalEl.scrollHeight;
 
-            const rankRes = await fetch(API_BASE + '/rankings');
+            const rankRes = await fetch(API_BASE + '/rankings', {
+                mode: 'cors',
+                headers: { "ngrok-skip-browser-warning": "true" }
+            });
             const data = await rankRes.json();
 
             const statusEl = document.getElementById('loop-status');
@@ -228,9 +240,9 @@
             ).join('') : '<tr><td colspan="3" style="color:var(--text-muted)">No metrics recorded today.</td></tr>';
 
         } catch (e) { 
-            document.getElementById('loop-status').textContent = "OFFLINE";
+            document.getElementById('loop-status').textContent = "SCRAPER OFFLINE";
             document.getElementById('loop-status').className = "loop-status status-off";
-            console.error("Local script offline", e); 
+            console.error("Local context script connection failure", e); 
         }
     }
 

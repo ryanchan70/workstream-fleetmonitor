@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 fleet_monitor.py
-Logs into fleet.shiftiq.us (password: workstream) and polls /api/fleet/status.
-Includes a lightweight embedded HTTP server to stream direct text dumps, 
-control loop state, and feed ranked timings to a clean web frontend.
+Logs into fleet.shiftiq.us and polls /api/fleet/status.
+Includes an isolated local-only server to stream terminal metrics securely.
+Features a re-activated CLI keyboard input listener and UI snapshot bindings.
 """
 
 import json
@@ -21,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 BASE_URL      = "https://fleet.shiftiq.us"
 PASSWORD      = "workstream"
 POLL_INTERVAL = 5          
-WEB_PORT      = 8080       # Access the API locally at http://localhost:8080
+WEB_PORT      = 8080       
 
 # ANSI Color Codes
 ANSI_BRIGHT_RED   = "\033[91m"
@@ -35,10 +35,6 @@ ANSI_RESET        = "\033[0m"
 # Formatting
 ANSI_BOLD         = "\033[1m"
 ANSI_UNDERLINE    = "\033[4m"
-ANSI_BLINK        = "\033[5m"
-ANSI_BG_RED       = "\033[41m"
-ANSI_BG_YELLOW    = "\033[43m"
-
 ANSI_REC          = f"\033[91m\033[1m\033[4m"
 ANSI_WARN_FMT     = f"\033[43m\033[30m\033[1m\033[4m\033[5m"
 ANSI_URGENT_FMT   = f"\033[41m\033[97m\033[1m\033[4m\033[5m"
@@ -127,18 +123,22 @@ def load_daily_totals():
             web_print(f"[{ts()}] ERROR  Could not scan log file for history: {e}")
 
 def fetch_and_log_tasks(http_session, hostname, label, fallback_op=None, fallback_task=None, fallback_dur=None):
+    """Fetches individual task metrics from a single Pi device."""
     today_str = get_date_str()
     op_filename = f"operator_sessions_{today_str}.txt"
     today_prefix = today_str.replace("-", "")
     success = False
 
     recordings_url = f"{BASE_URL}/proxy/{hostname}/recordings?embed=1"
-    try: http_session.get(recordings_url, timeout=10)
-    except Exception: pass
+    try: 
+        http_session.get(recordings_url, timeout=5)
+    except requests.RequestException: 
+        web_print(f"[{ts()}] {ANSI_YELLOW}WARN   Snapshot Timeout: {label} recordings page was unreachable.{ANSI_RESET}")
+        if fallback_dur is None: return
 
     api_url = f"{BASE_URL}/proxy/{hostname}/statusboard-api/mcap-sync/sessions?light=1&limit=100"
     try:
-        r = http_session.get(api_url, timeout=10)
+        r = http_session.get(api_url, timeout=5)
         if r.ok:
             data = r.json()
             groups = data if isinstance(data, list) else (data.get("session_groups") or data.get("sessions") or [])
@@ -147,10 +147,7 @@ def fetch_and_log_tasks(http_session, hostname, label, fallback_op=None, fallbac
                 name = str(rec.get("name", ""))
                 start_unix = rec.get("start_time_unix") or rec.get("mtime") or 0
                 try:
-                    from_unix_today = (
-                        start_unix > 0 and
-                        datetime.datetime.fromtimestamp(float(start_unix)).strftime("%Y-%m-%d") == today_str
-                    )
+                    from_unix_today = (start_unix > 0 and datetime.datetime.fromtimestamp(float(start_unix)).strftime("%Y-%m-%d") == today_str)
                 except Exception: from_unix_today = False
 
                 if not (name.startswith(today_prefix) or from_unix_today): continue
@@ -168,8 +165,10 @@ def fetch_and_log_tasks(http_session, hostname, label, fallback_op=None, fallbac
                         with open(op_filename, "a") as f:
                             f.write(f"[{ts()}] Operator: {op:<20} | Pi: {label:<18} | Task: {task:<25}{loc_str} | Session Duration: {format_time(dur)} ({dur:.2f}s)\n")
             success = True
-    except Exception as exc:
-        web_print(f"[{ts()}] DEBUG  Statusboard API failed for {label}: {exc}")
+        else:
+            web_print(f"[{ts()}] {ANSI_YELLOW}WARN   Snapshot Failed: {label} database API returned status {r.status_code}.{ANSI_RESET}")
+    except requests.RequestException as e:
+        web_print(f"[{ts()}] {ANSI_YELLOW}WARN   Snapshot Timeout: Could not retrieve target API records from {label} ({e}).{ANSI_RESET}")
 
     if not success and fallback_dur is not None:
         op   = clean_str(fallback_op)
@@ -191,7 +190,7 @@ def scrape_all_device_tasks(http_session):
         t = threading.Thread(target=fetch_and_log_tasks, args=(http_session, hostname, label), daemon=True)
         threads.append(t)
         t.start()
-    for t in threads: t.join(timeout=300)
+    for t in threads: t.join(timeout=10) # 10s combined parallel execution timeout window
 
 def sync_all_tasks(http_session, devices):
     web_print(f"[{ts()}] INFO   Syncing Operator Sessions from Completed Tasks tabs...")
@@ -237,7 +236,6 @@ def log_current_totals(reason: str):
             daily_totals[today_str] = {"total": 0, "by_pi": {}, "by_operator": {}}
             
         day_stats = daily_totals[today_str]
-        
         snap_total = day_stats["total"]
         snap_by_pi = dict(day_stats["by_pi"])
         snap_by_op = dict(day_stats["by_operator"])
@@ -280,7 +278,7 @@ def device_label(device: dict) -> str:
     return device.get("display_name") or device.get("hostname", "?")
 
 def verify_on_close(session: requests.Session):
-    web_print(f"[{ts()}] INFO   Starting granular verification of individual rows vs local history...")
+    web_print(f"[{ts()}] INFO   Starting granular verification of individual rows vs local history...", "sys")
     today_str = get_date_str()
     today_prefix = today_str.replace("-", "")
     log_filename = f"daily_recording_log_{today_str}.txt"
@@ -306,7 +304,7 @@ def verify_on_close(session: requests.Session):
         
         api_url = f"{BASE_URL}/proxy/{hostname}/statusboard-api/mcap-sync/sessions?light=1&limit=100"
         try:
-            r = session.get(api_url, timeout=10)
+            r = session.get(api_url, timeout=5)
             if r.ok:
                 data = r.json()
                 groups = data if isinstance(data, list) else (data.get("session_groups") or data.get("sessions") or [])
@@ -347,19 +345,17 @@ def verify_on_close(session: requests.Session):
                 f.write(f"[{ts()}] ===================================================\n\n")
         except Exception: pass
 
-# ── Embedded API Server (With CORS Fixes) ────────────────────────────────────
+# ── Embedded Local API Server ────────────────────────────────────────────────
 class EmbeddedUIServer(BaseHTTPRequestHandler):
     def log_message(self, format, *args): return 
     
     def end_headers(self):
-        # Allow requests from GitHub Pages
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'GET, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'X-Requested-With, Content-Type')
+        self.send_header('Access-Control-Allow-Headers', 'X-Requested-With, Content-Type, ngrok-skip-browser-warning')
         super().end_headers()
 
     def do_OPTIONS(self):
-        # Handle pre-flight checks from browser security engines
         self.send_response(200)
         self.end_headers()
 
@@ -379,17 +375,16 @@ class EmbeddedUIServer(BaseHTTPRequestHandler):
                 stats = daily_totals.get(today_str, {"by_pi": {}, "by_operator": {}})
                 pi_source = stats.get("ui_live_pi") if "ui_live_pi" in stats else stats.get("by_pi", {})
                 op_source = stats.get("ui_live_operator") if "ui_live_operator" in stats else stats.get("by_operator", {})
-                
                 pi_rank = [{"name": k, "duration": format_time(v)} for k, v in sorted(pi_source.items(), key=lambda x: x[1], reverse=True)]
                 op_rank = [{"name": k, "duration": format_time(v)} for k, v in sorted(op_source.items(), key=lambda x: x[1], reverse=True)]
             self.wfile.write(json.dumps({"pi": pi_rank, "operator": op_rank, "active": loop_active}).encode())
         elif self.path == '/start':
             loop_active = True
-            web_print(f"[{ts()}] SYSTEM  Loop tracking manually STARTED via GitHub Pages Control UI.")
+            web_print(f"[{ts()}] SYSTEM  Loop tracking manually STARTED via UI.")
             self.send_response(200); self.end_headers()
         elif self.path == '/stop':
             loop_active = False
-            web_print(f"[{ts()}] SYSTEM  {ANSI_BRIGHT_RED}Loop tracking manually STOPPED via GitHub Pages Control UI.{ANSI_RESET}")
+            web_print(f"[{ts()}] SYSTEM  {ANSI_BRIGHT_RED}Loop tracking manually STOPPED via UI.{ANSI_RESET}")
             self.send_response(200); self.end_headers()
         elif self.path == '/snapshot':
             log_current_totals("Web UI Trigger")
@@ -398,24 +393,80 @@ class EmbeddedUIServer(BaseHTTPRequestHandler):
             self.send_response(404); self.end_headers()
 
 def start_web_server():
-    server = HTTPServer(('0.0.0.0', WEB_PORT), EmbeddedUIServer)
+    server = HTTPServer(('127.0.0.1', WEB_PORT), EmbeddedUIServer)
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
+def execute_otp_flow(session: requests.Session, email: str) -> bool:
+    send_url = f"{BASE_URL}/api/auth/otp/send"
+    print(f"[{ts()}] INFO   Defaulting to OTP execution fallback. Requesting token code for: {email}...")
+    try:
+        r = session.post(send_url, json={"email": email}, timeout=10)
+        if not r.ok or not r.json().get("ok"):
+            print(f"[{ts()}] FATAL  Failed to send code sequence: {r.json().get('error', 'Unknown error')}")
+            return False
+    except Exception as e:
+        print(f"[{ts()}] FATAL  Network failure while dispatching code configuration rules: {e}")
+        return False
+
+    print("\n" + "="*70)
+    print(f" {ANSI_YELLOW}ATTENTION: Check your inbox for an email sent to {email}.{ANSI_RESET} ")
+    otp_code = input(" Enter the 6-digit verification fallback login code: ").strip()
+    print("="*70 + "\n")
+
+    if not otp_code or len(otp_code) != 6:
+        print(f"[{ts()}] FATAL  Invalid formatting token length pattern matches.")
+        return False
+
+    verify_url = f"{BASE_URL}/api/auth/otp/verify"
+    try:
+        r = session.post(verify_url, json={"email": email, "token": otp_code}, timeout=10)
+        if r.ok and r.json().get("ok"):
+            print(f"[{ts()}] SUCCESS Fully authorized with capture fleet infrastructure.")
+            return True
+        else:
+            print(f"[{ts()}] FATAL  Verification rejected: {r.json().get('error', 'Invalid token context')}")
+    except Exception as e:
+        print(f"[{ts()}] FATAL  Network error while verifying fallback values: {e}")
+    return False
+
 def login(session: requests.Session) -> bool:
-    try: resp = session.get(BASE_URL + "/", timeout=10, allow_redirects=True)
-    except requests.RequestException: return False
-    if resp.status_code == 200 and "device-grid" in resp.text: return True
-    soup = BeautifulSoup(resp.text, "html.parser")
-    form = soup.find("form")
-    if form is None:
-        session.auth = ("", PASSWORD)
-        return session.get(BASE_URL + "/", timeout=10).status_code == 200
-    action = form.get("action") or "/"
-    post_url = action if action.startswith("http") else BASE_URL + action
-    payload = {inp.get("name"): (PASSWORD if inp.get("type") == "password" else inp.get("value", "")) for inp in form.find_all("input") if inp.get("name")}
-    try: r = session.request((form.get("method") or "POST").upper(), post_url, data=payload, timeout=10, allow_redirects=True)
-    except requests.RequestException: return False
-    return r.status_code in range(200, 400)
+    try:
+        with open("secrets.json", "r") as sf:
+            secrets = json.load(sf)
+            email = secrets.get("email")
+            password = secrets.get("password")
+    except Exception:
+        print(f"[{ts()}] FATAL  Could not read secrets.json file architecture parameters.")
+        return False
+
+    if not email:
+        print(f"[{ts()}] FATAL  Email credential parameter is missing inside secrets.json configuration parameters.")
+        return False
+
+    print(f"[{ts()}] DEBUG  Initializing credential handshakes with {BASE_URL}...")
+    try:
+        session.get(BASE_URL + "/", timeout=10)
+    except requests.RequestException:
+        print(f"[{ts()}] FATAL  Unable to establish safe connections with target network layer.")
+        return False
+
+    pw_auth_url = f"{BASE_URL}/api/auth/password"
+    print(f"[{ts()}] INFO   Submitting authentication password parameters to database...")
+    try:
+        r = session.post(pw_auth_url, json={"email": email, "password": password or ""}, timeout=10)
+        res_data = r.json()
+        
+        if r.ok and res_data.get("ok"):
+            print(f"[{ts()}] SUCCESS Fully authorized with password infrastructure profile configuration rules.")
+            return True
+        else:
+            err_msg = res_data.get("error", "Invalid configuration token.")
+            print(f"[{ts()}] {ANSI_YELLOW}WARN   Password rejection matching detected: {err_msg}{ANSI_RESET}")
+            return execute_otp_flow(session, email)
+            
+    except Exception as e:
+        print(f"[{ts()}] WARN   Connection issue with password endpoints: {e}. Attempting OTP fallback flow rules...")
+        return execute_otp_flow(session, email)
 
 def poll(session: requests.Session) -> list[dict] | None:
     try: r = session.get(BASE_URL + "/api/fleet/status", timeout=10)
@@ -426,25 +477,33 @@ def poll(session: requests.Session) -> list[dict] | None:
 
 def start_key_listener():
     def _listener():
-        import sys
         if sys.platform == 'win32':
             import msvcrt
             while True:
                 try:
                     key = msvcrt.getwch()
                     if key in ('~', '`'): log_current_totals("Tilde Key Pressed")
+                    elif key == '\x03': import _thread; _thread.interrupt_main(); break
                 except Exception: pass
         else:
-            import tty, termios
+            import tty, termios, _thread
             try:
                 fd = sys.stdin.fileno()
                 old_settings = termios.tcgetattr(fd)
+            except Exception: return
+            try:
                 tty.setcbreak(fd)
                 while True:
                     ch = sys.stdin.read(1)
                     if ch in ('~', '`'): log_current_totals("Tilde Key Pressed")
+                    elif ch == '\x03': _thread.interrupt_main(); break
             except Exception: pass
-    threading.Thread(target=_listener, daemon=True).start()
+            finally:
+                try: termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                except Exception: pass
+
+    t = threading.Thread(target=_listener, daemon=True)
+    t.start()
 
 def run():
     global global_session
@@ -453,13 +512,13 @@ def run():
     session = global_session
 
     if not login(session):
-        web_print(f"[{ts()}] FATAL  Cannot authenticate. Exiting.")
+        print(f"[{ts()}] FATAL  Cannot authenticate sequence framework. Exiting.")
         sys.exit(1)
 
     load_daily_totals()
     start_web_server()
-    start_key_listener()
-    web_print(f"[{ts()}] SYSTEM  CORS API endpoint layer live on port {WEB_PORT}.")
+    start_key_listener() 
+    web_print(f"[{ts()}] SYSTEM  Localhost-only API core listening on port {WEB_PORT}.")
     
     prev_status: dict[str, str] = {}
     
