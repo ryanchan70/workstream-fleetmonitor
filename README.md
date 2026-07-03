@@ -39,3 +39,26 @@ you in for 12 hours.
 
 Press `` ` `` or `~` in the terminal running `fleet_monitor.py` at any time
 to force a snapshot of daily totals to disk.
+
+## Hosting on Vercel
+
+The `api/` directory contains a serverless port of the dashboard backend
+(same `index.html` frontend, auto-detected). Auth is fully stateless: the
+OTP-verified fleet.shiftiq.us cookies ride inside HMAC-signed tokens, so no
+database is required to sign in.
+
+Setup:
+
+1. Import the repo in Vercel (or `vercel deploy` from this directory).
+2. Set the `AUTH_SECRET` env var to a long random string
+   (`openssl rand -hex 32`). Required — tokens are signed with it.
+3. Optional but recommended: attach an Upstash Redis (Vercel KV) database.
+   The functions pick up `KV_REST_API_URL`/`KV_REST_API_TOKEN` automatically
+   and use it for the leaderboard carry-forward cache, observed-session
+   state, and the alert log. Without it, that state lives in warm function
+   memory only (best effort).
+
+Serverless limitations vs. running `fleet_monitor.py` locally: no daily
+`.txt` log files, no start/stop loop controls (hidden in the UI), and
+observed-session tracking only ticks while someone has the dashboard open —
+there is no always-on poller.

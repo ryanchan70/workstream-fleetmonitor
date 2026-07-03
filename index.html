@@ -319,7 +319,7 @@
             <h2 style="margin: 0; font-size: 1.2rem;">Live Terminal Text Dump</h2>
         </div>
 
-        <div class="controls-grid">
+        <div class="controls-grid" id="local-controls">
             <button class="btn-start" onclick="sendControl('/start')">Start Python Script</button>
             <button class="btn-stop" onclick="sendControl('/stop')">Stop Python Script</button>
             <button class="btn-snapshot" onclick="sendControl('/snapshot')">Snapshot File Output</button>
@@ -348,10 +348,14 @@
 </div>
 
 <script>
-    // Point directly to your active local execution thread or Ngrok address
-    const API_BASE = "http://127.0.0.1:8080";
+    // Local mode: page opened from disk or the dev static server -> talk to
+    // the embedded fleet_monitor.py API. Hosted mode (Vercel): same-origin
+    // serverless functions under /api.
+    const IS_LOCAL = location.protocol === 'file:' || ['127.0.0.1', 'localhost'].includes(location.hostname);
+    const API_BASE = IS_LOCAL ? "http://127.0.0.1:8080" : "/api";
     const TOKEN_KEY = "fleet_dashboard_token";
     let pollTimer = null;
+    let pendingToken = null;
 
     function authHeaders() {
         const token = localStorage.getItem(TOKEN_KEY);
@@ -386,6 +390,7 @@
                 errEl.textContent = data.error || 'Could not send verification code.';
                 return;
             }
+            pendingToken = data.pending || null;
             document.getElementById('auth-email-echo').textContent = email;
             document.getElementById('auth-step-email').classList.add('hidden');
             document.getElementById('auth-step-code').classList.remove('hidden');
@@ -411,7 +416,7 @@
                 method: 'POST',
                 mode: 'cors',
                 headers: { "Content-Type": "application/json", "ngrok-skip-browser-warning": "true" },
-                body: JSON.stringify({ email, code })
+                body: JSON.stringify({ email, code, pending: pendingToken })
             });
             const data = await res.json();
             if (!res.ok || !data.ok) {
@@ -447,6 +452,7 @@
         document.getElementById('dashboard').classList.remove('hidden');
         document.getElementById('session-email').textContent = email;
         document.getElementById('hide-warnings').checked = hideWarnings;
+        if (!IS_LOCAL) document.getElementById('local-controls').classList.add('hidden');
         if ("Notification" in window && Notification.permission === "default") {
             Notification.requestPermission();
         }
