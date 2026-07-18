@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
 fleet_monitor.py
-Polls the fleet.shiftiq.us JSON API for device/session status and serves a
-local-only dashboard (gated behind real email verification codes) that
-streams terminal metrics and per-Pi/operator timing rankings.
+Queries the fleet.shiftiq.us JSON API for device/session status and serves a
+local-only dashboard with live status updates and rig timings.
 """
 
 import json
@@ -16,6 +15,8 @@ import re
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
 
+import collections
+import secrets as _secrets
 from api_client import FleetAPIClient, FleetAPIError
 from auth import DashboardAuth
 
@@ -54,6 +55,89 @@ log_lock = threading.Lock()
 api_client: FleetAPIClient | None = None
 
 dashboard_auth = DashboardAuth()
+
+# ── Single-sign-on: auto-token generated when fleet.shiftiq.us login succeeds ─
+# The HTML page calls /auth/auto-token on load and gets in without a second OTP.
+_AUTO_TOKEN: str | None = None
+_AUTO_EMAIL: str | None = None
+
+def _setup_auto_token(email: str):
+    global _AUTO_TOKEN, _AUTO_EMAIL
+    _AUTO_TOKEN = _secrets.token_urlsafe(32)
+    _AUTO_EMAIL = email
+
+def _check_auto_token(token: str | None) -> str | None:
+    """Returns email if the token matches the machine auto-token, else None."""
+    if token and _AUTO_TOKEN and token == _AUTO_TOKEN:
+        return _AUTO_EMAIL
+    return None
+
+# ── Frame health history (rolling 2-hour window at 5-s poll rate) ─────────────
+_HEALTH_HISTORY: collections.deque = collections.deque(maxlen=1440)
+_health_lock = threading.Lock()
+
+# ── Persistent daily hours cache ──────────────────────────────────────────────
+# Survives restarts; keyed by YYYY-MM-DD, value in seconds (named pis only).
+_DAILY_HOURS_FILE = ".daily_hours_cache.json"
+_daily_hours_cache: dict[str, float] = {}
+_daily_hours_lock = threading.Lock()
+
+def _load_daily_hours_cache():
+    global _daily_hours_cache
+    try:
+        with open(_DAILY_HOURS_FILE) as f:
+            data = json.load(f)
+        with _daily_hours_lock:
+            _daily_hours_cache = {k: float(v) for k, v in data.items() if isinstance(v, (int, float))}
+        print(f"[{ts()}] DEBUG  Loaded daily hours cache: {len(_daily_hours_cache)} days")
+    except Exception:
+        pass
+
+def _save_daily_hours_cache():
+    with _daily_hours_lock:
+        snap = dict(_daily_hours_cache)
+    try:
+        tmp = _DAILY_HOURS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(snap, f, indent=2)
+        os.replace(tmp, _DAILY_HOURS_FILE)
+    except Exception as e:
+        pass
+
+def _flush_past_days_to_cache():
+    """Promotes completed days from daily_totals into _daily_hours_cache and saves.
+    Called during snapshot and on exit so hours aren't lost on restart."""
+    today = get_date_str()
+    updated = False
+    with log_lock:
+        for day, day_data in daily_totals.items():
+            if day == today:
+                continue  # today isn't finished — don't bake it in
+            src_pi = day_data.get("ui_live_pi") or day_data.get("by_pi", {})
+            day_s  = sum(v for k, v in src_pi.items() if not is_unnamed_pi(k)) if src_pi else 0
+            if day_s > 0:
+                with _daily_hours_lock:
+                    if _daily_hours_cache.get(day, 0) < day_s:
+                        _daily_hours_cache[day] = day_s
+                        updated = True
+    if updated:
+        _save_daily_hours_cache()
+
+def _record_health_snapshot(rigs: list[dict]):
+    """Called after each fleet poll. Appends avg/min frame health across
+    online recording rigs to the rolling history used by /stats."""
+    readings = [r["frame_health_pct"] for r in rigs
+                if r.get("frame_health_pct") is not None and r.get("online")]
+    if not readings:
+        return
+    avg_h = sum(readings) / len(readings)
+    min_h = min(readings)
+    with _health_lock:
+        _HEALTH_HISTORY.append({
+            "t": int(time.time() * 1000),  # ms epoch for JS
+            "avg": round(avg_h, 2),
+            "min": round(min_h, 2),
+        })
 
 # Web UI Tracking State
 loop_active = True
@@ -307,6 +391,88 @@ def extract_storage(device: dict) -> tuple[float | None, float | None]:
         free_pct = free_b / total_b * 100.0
     return free_gb, free_pct
 
+CPU_TEMP_WARN_C  = 75.0   # warn above this
+CPU_TEMP_CRIT_C  = 85.0   # critical above this
+SSD_TEMP_WARN_C  = 60.0
+SSD_TEMP_CRIT_C  = 70.0
+
+def extract_thermals(device: dict) -> dict:
+    """Pulls CPU temp (°C), fan speed (RPM or %), and SSD/NVMe temp (°C)
+    from whichever field names the rig firmware uses. All values optional."""
+    cpu_c = _pick_number(device, (
+        "cpu_temp_c", "cpu_temperature_c", "cpu_temperature", "cpu_temp",
+        "soc_temp_c", "soc_temperature", "temperature_cpu", "core_temp_c",
+    ))
+    # Some payloads nest thermals under a sub-dict
+    thermals = device.get("thermals") or device.get("thermal") or {}
+    if isinstance(thermals, dict):
+        if cpu_c is None:
+            cpu_c = _pick_number(thermals, ("cpu", "cpu_c", "soc", "core"))
+    # milli-celsius (common in Linux hwmon)
+    if cpu_c is not None and cpu_c > 1000:
+        cpu_c = cpu_c / 1000.0
+
+    fan_rpm = _pick_number(device, (
+        "fan_speed_rpm", "fan_rpm", "fan_speed", "fan1_rpm",
+        "cooling_fan_rpm", "fan_tach",
+    ))
+    if fan_rpm is None and isinstance(thermals, dict):
+        fan_rpm = _pick_number(thermals, ("fan_rpm", "fan", "fan1"))
+    fan_pct = None
+    if fan_rpm is None:
+        fan_pct = _pick_number(device, ("fan_percent", "fan_speed_percent", "fan_duty_pct"))
+
+    ssd_c = _pick_number(device, (
+        "ssd_temp_c", "nvme_temp_c", "disk_temp_c", "storage_temp_c",
+        "nvme_temperature", "ssd_temperature", "m2_temp_c",
+    ))
+    if ssd_c is None and isinstance(thermals, dict):
+        ssd_c = _pick_number(thermals, ("ssd", "nvme", "disk", "storage"))
+    if ssd_c is not None and ssd_c > 1000:
+        ssd_c = ssd_c / 1000.0
+
+    return {
+        "cpu_temp_c":  round(cpu_c, 1)  if cpu_c  is not None else None,
+        "fan_rpm":     round(fan_rpm)   if fan_rpm is not None else None,
+        "fan_pct":     round(fan_pct,1) if fan_pct is not None else None,
+        "ssd_temp_c":  round(ssd_c, 1) if ssd_c   is not None else None,
+    }
+
+def extract_upload_speed(device: dict) -> float | None:
+    """Upload speed in bytes/sec from whichever field the rig firmware uses.
+    Returns None if not available."""
+    bps = _pick_number(device, (
+        "upload_speed_bps", "upload_rate_bps", "upload_bytes_per_sec",
+        "network_upload_bps", "transfer_rate_bps", "mcap_upload_bps",
+        "sync_rate_bps", "uplink_bps",
+    ))
+    if bps is not None:
+        return bps
+    # MB/s field — convert
+    mbps = _pick_number(device, (
+        "upload_speed_mbps", "upload_rate_mbps", "transfer_rate_mbps",
+        "sync_rate_mbps",
+    ))
+    if mbps is not None:
+        return mbps * 1_000_000
+    # nested network/sync sub-dict
+    for sub_key in ("network", "sync", "transfer"):
+        sub = device.get(sub_key)
+        if isinstance(sub, dict):
+            v = _pick_number(sub, ("upload_bps", "upload_rate", "rate_bps", "bps"))
+            if v is not None:
+                return v
+    return None
+
+def format_speed(bps: float | None) -> str | None:
+    if bps is None:
+        return None
+    if bps >= 1_000_000:
+        return f"{bps/1_000_000:.1f} MB/s"
+    if bps >= 1_000:
+        return f"{bps/1_000:.0f} KB/s"
+    return f"{bps:.0f} B/s"
+
 def evaluate_rigs(devices: list[dict]) -> tuple[list[dict], list[dict]]:
     """Normalizes fleet status devices into rig cards + critical alerts."""
     rigs, alerts = [], []
@@ -319,6 +485,8 @@ def evaluate_rigs(devices: list[dict]) -> tuple[list[dict], list[dict]]:
         # storage from them, and never alert on them.
         health = extract_frame_health(d) if online else None
         free_gb, free_pct = extract_storage(d) if online else (None, None)
+        thermals = extract_thermals(d) if online else {"cpu_temp_c": None, "fan_rpm": None, "fan_pct": None, "ssd_temp_c": None}
+        upload_bps = extract_upload_speed(d) if online else None
         dur = float(d.get("recording_duration_s") or 0)
         critical = []
 
@@ -340,6 +508,21 @@ def evaluate_rigs(devices: list[dict]) -> tuple[list[dict], list[dict]]:
             alerts.append({"hostname": hostname, "rig": label, "kind": "storage",
                            "message": "Storage running low: " + detail})
 
+        cpu_c = thermals["cpu_temp_c"]
+        ssd_c = thermals["ssd_temp_c"]
+        if cpu_c is not None and cpu_c >= CPU_TEMP_CRIT_C:
+            critical.append("cpu_temp")
+            alerts.append({"hostname": hostname, "rig": label, "kind": "cpu_temp",
+                           "message": f"CPU temp critical: {cpu_c:.1f}°C"})
+        elif cpu_c is not None and cpu_c >= CPU_TEMP_WARN_C:
+            critical.append("cpu_temp_warn")
+            alerts.append({"hostname": hostname, "rig": label, "kind": "cpu_temp_warn",
+                           "message": f"CPU temp high: {cpu_c:.1f}°C"})
+        if ssd_c is not None and ssd_c >= SSD_TEMP_CRIT_C:
+            critical.append("ssd_temp")
+            alerts.append({"hostname": hostname, "rig": label, "kind": "ssd_temp",
+                           "message": f"SSD temp critical: {ssd_c:.1f}°C"})
+
         rigs.append({
             "hostname": hostname,
             "label": label,
@@ -352,6 +535,12 @@ def evaluate_rigs(devices: list[dict]) -> tuple[list[dict], list[dict]]:
             "frame_health_pct": health,
             "storage_free_gb": free_gb,
             "storage_free_pct": free_pct,
+            "cpu_temp_c": thermals["cpu_temp_c"],
+            "fan_rpm": thermals["fan_rpm"],
+            "fan_pct": thermals["fan_pct"],
+            "ssd_temp_c": thermals["ssd_temp_c"],
+            "upload_bps": upload_bps,
+            "upload_speed_label": format_speed(upload_bps),
             "critical": critical,
         })
     return rigs, alerts
@@ -561,10 +750,14 @@ def build_api_leaderboard(client: FleetAPIClient) -> dict | None:
             by_pi[label] = by_pi.get(label, 0.0) + dur
             by_op[op] = by_op.get(op, 0.0) + dur
 
-    def ranked(source: dict[str, float]) -> list[dict]:
-        return [{"name": k, "duration": format_time(v)} for k, v in sorted(source.items(), key=lambda x: x[1], reverse=True)]
+    def ranked(source: dict[str, float], hide_unnamed: bool = False) -> list[dict]:
+        return [
+            {"name": k, "duration": format_time(v)}
+            for k, v in sorted(source.items(), key=lambda x: x[1], reverse=True)
+            if not (hide_unnamed and is_unnamed_pi(k))
+        ]
 
-    return {"pi": ranked(by_pi), "operator": ranked(by_op), "source": "api"}
+    return {"pi": ranked(by_pi, hide_unnamed=True), "operator": ranked(by_op), "source": "api"}
 
 def _leaderboard_refresher():
     """Rebuilds the leaderboard in the background. The per-device fan-out can
@@ -585,6 +778,7 @@ def _leaderboard_refresher():
             with _leaderboard_lock:
                 _leaderboard_cache["ts"] = time.time()
                 _leaderboard_cache["data"] = data
+        _flush_past_days_to_cache()
         time.sleep(LEADERBOARD_CACHE_TTL)
 
 def get_api_leaderboard() -> dict | None:
@@ -597,6 +791,12 @@ def get_status(device: dict) -> str:
     if cs == "recording": return "recording"
     if (device.get("upload_queue") or 0) > 0: return "uploading"
     return cs or "idle"
+
+_UNNAMED_PI_RE = re.compile(r'^rpi\d*-[0-9a-f]{4}-[0-9a-f]{4}$', re.IGNORECASE)
+
+def is_unnamed_pi(label: str) -> bool:
+    """Returns True for default hostnames like rpi5-867a-7c29 that have no display name."""
+    return bool(_UNNAMED_PI_RE.match(label))
 
 def device_label(device: dict) -> str:
     return device.get("display_name") or device.get("hostname", "?")
@@ -689,7 +889,10 @@ class EmbeddedUIServer(BaseHTTPRequestHandler):
         return None
 
     def _require_auth(self):
-        email = dashboard_auth.check_session(self._bearer_token())
+        token = self._bearer_token()
+        # Accept the machine auto-token (generated at fleet.shiftiq.us login)
+        # so the local HTML page never needs a separate OTP sign-in.
+        email = _check_auto_token(token) or dashboard_auth.check_session(token)
         if not email:
             _send_json(self, 401, {"error": "authentication required"})
             return None
@@ -715,7 +918,15 @@ class EmbeddedUIServer(BaseHTTPRequestHandler):
             email = dashboard_auth.check_session(self._bearer_token())
             return _send_json(self, 200, {"authenticated": bool(email), "email": email})
 
-        if path not in ('/logs', '/rankings', '/devices', '/start', '/stop', '/snapshot'):
+        # ── Unauthenticated bootstrap endpoint ────────────────────────────
+        # Returns the machine auto-token so the HTML page can sign itself in
+        # without a second OTP flow. Only reachable on localhost.
+        if path == '/auth/auto-token':
+            if _AUTO_TOKEN:
+                return _send_json(self, 200, {"token": _AUTO_TOKEN, "email": _AUTO_EMAIL})
+            return _send_json(self, 503, {"error": "python not yet authenticated"})
+
+        if path not in ('/logs', '/rankings', '/devices', '/start', '/stop', '/snapshot', '/stats'):
             self.send_response(404); self.end_headers()
             return
         if self._require_auth() is None:
@@ -759,7 +970,46 @@ class EmbeddedUIServer(BaseHTTPRequestHandler):
             _send_json(self, 200, {"ok": True})
         elif path == '/snapshot':
             log_current_totals("Web UI Trigger")
+            _flush_past_days_to_cache()
             _send_json(self, 200, {"ok": True})
+        elif path == '/stats':
+            today_str = get_date_str()
+            with log_lock:
+                # Use ui_live_pi/ui_live_operator — same source as /rankings.
+                # Exclude unnamed rpi5-xxxx-xxxx hostnames from all totals.
+                today_stats = daily_totals.get(today_str, {"total": 0, "by_pi": {}, "by_operator": {}})
+                by_pi = {k: v for k, v in (today_stats.get("ui_live_pi") or today_stats.get("by_pi", {})).items()
+                         if not is_unnamed_pi(k)}
+                total_s = sum(by_pi.values())
+                # Hours by day — merge daily_totals with _daily_hours_cache for older days
+                merged_days: dict[str, float] = {}
+                for day, secs in _daily_hours_cache.items():
+                    merged_days[day] = secs
+                for day in sorted(daily_totals.keys()):
+                    day_data = daily_totals[day]
+                    src_pi = day_data.get("ui_live_pi") or day_data.get("by_pi", {})
+                    day_s  = sum(v for k, v in src_pi.items() if not is_unnamed_pi(k)) if src_pi else 0
+                    if day_s > 0:
+                        merged_days[day] = day_s
+                hours_by_day = [{"date": d, "hours": round(s / 3600, 3)}
+                                 for d, s in sorted(merged_days.items())]
+            # Frame health from last rig cache poll
+            dev_data = _rig_cache.get("data") or {}
+            rigs_now = dev_data.get("rigs", [])
+            fh_now   = [r["frame_health_pct"] for r in rigs_now
+                        if r.get("frame_health_pct") is not None and r.get("online")]
+            with _health_lock:
+                history = list(_HEALTH_HISTORY)
+            _send_json(self, 200, {
+                "total_hours_today":    round(total_s / 3600, 3),
+                "avg_frame_health_pct": round(sum(fh_now)/len(fh_now), 2) if fh_now else None,
+                "min_frame_health_pct": round(min(fh_now), 2) if fh_now else None,
+                "active_recording_rigs": sum(1 for r in rigs_now if r.get("status") == "recording"),
+                "total_rigs": len(rigs_now),
+                "hours_by_day": hours_by_day,
+                "frame_health_history": history[-360:],
+                "last_updated_ms": int(time.time() * 1000),
+            })
 
     def do_POST(self):
         path = urlparse(self.path).path
@@ -805,6 +1055,7 @@ def execute_otp_flow(email: str) -> bool:
 
     ok, err = api_client.verify_otp(email, otp_code)
     if ok:
+        _setup_auto_token(email)
         print(f"[{ts()}] SUCCESS Authenticated with fleet.shiftiq.us.")
         return True
     print(f"[{ts()}] FATAL  Verification rejected: {err}")
@@ -827,6 +1078,7 @@ def login() -> bool:
     print(f"[{ts()}] DEBUG  Authenticating with {api_client.base_url}...")
     ok, err = api_client.login_password(email, password or "")
     if ok:
+        _setup_auto_token(email)
         print(f"[{ts()}] SUCCESS Authenticated with fleet.shiftiq.us.")
         return True
 
@@ -874,6 +1126,7 @@ def run():
         print(f"[{ts()}] FATAL  Could not authenticate with fleet.shiftiq.us. Exiting.")
         sys.exit(1)
 
+    _load_daily_hours_cache()
     load_daily_totals()
     start_web_server()
     start_key_listener()
@@ -892,6 +1145,7 @@ def run():
 
         rigs, alerts = evaluate_rigs(devices)
         process_alert_transitions(alerts)
+        _record_health_snapshot(rigs)
 
         for d in devices:
             hostname = d.get("hostname", "")
@@ -923,3 +1177,4 @@ def run():
 if __name__ == "__main__":
     try: run()
     except KeyboardInterrupt: pass
+    finally: _flush_past_days_to_cache()
