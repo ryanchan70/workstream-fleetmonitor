@@ -1,9 +1,14 @@
 daily_recording_log_*.txt
 operator_sessions_*.txt
 *.txt
+!requirements.txt
 *.log
 secrets.json
+.dashboard_sessions.json
+.leaderboard_cache.json
 
 .DS_Store
 __pycache__/
 *.pyc
+.vercel
+.env*

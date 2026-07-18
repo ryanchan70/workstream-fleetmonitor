@@ -65,6 +65,7 @@
         }
 
         button:active { transform: scale(0.98); }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
         .btn-start { background-color: var(--accent-green); }
         .btn-start:hover { background-color: #059669; box-shadow: 0 0 12px rgba(16,185,129,0.3); }
         .btn-stop { background-color: var(--accent-red); }
@@ -134,23 +135,191 @@
             font-size: 0.8rem;
             color: var(--accent-blue);
         }
+
+        /* ── Live rig status grid ──────────────────────────────────────── */
+        .rig-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+            gap: 14px;
+            margin-top: 15px;
+        }
+        .rig-tile {
+            background-color: #0b0f19;
+            border: 1px solid #1f2937;
+            border-radius: 10px;
+            padding: 14px 16px;
+        }
+        .rig-tile.critical {
+            border-color: #ff2222;
+            background-color: rgba(255, 34, 34, 0.14);
+            animation: critical-pulse 1.2s ease-in-out infinite;
+        }
+        @keyframes critical-pulse {
+            0%, 100% { box-shadow: 0 0 4px rgba(255,34,34,0.5); }
+            50%       { box-shadow: 0 0 18px rgba(255,34,34,0.9); }
+        }
+        .rig-name {
+            font-weight: 700;
+            font-size: 0.95rem;
+            margin-bottom: 8px;
+        }
+        .rig-badge {
+            float: right;
+            font-size: 0.65rem;
+            font-weight: 700;
+            letter-spacing: 0.06em;
+            padding: 3px 7px;
+            border-radius: 5px;
+            text-transform: uppercase;
+        }
+        .badge-recording { background: rgba(239,68,68,0.2); color: #f87171; animation: critical-pulse 1.5s infinite; }
+        .badge-idle      { background: rgba(16,185,129,0.15); color: var(--accent-green); }
+        .badge-uploading { background: rgba(59,130,246,0.15); color: var(--accent-blue); }
+        .badge-offline   { background: rgba(156,163,175,0.15); color: var(--text-muted); }
+        .badge-other     { background: rgba(245,158,11,0.15); color: var(--accent-yellow); }
+        .rig-meta {
+            color: var(--text-muted);
+            font-size: 0.8rem;
+            line-height: 1.5;
+        }
+        .rig-stats {
+            font-family: 'Geist Mono', monospace;
+            font-size: 0.78rem;
+            margin-top: 8px;
+            color: #d1d5db;
+        }
+        .rig-alert {
+            margin-top: 8px;
+            font-size: 0.78rem;
+            font-weight: 700;
+            color: #ff3333;
+        }
+        .rig-filter {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 12px;
+        }
+        .rig-pill {
+            font-size: 0.75rem;
+            font-weight: 600;
+            padding: 4px 12px;
+            border-radius: 999px;
+            border: 1px solid #1f2937;
+            color: var(--text-muted);
+            cursor: pointer;
+            user-select: none;
+            transition: all 0.15s ease;
+        }
+        .rig-pill:hover { border-color: var(--accent-blue); }
+        .rig-pill.on {
+            background: rgba(59,130,246,0.15);
+            color: var(--accent-blue);
+            border-color: var(--accent-blue);
+        }
+        .toggle-label {
+            float: right;
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            font-weight: 400;
+            cursor: pointer;
+            user-select: none;
+            margin-left: 14px;
+        }
+
+        /* ── Auth gate ─────────────────────────────────────────────────── */
+        #auth-gate {
+            max-width: 420px;
+            margin: 80px auto;
+        }
+        #auth-gate label {
+            display: block;
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            margin-bottom: 6px;
+        }
+        #auth-gate input {
+            width: 100%;
+            box-sizing: border-box;
+            padding: 12px 14px;
+            font-size: 0.95rem;
+            font-family: 'Inter', sans-serif;
+            border: 1px solid #1f2937;
+            border-radius: 8px;
+            background-color: #0b0f19;
+            color: var(--text-main);
+            margin-bottom: 16px;
+        }
+        #auth-gate .btn-primary {
+            background-color: var(--accent-blue);
+            width: 100%;
+        }
+        #auth-gate .btn-primary:hover { background-color: #2563eb; }
+        #auth-error {
+            color: var(--accent-red);
+            font-size: 0.85rem;
+            margin-top: -8px;
+            margin-bottom: 12px;
+            min-height: 1em;
+        }
+        #auth-hint {
+            color: var(--text-muted);
+            font-size: 0.8rem;
+            margin-top: 12px;
+        }
+        .hidden { display: none !important; }
+        #logout-link {
+            float: right;
+            color: var(--text-muted);
+            font-size: 0.8rem;
+            cursor: pointer;
+            text-decoration: underline;
+        }
     </style>
 </head>
 <body>
 
-<div class="container">
+<div id="auth-gate" class="card">
+    <h1 style="margin: 0 0 5px 0; font-size: 1.4rem;">ShiftIQ Fleet Monitor</h1>
+    <p style="color: var(--text-muted); margin: 0 0 20px 0; font-size: 0.9rem;">Sign in with an authorized fleet.shiftiq.us email to view the dashboard.</p>
+
+    <div id="auth-step-email">
+        <label for="auth-email">Email</label>
+        <input id="auth-email" type="email" placeholder="you@example.com" autocomplete="email">
+        <div id="auth-error"></div>
+        <button class="btn-primary" id="auth-send-btn" onclick="requestCode()">Send verification code</button>
+    </div>
+
+    <div id="auth-step-code" class="hidden">
+        <label for="auth-code">6-digit verification code</label>
+        <input id="auth-code" type="text" inputmode="numeric" maxlength="6" placeholder="123456" autocomplete="one-time-code">
+        <div id="auth-code-error"></div>
+        <button class="btn-primary" id="auth-verify-btn" onclick="verifyCode()">Verify &amp; sign in</button>
+        <div id="auth-hint">Sent to <span id="auth-email-echo"></span>. Didn't get it? <a href="#" onclick="resetAuth(); return false;" style="color: var(--accent-blue);">Try a different email</a>.</div>
+    </div>
+</div>
+
+<div id="dashboard" class="container hidden">
     <div class="full-width">
+        <span id="logout-link" onclick="logout()">Sign out (<span id="session-email"></span>)</span>
         <h1 style="margin: 0 0 5px 0; font-size: 1.8rem;">ShiftIQ Fleet Monitor Console</h1>
-        <p style="color: var(--text-muted); margin: 0; font-size: 0.95rem;">Direct console output stream and automatic log timing calculations.</p>
+        <p style="color: var(--text-muted); margin: 0; font-size: 0.95rem;">Live API-backed status stream and automatic log timing calculations.</p>
+    </div>
+
+    <div class="card full-width">
+        <h2 style="margin: 0; font-size: 1.2rem;">Live Rig Status</h2>
+        <div id="rig-filter" class="rig-filter"></div>
+        <div id="rig-grid" class="rig-grid"><div style="color: var(--text-muted); font-size: 0.9rem;">Awaiting fleet status...</div></div>
     </div>
 
     <div class="card">
         <div style="margin-bottom: 15px; overflow: hidden;">
             <span id="loop-status" class="loop-status status-off">CONNECTING...</span>
+            <label class="toggle-label"><input type="checkbox" id="hide-warnings" onchange="toggleWarnings(this.checked)"> Hide warnings</label>
             <h2 style="margin: 0; font-size: 1.2rem;">Live Terminal Text Dump</h2>
         </div>
-        
-        <div class="controls-grid">
+
+        <div class="controls-grid" id="local-controls">
             <button class="btn-start" onclick="sendControl('/start')">Start Python Script</button>
             <button class="btn-stop" onclick="sendControl('/stop')">Stop Python Script</button>
             <button class="btn-snapshot" onclick="sendControl('/snapshot')">Snapshot File Output</button>
@@ -179,8 +348,266 @@
 </div>
 
 <script>
-    // Point directly to your active local execution thread or Ngrok address
-    const API_BASE = "http://127.0.0.1:8080";
+    // Local mode: page opened from disk or the dev static server -> talk to
+    // the embedded fleet_monitor.py API. Hosted mode (Vercel): same-origin
+    // serverless functions under /api.
+    const IS_LOCAL = location.protocol === 'file:' || ['127.0.0.1', 'localhost'].includes(location.hostname);
+    const API_BASE = IS_LOCAL ? "http://127.0.0.1:8080" : "/api";
+    const TOKEN_KEY = "fleet_dashboard_token";
+    let pollTimer = null;
+    let pendingToken = null;
+
+    function authHeaders() {
+        const token = localStorage.getItem(TOKEN_KEY);
+        return token ? { "Authorization": "Bearer " + token } : {};
+    }
+
+    function resetAuth() {
+        document.getElementById('auth-step-code').classList.add('hidden');
+        document.getElementById('auth-step-email').classList.remove('hidden');
+        document.getElementById('auth-error').textContent = '';
+        document.getElementById('auth-code-error').textContent = '';
+        document.getElementById('auth-code').value = '';
+    }
+
+    async function requestCode() {
+        const email = document.getElementById('auth-email').value.trim();
+        const errEl = document.getElementById('auth-error');
+        errEl.textContent = '';
+        if (!email) { errEl.textContent = 'Enter an email address.'; return; }
+
+        const btn = document.getElementById('auth-send-btn');
+        btn.disabled = true;
+        try {
+            const res = await fetch(API_BASE + '/auth/request-code', {
+                method: 'POST',
+                mode: 'cors',
+                headers: { "Content-Type": "application/json", "ngrok-skip-browser-warning": "true" },
+                body: JSON.stringify({ email })
+            });
+            const data = await res.json();
+            if (!res.ok || !data.ok) {
+                errEl.textContent = data.error || 'Could not send verification code.';
+                return;
+            }
+            pendingToken = data.pending || null;
+            document.getElementById('auth-email-echo').textContent = email;
+            document.getElementById('auth-step-email').classList.add('hidden');
+            document.getElementById('auth-step-code').classList.remove('hidden');
+            document.getElementById('auth-code').focus();
+        } catch (e) {
+            errEl.textContent = 'Could not reach the local dashboard server at ' + API_BASE + '.';
+        } finally {
+            btn.disabled = false;
+        }
+    }
+
+    async function verifyCode() {
+        const email = document.getElementById('auth-email').value.trim();
+        const code = document.getElementById('auth-code').value.trim();
+        const errEl = document.getElementById('auth-code-error');
+        errEl.textContent = '';
+        if (!code) { errEl.textContent = 'Enter the 6-digit code.'; return; }
+
+        const btn = document.getElementById('auth-verify-btn');
+        btn.disabled = true;
+        try {
+            const res = await fetch(API_BASE + '/auth/verify-code', {
+                method: 'POST',
+                mode: 'cors',
+                headers: { "Content-Type": "application/json", "ngrok-skip-browser-warning": "true" },
+                body: JSON.stringify({ email, code, pending: pendingToken })
+            });
+            const data = await res.json();
+            if (!res.ok || !data.ok) {
+                errEl.textContent = data.error || 'Invalid code.';
+                return;
+            }
+            localStorage.setItem(TOKEN_KEY, data.token);
+            enterDashboard(email);
+        } catch (e) {
+            errEl.textContent = 'Could not reach the local dashboard server at ' + API_BASE + '.';
+        } finally {
+            btn.disabled = false;
+        }
+    }
+
+    async function logout() {
+        try {
+            await fetch(API_BASE + '/auth/logout', {
+                method: 'POST',
+                mode: 'cors',
+                headers: { ...authHeaders(), "ngrok-skip-browser-warning": "true" }
+            });
+        } catch (e) { /* best-effort */ }
+        localStorage.removeItem(TOKEN_KEY);
+        if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+        document.getElementById('dashboard').classList.add('hidden');
+        document.getElementById('auth-gate').classList.remove('hidden');
+        resetAuth();
+    }
+
+    function enterDashboard(email) {
+        document.getElementById('auth-gate').classList.add('hidden');
+        document.getElementById('dashboard').classList.remove('hidden');
+        document.getElementById('session-email').textContent = email;
+        document.getElementById('hide-warnings').checked = hideWarnings;
+        if (!IS_LOCAL) document.getElementById('local-controls').classList.add('hidden');
+        if ("Notification" in window && Notification.permission === "default") {
+            Notification.requestPermission();
+        }
+        fetchUpdates();
+        if (!pollTimer) pollTimer = setInterval(fetchUpdates, 2000);
+    }
+
+    async function checkSession() {
+        const token = localStorage.getItem(TOKEN_KEY);
+        if (!token) return;
+        try {
+            const res = await fetch(API_BASE + '/auth/status', {
+                mode: 'cors',
+                headers: { ...authHeaders(), "ngrok-skip-browser-warning": "true" }
+            });
+            const data = await res.json();
+            if (data.authenticated) {
+                enterDashboard(data.email);
+            } else {
+                localStorage.removeItem(TOKEN_KEY);
+            }
+        } catch (e) { /* stay on the login screen if the local server is offline */ }
+    }
+
+    // ── Terminal warning filter ─────────────────────────────────────────
+    let hideWarnings = localStorage.getItem('fleet_hide_warnings') === '1';
+    let lastLogs = [];
+
+    function toggleWarnings(checked) {
+        hideWarnings = checked;
+        localStorage.setItem('fleet_hide_warnings', checked ? '1' : '0');
+        renderTerminal();
+    }
+
+    function renderTerminal() {
+        const terminalEl = document.getElementById('terminal');
+        const lines = hideWarnings ? lastLogs.filter(l => !l.includes('WARN')) : lastLogs;
+        terminalEl.innerHTML = lines.map(l => parseAnsi(l)).join('\n');
+        terminalEl.scrollTop = terminalEl.scrollHeight;
+    }
+
+    // ── Live rig grid + critical notifications ──────────────────────────
+    const notifiedAlerts = new Set();
+    let lastDevData = null;
+    let knownRigs = [];
+
+    // null = monitor all rigs; otherwise an array of monitored hostnames.
+    let monitoredRigs = null;
+    try { monitoredRigs = JSON.parse(localStorage.getItem('fleet_monitored_rigs')); } catch (e) {}
+
+    function isMonitored(hostname) {
+        return !Array.isArray(monitoredRigs) || monitoredRigs.includes(hostname);
+    }
+
+    function saveMonitored() {
+        if (monitoredRigs === null) localStorage.removeItem('fleet_monitored_rigs');
+        else localStorage.setItem('fleet_monitored_rigs', JSON.stringify(monitoredRigs));
+        if (lastDevData) renderRigs(lastDevData);
+    }
+
+    function monitorAll() {
+        // Toggles between select-all (null = monitor everything) and deselect-all.
+        monitoredRigs = Array.isArray(monitoredRigs) ? null : [];
+        saveMonitored();
+    }
+
+    function toggleRig(hostname) {
+        if (!Array.isArray(monitoredRigs)) monitoredRigs = knownRigs.map(r => r.hostname);
+        if (monitoredRigs.includes(hostname)) monitoredRigs = monitoredRigs.filter(h => h !== hostname);
+        else monitoredRigs.push(hostname);
+        if (monitoredRigs.length === knownRigs.length) monitoredRigs = null;
+        saveMonitored();
+    }
+
+    function renderFilter() {
+        const all = !Array.isArray(monitoredRigs);
+        const pills = ['<span class="rig-pill' + (all ? ' on' : '') + '" onclick="monitorAll()">All</span>'];
+        knownRigs.forEach(r => {
+            const on = all || monitoredRigs.includes(r.hostname);
+            pills.push('<span class="rig-pill' + (on ? ' on' : '') + '" onclick="toggleRig(\'' + esc(r.hostname) + '\')">' + esc(r.label) + '</span>');
+        });
+        document.getElementById('rig-filter').innerHTML = pills.join('');
+    }
+
+    function esc(s) {
+        return String(s ?? '').replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    }
+
+    function badgeClass(status) {
+        if (status === 'recording') return 'badge-recording';
+        if (status === 'idle') return 'badge-idle';
+        if (status === 'uploading') return 'badge-uploading';
+        if (status === 'offline') return 'badge-offline';
+        return 'badge-other';
+    }
+
+    function renderRigs(data) {
+        lastDevData = data;
+        const grid = document.getElementById('rig-grid');
+        if (!data.rigs || !data.rigs.length) {
+            grid.innerHTML = '<div style="color: var(--text-muted); font-size: 0.9rem;">No devices reported by the fleet API.</div>';
+            return;
+        }
+        knownRigs = data.rigs;
+        renderFilter();
+
+        const visible = data.rigs.filter(r => isMonitored(r.hostname));
+        if (!visible.length) {
+            grid.innerHTML = '<div style="color: var(--text-muted); font-size: 0.9rem;">No rigs selected — click a rig above or "All" to monitor.</div>';
+            return;
+        }
+        const alertsByRig = {};
+        (data.alerts || []).forEach(a => {
+            (alertsByRig[a.hostname] = alertsByRig[a.hostname] || []).push(a.message);
+        });
+        grid.innerHTML = visible.map(r => {
+            const crit = r.critical && r.critical.length > 0;
+            const stats = [];
+            if (r.status === 'offline') {
+                stats.push('Offline — no live metrics');
+            } else {
+                if (r.status === 'recording') stats.push('&#9201; ' + esc(r.duration_label));
+                if (r.frame_health_pct != null) stats.push('&#127902; ' + r.frame_health_pct.toFixed(1) + '%');
+                if (r.storage_free_gb != null && r.storage_free_pct != null) stats.push('&#128190; ' + r.storage_free_gb.toFixed(0) + ' GB (' + r.storage_free_pct.toFixed(0) + '%) free');
+                else if (r.storage_free_gb != null) stats.push('&#128190; ' + r.storage_free_gb.toFixed(0) + ' GB free');
+                else if (r.storage_free_pct != null) stats.push('&#128190; ' + r.storage_free_pct.toFixed(0) + '% free');
+            }
+            const meta = [];
+            if (r.operator && r.operator !== 'Unknown') meta.push('Op: ' + esc(r.operator));
+            if (r.task && r.task !== 'Unknown') meta.push('Task: ' + esc(r.task));
+            const alertLines = (alertsByRig[r.hostname] || []).map(m => '<div class="rig-alert">&#9888; ' + esc(m) + '</div>').join('');
+            return `<div class="rig-tile${crit ? ' critical' : ''}">
+                <div class="rig-name"><span class="rig-badge ${badgeClass(r.status)}">${esc(r.status)}</span>${esc(r.label)}</div>
+                <div class="rig-meta">${meta.join('<br>') || '<span style="opacity:.5">—</span>'}</div>
+                <div class="rig-stats">${stats.join(' &middot; ') || ''}</div>
+                ${alertLines}
+            </div>`;
+        }).join('');
+    }
+
+    function handleAlerts(alerts) {
+        const current = new Set();
+        (alerts || []).filter(a => isMonitored(a.hostname)).forEach(a => {
+            const key = a.hostname + '|' + a.kind;
+            current.add(key);
+            if (!notifiedAlerts.has(key)) {
+                notifiedAlerts.add(key);
+                if ("Notification" in window && Notification.permission === "granted") {
+                    new Notification('\u{1F534} CRITICAL: ' + a.rig, { body: a.message, tag: key });
+                }
+            }
+        });
+        // Re-arm notifications for alerts that have cleared.
+        [...notifiedAlerts].forEach(k => { if (!current.has(k)) notifiedAlerts.delete(k); });
+    }
 
     function parseAnsi(text) {
         let html = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -195,12 +622,13 @@
     }
 
     async function sendControl(endpoint) {
-        try { 
-            await fetch(API_BASE + endpoint, {
+        try {
+            const res = await fetch(API_BASE + endpoint, {
                 mode: 'cors',
-                headers: { "ngrok-skip-browser-warning": "true" }
-            }); 
-            fetchUpdates(); 
+                headers: { ...authHeaders(), "ngrok-skip-browser-warning": "true" }
+            });
+            if (res.status === 401) return logout();
+            fetchUpdates();
         } catch (e) { console.error("Control instruction offline", e); }
     }
 
@@ -208,18 +636,28 @@
         try {
             const logRes = await fetch(API_BASE + '/logs', {
                 mode: 'cors',
-                headers: { "ngrok-skip-browser-warning": "true" }
+                headers: { ...authHeaders(), "ngrok-skip-browser-warning": "true" }
             });
-            const logs = await logRes.json();
-            const terminalEl = document.getElementById('terminal');
-            
-            terminalEl.innerHTML = logs.map(l => parseAnsi(l)).join('\n');
-            terminalEl.scrollTop = terminalEl.scrollHeight;
+            if (logRes.status === 401) return logout();
+            lastLogs = await logRes.json();
+            renderTerminal();
+
+            const devRes = await fetch(API_BASE + '/devices', {
+                mode: 'cors',
+                headers: { ...authHeaders(), "ngrok-skip-browser-warning": "true" }
+            });
+            if (devRes.status === 401) return logout();
+            if (devRes.ok) {
+                const devData = await devRes.json();
+                renderRigs(devData);
+                handleAlerts(devData.alerts);
+            }
 
             const rankRes = await fetch(API_BASE + '/rankings', {
                 mode: 'cors',
-                headers: { "ngrok-skip-browser-warning": "true" }
+                headers: { ...authHeaders(), "ngrok-skip-browser-warning": "true" }
             });
+            if (rankRes.status === 401) return logout();
             const data = await rankRes.json();
 
             const statusEl = document.getElementById('loop-status');
@@ -231,23 +669,22 @@
                 statusEl.className = "loop-status status-off";
             }
 
-            document.getElementById('pi-rankings').innerHTML = data.pi.length ? data.pi.map((p, i) => 
+            document.getElementById('pi-rankings').innerHTML = data.pi.length ? data.pi.map((p, i) =>
                 `<tr><td>${i+1}</td><td><strong>${p.name}</strong></td><td style="text-align: right;"><span class="time-badge">${p.duration}</span></td></tr>`
             ).join('') : '<tr><td colspan="3" style="color:var(--text-muted)">No metrics recorded today.</td></tr>';
 
-            document.getElementById('operator-rankings').innerHTML = data.operator.length ? data.operator.map((o, i) => 
+            document.getElementById('operator-rankings').innerHTML = data.operator.length ? data.operator.map((o, i) =>
                 `<tr><td>${i+1}</td><td><strong>${o.name}</strong></td><td style="text-align: right;"><span class="time-badge">${o.duration}</span></td></tr>`
             ).join('') : '<tr><td colspan="3" style="color:var(--text-muted)">No metrics recorded today.</td></tr>';
 
-        } catch (e) { 
-            document.getElementById('loop-status').textContent = "SCRAPER OFFLINE";
+        } catch (e) {
+            document.getElementById('loop-status').textContent = "MONITOR OFFLINE";
             document.getElementById('loop-status').className = "loop-status status-off";
-            console.error("Local context script connection failure", e); 
+            console.error("Local context script connection failure", e);
         }
     }
 
-    setInterval(fetchUpdates, 2000);
-    fetchUpdates();
+    checkSession();
 </script>
 </body>
 </html>
