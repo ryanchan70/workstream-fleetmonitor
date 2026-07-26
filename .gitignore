@@ -3,7 +3,8 @@ operator_sessions_*.txt
 *.txt
 !requirements.txt
 *.log
-secrets.json
+*.json
+.*.json
 .dashboard_sessions.json
 .leaderboard_cache.json
 

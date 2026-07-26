@@ -2,7 +2,8 @@
 """
 fleet_monitor.py
 Queries the fleet.shiftiq.us JSON API for device/session status and serves a
-local-only dashboard with live status updates and rig timings.
+local-only dashboard with live status updates, rig timings, locations, task history,
+and push notifications for critical alerts.
 """
 
 import json
@@ -28,6 +29,10 @@ WEB_PORT = 8080
 FRAME_HEALTH_MIN_PCT = 95.0   # frame health below this while recording => critical
 STORAGE_MIN_FREE_PCT = 10.0   # free disk % below this => critical
 STORAGE_MIN_FREE_GB  = 50.0   # free disk GB below this => critical
+TEMP_OVERHEAT_C = 70.0        # CPU/SSD overheating threshold
+
+# Alert deduplication: don't spam same alert within 15 minutes
+ALERT_DEBOUNCE_SEC = 900
 
 # ANSI Color Codes
 ANSI_BRIGHT_RED   = "\033[91m"
@@ -54,6 +59,124 @@ logged_session_ids: set[str] = set()
 log_lock = threading.Lock()
 api_client: FleetAPIClient | None = None
 
+# ── Device locations & task history cache ─────────────────────────────────
+_device_locations: dict[str, str] = {}  # hostname -> "location_name"
+_completed_tasks: dict[str, list] = {}   # hostname -> [{"name": "", "op": "", "dur": s, "ts": unix}]
+_task_history_lock = threading.Lock()
+_LOCATIONS_FILE = ".device_locations.json"
+_TASK_HISTORY_FILE = ".task_history.json"
+
+# ── Alert history (prevent spam) ──────────────────────────────────────────
+_last_alert_ts: dict[str, float] = {}  # "hostname|kind" -> unix timestamp
+_alert_lock = threading.Lock()
+
+def _should_alert(hostname: str, kind: str) -> bool:
+    """Returns True if this alert hasn't fired in the last ALERT_DEBOUNCE_SEC seconds."""
+    key = f"{hostname}|{kind}"
+    now = time.time()
+    with _alert_lock:
+        last = _last_alert_ts.get(key, 0.0)
+        if now - last >= ALERT_DEBOUNCE_SEC:
+            _last_alert_ts[key] = now
+            return True
+    return False
+
+def is_weekend(date_str: str) -> bool:
+    """Returns True if date_str (YYYY-MM-DD) is Saturday or Sunday."""
+    try:
+        d = datetime.datetime.strptime(date_str, "%Y-%m-%d")
+        return d.weekday() >= 5  # 5=Sat, 6=Sun
+    except Exception:
+        return False
+
+def _load_locations():
+    global _device_locations
+    try:
+        with open(_LOCATIONS_FILE) as f:
+            _device_locations = json.load(f)
+        web_print(f"[{ts()}] DEBUG  Loaded {len(_device_locations)} device locations.")
+    except Exception:
+        pass
+
+def _save_locations():
+    try:
+        tmp = _LOCATIONS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(_device_locations, f, indent=2)
+        os.replace(tmp, _LOCATIONS_FILE)
+    except Exception as e:
+        web_print(f"[{ts()}] ERROR  Failed to save locations: {e}")
+
+def _load_task_history():
+    """Loads the cached task history, dropping legacy entries written before
+    sessions carried a real start time / task label. Those older records
+    rendered as 'Invalid Date — op / 20260619_132103'; discarding them lets
+    the next backfill rebuild them correctly from the session cache."""
+    global _completed_tasks
+    try:
+        with open(_TASK_HISTORY_FILE) as f:
+            data = json.load(f)
+        dropped = 0
+        cleaned: dict[str, list] = {}
+        for k, v in data.items():
+            if not isinstance(v, list):
+                continue
+            keep = []
+            for t in v:
+                if not isinstance(t, dict):
+                    continue
+                # Legacy record: no start_time, or a task that is really just
+                # the raw session folder name (YYYYMMDD_HHMMSS).
+                task = str(t.get("task") or "")
+                if not t.get("start_time") or re.match(r"^\d{8}_\d{6}", task):
+                    dropped += 1
+                    continue
+                keep.append(t)
+            if keep:
+                cleaned[k] = keep
+        with _task_history_lock:
+            _completed_tasks = cleaned
+        n = sum(len(v) for v in _completed_tasks.values())
+        msg = f"[{ts()}] DEBUG  Loaded {len(_completed_tasks)} Pi(s), {n} task(s) total."
+        if dropped:
+            msg += f" Dropped {dropped} legacy record(s); backfill will rebuild them."
+        web_print(msg)
+    except Exception:
+        pass
+
+def _save_task_history():
+    with _task_history_lock:
+        snap = dict(_completed_tasks)
+    try:
+        tmp = _TASK_HISTORY_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(snap, f, indent=2)
+        os.replace(tmp, _TASK_HISTORY_FILE)
+    except Exception:
+        pass
+
+def _archive_completed_task(hostname: str, label: str, operator: str, task: str, duration_s: float, start_time_unix: float = None):
+    """Cache a completed task to the persistent history."""
+    if start_time_unix is None:
+        start_time_unix = time.time() - duration_s  # estimate if not provided
+
+    with _task_history_lock:
+        if hostname not in _completed_tasks:
+            _completed_tasks[hostname] = []
+
+        # Truncate task name to 20 chars
+        task_short = task[:20] if task else "Unknown"
+
+        _completed_tasks[hostname].append({
+            "label": label,
+            "operator": operator,
+            "task": task_short,
+            "duration_s": duration_s,
+            "start_time": int(start_time_unix),
+            "_session_id": f"{label}|{operator}|{task}|{duration_s}|{int(start_time_unix)}"
+        })
+    _save_task_history()
+
 dashboard_auth = DashboardAuth()
 
 # ── Single-sign-on: auto-token generated when fleet.shiftiq.us login succeeds ─
@@ -75,8 +198,32 @@ def _check_auto_token(token: str | None) -> str | None:
 # ── Frame health history (rolling 2-hour window at 5-s poll rate) ─────────────
 _HEALTH_HISTORY: collections.deque = collections.deque(maxlen=1440)
 _health_lock = threading.Lock()
+_HEALTH_HISTORY_FILE = ".frame_health_cache.json"
+_health_save_counter = 0   # save every 60 entries (~5 min at 5-s poll)
 
-# ── Persistent daily hours cache ──────────────────────────────────────────────
+def _load_health_history():
+    try:
+        with open(_HEALTH_HISTORY_FILE) as f:
+            entries = json.load(f)
+        with _health_lock:
+            for e in entries[-1440:]:
+                _HEALTH_HISTORY.append(e)
+        print(f"[{ts()}] DEBUG  Loaded {len(entries)} frame-health history entries.")
+    except Exception:
+        pass
+
+def _save_health_history():
+    with _health_lock:
+        snap = list(_HEALTH_HISTORY)
+    try:
+        tmp = _HEALTH_HISTORY_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(snap[-1440:], f)
+        os.replace(tmp, _HEALTH_HISTORY_FILE)
+    except Exception:
+        pass
+
+# ── Persistent daily hours cache ──────────────────────────────────────────
 # Survives restarts; keyed by YYYY-MM-DD, value in seconds (named pis only).
 _DAILY_HOURS_FILE = ".daily_hours_cache.json"
 _daily_hours_cache: dict[str, float] = {}
@@ -123,9 +270,263 @@ def _flush_past_days_to_cache():
     if updated:
         _save_daily_hours_cache()
 
+# ── Persistent per-Pi session cache (ALL days, not trimmed to today) ─────────
+# Unlike _device_sessions_cache (today only, in-memory-refreshed each cycle),
+# this holds every session ever fetched for every named Pi, merged by session
+# id, and survives restarts. It is the durable source used to (a) speed up
+# backfill on subsequent runs and (b) keep counting a Pi's time in daily
+# totals even after it goes offline and can no longer be reached directly.
+_PI_SESSION_CACHE_FILE = ".pi_session_cache.json"
+_pi_session_cache: dict[str, dict] = {}   # hostname -> {"label":.., "sessions": {sid: {...}}}
+_pi_session_cache_lock = threading.Lock()
+
+def _load_pi_session_cache():
+    global _pi_session_cache
+    try:
+        with open(_PI_SESSION_CACHE_FILE) as f:
+            data = json.load(f)
+        with _pi_session_cache_lock:
+            _pi_session_cache = data
+        n = sum(len(v.get("sessions", {})) for v in data.values())
+        print(f"[{ts()}] DEBUG  Loaded per-Pi session cache: {len(data)} pi(s), {n} session(s).")
+    except Exception:
+        pass
+
+def _save_pi_session_cache():
+    with _pi_session_cache_lock:
+        snap = _pi_session_cache
+    try:
+        tmp = _PI_SESSION_CACHE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(snap, f)
+        os.replace(tmp, _PI_SESSION_CACHE_FILE)
+    except Exception:
+        pass
+
+def _merge_pi_sessions(hostname: str, label: str, sessions: list[dict]) -> bool:
+    """Merges freshly-fetched sessions into the persistent per-Pi cache, keyed
+    by session id so re-fetches never duplicate. Never deletes old sessions —
+    this is exactly what lets an offline Pi's history keep counting.
+    Returns True if anything new was added."""
+    changed = False
+    with _pi_session_cache_lock:
+        entry = _pi_session_cache.setdefault(hostname, {"label": label, "sessions": {}})
+        entry["label"] = label
+        for rec in sessions:
+            sid = rec.get("id") or rec.get("session_uuid") or f"{label}|{rec.get('name')}"
+            dur = float(rec.get("duration_s") or 0)
+            if dur <= 0:
+                continue
+            existing = entry["sessions"].get(sid)
+            if existing is None or existing.get("duration_s", 0) != dur or "start_unix" not in existing:
+                entry["sessions"][sid] = {
+                    "date": _session_date(rec),
+                    "duration_s": dur,
+                    "operator": clean_str(rec.get("operator")),
+                    "name": rec.get("name"),
+                    # Task label + real start timestamp. Without these the task
+                    # history can only fall back to the raw folder name
+                    # (20260619_132103) and has no date to render.
+                    "task": clean_str(rec.get("task")),
+                    "start_unix": _session_start_unix(rec),
+                }
+                changed = True
+    return changed
+
+def _pi_cached_day_total(hostname: str, date_str: str) -> float:
+    """Sums this Pi's cached session durations for a specific date."""
+    with _pi_session_cache_lock:
+        entry = _pi_session_cache.get(hostname)
+        if not entry:
+            return 0.0
+        return sum(s["duration_s"] for s in entry["sessions"].values() if s.get("date") == date_str)
+
+def _pi_cached_label(hostname: str) -> str | None:
+    with _pi_session_cache_lock:
+        entry = _pi_session_cache.get(hostname)
+        return entry.get("label") if entry else None
+
+
+def _session_start_unix(rec: dict) -> int | None:
+    """Derives the session's START time as a unix timestamp.
+
+    Prefers the API's own start_time_unix/mtime. Falls back to parsing the
+    session folder name, which is formatted YYYYMMDD_HHMMSS (e.g.
+    20260619_132103) — that name is often the ONLY time information a
+    backfilled session carries."""
+    start_unix = rec.get("start_time_unix") or rec.get("mtime") or 0
+    if start_unix:
+        try:
+            return int(float(start_unix))
+        except Exception:
+            pass
+    name = str(rec.get("name", ""))
+    m = re.match(r"^(\d{8})_(\d{6})", name)
+    if m:
+        try:
+            dt = datetime.datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+            return int(dt.timestamp())
+        except Exception:
+            pass
+    return None
+
+
+def _session_date(rec: dict) -> str | None:
+    """Derives YYYY-MM-DD from a session record via folder name or unix timestamp."""
+    name = str(rec.get("name", ""))
+    if len(name) >= 8 and name[:8].isdigit():
+        raw = name[:8]
+        return f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}"
+    start_unix = rec.get("start_time_unix") or rec.get("mtime") or 0
+    if start_unix:
+        try:
+            return datetime.datetime.fromtimestamp(float(start_unix)).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    return None
+
+
+def backfill_daily_hours(client: "FleetAPIClient"):
+    """Fetches the FULL session history for every named device, merges it
+    into the persistent per-Pi session cache (_pi_session_cache), and
+    recomputes _daily_hours_cache for all past days from that cache — not
+    just from what was fetched this cycle. This means a Pi that has since
+    gone offline still contributes its previously-cached sessions to the
+    daily totals. Runs on startup and every 5 minutes thereafter."""
+    global _last_backfill_message
+    devices = client.get_fleet_status()
+    if not devices:
+        return
+
+    results: dict[str, tuple[str, list]] = {}
+    failed_502: list[str] = []
+    failed_other: list[tuple[str, str]] = []
+    results_lock = threading.Lock()
+
+    def _fetch(hostname: str, label: str):
+        try:
+            groups = client.get_device_sessions(hostname)
+            with results_lock:
+                results[hostname] = (label, groups)
+        except Exception as e:
+            msg = str(e)
+            with results_lock:
+                if "502" in msg:
+                    failed_502.append(label)
+                else:
+                    failed_other.append((label, msg))
+
+    threads = []
+    named_hosts: list[tuple[str, str]] = []
+    for d in devices:
+        hostname = d.get("hostname")
+        if not hostname:
+            continue
+        label = device_label(d)
+        if is_unnamed_pi(label):
+            continue   # never count anonymous pis
+        named_hosts.append((hostname, label))
+        t = threading.Thread(target=_fetch, args=(hostname, label), daemon=True)
+        threads.append(t); t.start()
+    for t in threads:
+        t.join(timeout=45)
+
+    # ── Merge freshly-fetched sessions into the persistent cache ───────────────
+    any_new = False
+    for hostname, (label, groups) in results.items():
+        if _merge_pi_sessions(hostname, label, groups or []):
+            any_new = True
+    if any_new:
+        _save_pi_session_cache()
+
+    # ── Recompute all_by_day from the FULL persistent cache (covers Pis that ──
+    # are currently offline and weren't in `results` this cycle at all).
+    today = get_date_str()
+    all_by_day: dict[str, float] = {}
+    with _pi_session_cache_lock:
+        cache_snapshot = {h: dict(v) for h, v in _pi_session_cache.items()}
+    for hostname, entry in cache_snapshot.items():
+        label = entry.get("label", hostname)
+        if is_unnamed_pi(label):
+            continue
+        for sess in entry.get("sessions", {}).values():
+            date_str = sess.get("date")
+            if not date_str or date_str == today:
+                continue   # today is handled live by the leaderboard
+            if is_weekend(date_str):
+                continue   # skip weekends
+            dur = sess.get("duration_s", 0)
+            if dur > 0:
+                all_by_day[date_str] = all_by_day.get(date_str, 0.0) + dur
+
+    updated = False
+    with _daily_hours_lock:
+        for day, total_s in all_by_day.items():
+            if total_s > _daily_hours_cache.get(day, 0):
+                _daily_hours_cache[day] = total_s
+                updated = True
+
+    if updated:
+        _save_daily_hours_cache()
+
+    # ── Backfill task history from session cache ─────────────────────────────
+    # Add all cached sessions to task history for later review
+    with _pi_session_cache_lock:
+        cache_snapshot = {h: dict(v) for h, v in _pi_session_cache.items()}
+    with _task_history_lock:
+        for hostname, entry in cache_snapshot.items():
+            label = entry.get("label", hostname)
+            if hostname not in _completed_tasks:
+                _completed_tasks[hostname] = []
+            existing_sids = {t.get("_session_id") for t in _completed_tasks[hostname]}
+            for sid, sess in entry.get("sessions", {}).items():
+                if sid not in existing_sids:
+                    # Real task label ("First aid"), NOT the session folder
+                    # name. Only fall back to the folder name when the API
+                    # genuinely gave us no task for this session.
+                    task_name = sess.get("task")
+                    if not task_name or task_name == "Unknown":
+                        task_name = sess.get("name") or "Unknown"
+                    task_short = str(task_name)[:20]
+
+                    # Real start time, parsed from the API field or the
+                    # YYYYMMDD_HHMMSS folder name — never "now", which is
+                    # what produced Invalid Date / wrong timestamps.
+                    start_unix = sess.get("start_unix")
+                    if not start_unix:
+                        start_unix = _session_start_unix({"name": sess.get("name")})
+
+                    _completed_tasks[hostname].append({
+                        "label": label,
+                        "operator": sess.get("operator", "Unknown"),
+                        "task": task_short,
+                        "duration_s": sess.get("duration_s", 0),
+                        "start_time": start_unix,   # may be None -> UI shows "—"
+                        "_session_id": sid
+                    })
+    _save_task_history()
+
+    # ── Exactly ONE line per run, summarizing everything ────────────────────
+    n = len(all_by_day)
+    n_offline_cached = sum(1 for h, _ in named_hosts if h not in results and h in cache_snapshot)
+    fail_bits = []
+    if failed_502:
+        fail_bits.append(f"{len(failed_502)} 502'd ({', '.join(failed_502)})")
+    if failed_other:
+        fail_bits.append(f"{len(failed_other)} failed ({', '.join(l for l, _ in failed_other)})")
+    fail_summary = f", {'; '.join(fail_bits)}" if fail_bits else ""
+    message = (f"[{ts()}] INFO   Backfill — {n} past day(s) totaled, "
+               f"{n_offline_cached} Pi(s) from cache while unreachable, "
+               f"cache {'updated' if updated else 'unchanged'}{fail_summary}.")
+    if message != _last_backfill_message:
+        web_print(message)
+        _last_backfill_message = message
+
+
 def _record_health_snapshot(rigs: list[dict]):
     """Called after each fleet poll. Appends avg/min frame health across
-    online recording rigs to the rolling history used by /stats."""
+    all ONLINE rigs that report a frame_health_pct, to the rolling history."""
+    global _health_save_counter
     readings = [r["frame_health_pct"] for r in rigs
                 if r.get("frame_health_pct") is not None and r.get("online")]
     if not readings:
@@ -134,10 +535,13 @@ def _record_health_snapshot(rigs: list[dict]):
     min_h = min(readings)
     with _health_lock:
         _HEALTH_HISTORY.append({
-            "t": int(time.time() * 1000),  # ms epoch for JS
+            "t": int(time.time() * 1000),
             "avg": round(avg_h, 2),
             "min": round(min_h, 2),
         })
+    _health_save_counter += 1
+    if _health_save_counter % 60 == 0:
+        _save_health_history()
 
 # Web UI Tracking State
 loop_active = True
@@ -346,7 +750,7 @@ def session_is_today(rec: dict, today_str: str) -> bool:
     except Exception:
         return False
 
-# ── Live rig status & critical alerts ────────────────────────────────────────
+# ── Live rig status & critical alerts ────────────────────────────────────
 RIG_CACHE_TTL = 5
 _rig_cache: dict = {"ts": 0.0, "data": None}
 _rig_lock = threading.Lock()
@@ -488,40 +892,53 @@ def evaluate_rigs(devices: list[dict]) -> tuple[list[dict], list[dict]]:
         thermals = extract_thermals(d) if online else {"cpu_temp_c": None, "fan_rpm": None, "fan_pct": None, "ssd_temp_c": None}
         upload_bps = extract_upload_speed(d) if online else None
         dur = float(d.get("recording_duration_s") or 0)
+        location = _device_locations.get(hostname, "")
         critical = []
 
+        # ── Generate alerts ──────────────────────────────────────────────────
         if status == "recording" and health is not None and health < FRAME_HEALTH_MIN_PCT:
-            critical.append("frame_health")
-            alerts.append({"hostname": hostname, "rig": label, "kind": "frame_health",
-                           "message": f"Frame health {health:.1f}% (below {FRAME_HEALTH_MIN_PCT:.0f}%)"})
+            if _should_alert(hostname, "frame_health"):
+                critical.append("frame_health")
+                alerts.append({"hostname": hostname, "rig": label, "kind": "frame_health",
+                               "message": f"Frame health {health:.1f}% (below {FRAME_HEALTH_MIN_PCT:.0f}%)"})
 
         low_gb  = free_gb is not None and free_gb < STORAGE_MIN_FREE_GB
         low_pct = free_pct is not None and free_pct < STORAGE_MIN_FREE_PCT
         if low_gb or low_pct:
-            if free_gb is not None and free_pct is not None:
-                detail = f"{free_gb:.0f} GB ({free_pct:.0f}%) free"
-            elif free_gb is not None:
-                detail = f"{free_gb:.0f} GB free"
-            else:
-                detail = f"{free_pct:.0f}% free"
-            critical.append("storage")
-            alerts.append({"hostname": hostname, "rig": label, "kind": "storage",
-                           "message": "Storage running low: " + detail})
+            if _should_alert(hostname, "storage"):
+                if free_gb is not None and free_pct is not None:
+                    detail = f"{free_gb:.0f} GB ({free_pct:.0f}%) free"
+                elif free_gb is not None:
+                    detail = f"{free_gb:.0f} GB free"
+                else:
+                    detail = f"{free_pct:.0f}% free"
+                critical.append("storage")
+                alerts.append({"hostname": hostname, "rig": label, "kind": "storage",
+                               "message": "Storage running low: " + detail})
 
         cpu_c = thermals["cpu_temp_c"]
         ssd_c = thermals["ssd_temp_c"]
         if cpu_c is not None and cpu_c >= CPU_TEMP_CRIT_C:
-            critical.append("cpu_temp")
-            alerts.append({"hostname": hostname, "rig": label, "kind": "cpu_temp",
-                           "message": f"CPU temp critical: {cpu_c:.1f}°C"})
+            if _should_alert(hostname, "cpu_temp"):
+                critical.append("cpu_temp")
+                alerts.append({"hostname": hostname, "rig": label, "kind": "cpu_temp",
+                               "message": f"CPU temp critical: {cpu_c:.1f}°C"})
         elif cpu_c is not None and cpu_c >= CPU_TEMP_WARN_C:
-            critical.append("cpu_temp_warn")
-            alerts.append({"hostname": hostname, "rig": label, "kind": "cpu_temp_warn",
-                           "message": f"CPU temp high: {cpu_c:.1f}°C"})
+            if _should_alert(hostname, "cpu_temp_warn"):
+                critical.append("cpu_temp_warn")
+                alerts.append({"hostname": hostname, "rig": label, "kind": "cpu_temp_warn",
+                               "message": f"CPU temp high: {cpu_c:.1f}°C"})
         if ssd_c is not None and ssd_c >= SSD_TEMP_CRIT_C:
-            critical.append("ssd_temp")
-            alerts.append({"hostname": hostname, "rig": label, "kind": "ssd_temp",
-                           "message": f"SSD temp critical: {ssd_c:.1f}°C"})
+            if _should_alert(hostname, "ssd_temp"):
+                critical.append("ssd_temp")
+                alerts.append({"hostname": hostname, "rig": label, "kind": "ssd_temp",
+                               "message": f"SSD temp critical: {ssd_c:.1f}°C"})
+
+        # Recording stopped alert
+        if status in ("idle", "uploading") and hostname in recording_cache:
+            if _should_alert(hostname, "recording_stopped"):
+                alerts.append({"hostname": hostname, "rig": label, "kind": "recording_stopped",
+                               "message": f"Pi stopped recording"})
 
         rigs.append({
             "hostname": hostname,
@@ -530,6 +947,7 @@ def evaluate_rigs(devices: list[dict]) -> tuple[list[dict], list[dict]]:
             "online": online,
             "operator": clean_str(d.get("operator")),
             "task": clean_str(d.get("task")),
+            "location": location,
             "recording_duration_s": dur,
             "duration_label": format_time(dur),
             "frame_health_pct": health,
@@ -595,11 +1013,36 @@ _leaderboard_lock = threading.Lock()
 # one build makes operators' totals collapse — so failures fall back to the
 # last data that device did return. Persisted to disk so restarts keep it.
 _device_sessions_cache: dict[str, list[dict]] = {}
-# Sessions this monitor observed itself via fleet-status transitions
-# (recording -> stopped) for devices whose proxy is unreachable. Superseded
-# and discarded once the device's own session list is fetchable again.
-_observed_sessions: dict[str, list[dict]] = {}
-_live_tracker: dict[str, dict] = {}   # hostname -> {op, dur, date, label}
+
+# Self-tracked recording time per device, as an idempotent running total —
+# NOT a growing list of "finalized session" events. Re-observing the same
+# ongoing recording (e.g. after a Pi flickers offline and reconnects) can
+# only raise `cur_dur` via max(), it can never add a second entry for time
+# already counted. A segment is only "banked" (permanently added) when the
+# operator changes or the duration counter resets low, which is the actual
+# signal that a *new* recording began. This is what prevents the previous
+# design's bug where repeated offline/online flicker during one continuous
+# recording caused the observed total to climb forever and never settle.
+#   { hostname: {"date": "YYYY-MM-DD", "banked_s": float, "cur_dur": float,
+#                "cur_op": str, "label": str} }
+_observed_totals: dict[str, dict] = {}
+
+# Prevents momentary drops when a Pi stops recording and the API hasn't
+# committed the session yet (~20-second window). Cleared each new day.
+_pi_total_floor: dict = {"day": "", "pi": {}, "op": {}}
+_pi_floor_lock = threading.Lock()
+
+# Only print a Leaderboard fetch WARN when a device's fetch state actually
+# CHANGES (first failure, or recovery) — otherwise a chronically-502ing rig
+# spams an identical warning every single leaderboard cycle (every few
+# seconds), forever, drowning out everything else in the terminal.
+_leaderboard_fetch_state: dict[str, str] = {}   # hostname -> "ok" | "failed_cached" | "failed_nocache"
+_leaderboard_fetch_state_lock = threading.Lock()
+
+# Backfill runs every 5 minutes; if the summary is identical to last run
+# (same day count, same cache state, same failing devices) we don't want to
+# reprint that every single run — only when the message actually changes.
+_last_backfill_message: str = ""
 _device_sessions_lock = threading.Lock()
 LEADERBOARD_STATE_FILE = ".leaderboard_cache.json"   # git-ignored
 
@@ -618,13 +1061,13 @@ def _load_leaderboard_state():
         return
     with _device_sessions_lock:
         _device_sessions_cache.update(st.get("device_sessions", {}))
-        _observed_sessions.update(st.get("observed", {}))
+        _observed_totals.update(st.get("observed_totals", {}))
 
 def _save_leaderboard_state():
     with _device_sessions_lock:
         st = {"date": get_date_str(),
               "device_sessions": _device_sessions_cache,
-              "observed": _observed_sessions}
+              "observed_totals": _observed_totals}
     try:
         tmp = LEADERBOARD_STATE_FILE + ".tmp"
         with open(tmp, "w") as f:
@@ -633,32 +1076,59 @@ def _save_leaderboard_state():
     except Exception:
         pass
 
+def _observed_today_total(hostname: str, today_str: str) -> tuple[float, str]:
+    """Returns (seconds, last_operator) this monitor has itself observed for
+    the device today: banked (finalized) segments plus whatever the current
+    segment has reached so far. Safe to call repeatedly — never inflates."""
+    st = _observed_totals.get(hostname)
+    if not st or st.get("date") != today_str:
+        return 0.0, "Unknown"
+    return st.get("banked_s", 0.0) + st.get("cur_dur", 0.0), st.get("cur_op") or "Unknown"
+
 def _update_live_tracker(devices: list[dict], today_str: str):
-    """Watches fleet-status transitions so recording time isn't lost for
-    devices whose session list can't be fetched. A session is 'finalized'
-    into _observed_sessions when its rig stops recording (or its duration
-    resets, meaning a new session started)."""
+    """Feeds every fleet-status poll into the idempotent per-device running
+    total. Recording samples raise `cur_dur` via max() — repeated sampling of
+    the SAME ongoing recording (including across brief offline blips) can
+    never add extra time. A segment is only banked (permanently folded into
+    the day's total) when the operator changes or the duration counter drops
+    (a real new-session signal), or when the rig cleanly stops recording."""
     with _device_sessions_lock:
         for d in devices:
             hostname = d.get("hostname") or ""
             if not hostname: continue
             status = get_status(d)
-            trk = _live_tracker.get(hostname)
+            label = device_label(d)
+
+            st = _observed_totals.get(hostname)
+            if st is None or st.get("date") != today_str:
+                st = {"date": today_str, "banked_s": 0.0, "cur_dur": 0.0, "cur_op": "", "label": label}
+                _observed_totals[hostname] = st
+            st["label"] = label
+
             if status == "recording":
-                op = clean_str(d.get("operator"))
+                op  = clean_str(d.get("operator"))
                 dur = float(d.get("recording_duration_s") or 0)
-                if trk and (op != trk["op"] or dur < trk["dur"] - 30):
-                    _observed_sessions.setdefault(hostname, []).append(
-                        {"operator": trk["op"], "duration_s": trk["dur"], "date": trk["date"]})
-                    trk = None
-                _live_tracker[hostname] = {"op": op, "dur": max(dur, trk["dur"]) if trk else dur,
-                                           "date": today_str, "label": device_label(d)}
+                if st["cur_op"] and (op != st["cur_op"] or dur < st["cur_dur"] - 30):
+                    # Operator changed or counter reset -> a genuinely new
+                    # session started; bank the previous segment's time.
+                    st["banked_s"] += st["cur_dur"]
+                    st["cur_dur"] = dur
+                    st["cur_op"] = op
+                else:
+                    st["cur_op"] = op
+                    st["cur_dur"] = max(st["cur_dur"], dur)   # idempotent — never double-adds
             elif status == "offline":
-                pass  # keep the tracker — the rig may reconnect mid-session
-            elif trk:
-                _observed_sessions.setdefault(hostname, []).append(
-                    {"operator": trk["op"], "duration_s": trk["dur"], "date": trk["date"]})
-                del _live_tracker[hostname]
+                # Freeze the current segment. No append, no growth — if the
+                # rig reconnects still recording the same session, the
+                # "recording" branch above will simply raise cur_dur again.
+                pass
+            else:
+                # idle/uploading -> the current segment (if any) ended cleanly
+                if st["cur_dur"] > 0:
+                    st["banked_s"] += st["cur_dur"]
+                    st["cur_dur"] = 0.0
+                    st["cur_op"] = ""
+
 
 def build_api_leaderboard(client: FleetAPIClient) -> dict | None:
     """Aggregates today's completed sessions straight from the mcap-sync API
@@ -674,30 +1144,71 @@ def build_api_leaderboard(client: FleetAPIClient) -> dict | None:
     by_op: dict[str, float] = {}
     results: dict[str, tuple[str, list[dict]]] = {}
 
+    # ── Tracks which Pis had a genuinely successful, fresh API fetch this ──────
+    # cycle. Only THESE labels are allowed to reset the anti-drop floor below;
+    # everyone else (offline / cache-fallback / observed-only) can only raise
+    # it. Without this distinction, a single inflated estimate would get
+    # baked into the floor forever and never be allowed to correct itself —
+    # which is exactly what caused times to stay permanently double-counted.
+    confirmed_labels: set[str] = set()
+    confirmed_lock = threading.Lock()
+
+    # ── Snapshot status + label ONCE per device for this whole cycle ───────────
+    # get_status()/device_label() are called from several places below; if they
+    # were re-evaluated at different points they could return a different
+    # answer for the same device as time passes during the ~35s thread-join
+    # (e.g. a staleness threshold ticking over), which let a single hostname
+    # get classified two different ways in one cycle and be added twice. Every
+    # later step reads from these two dicts instead of re-querying the device.
+    device_status: dict[str, str] = {}
+    device_lbl: dict[str, str] = {}
+    for d in devices:
+        hostname = d.get("hostname") or ""
+        if not hostname:
+            continue
+        device_status[hostname] = get_status(d)
+        device_lbl[hostname] = device_label(d)
+
     def fetch(hostname: str, label: str):
         try:
             groups = _trim_groups(client.get_device_sessions(hostname), today_str)
             with _device_sessions_lock:
                 _device_sessions_cache[hostname] = groups
-                # The device's own session list is authoritative again —
-                # drop the transitions we tracked ourselves in the interim.
-                _observed_sessions.pop(hostname, None)
+                # The device's own session list is authoritative again for
+                # completed sessions — clear the banked (finalized) portion
+                # of our self-tracked total so it doesn't linger and inflate
+                # future merges. Keep cur_dur: a session still in progress
+                # right now isn't in the API's completed list yet.
+                st = _observed_totals.get(hostname)
+                if st and st.get("date") == today_str:
+                    st["banked_s"] = 0.0
             results[hostname] = (label, groups)
+            with confirmed_lock:
+                confirmed_labels.add(label)
+            with _leaderboard_fetch_state_lock:
+                prev_state = _leaderboard_fetch_state.get(hostname)
+                if prev_state and prev_state != "ok":
+                    web_print(f"[{ts()}] {ANSI_GREEN}INFO   Leaderboard: {label} recovered — session fetch succeeded.{ANSI_RESET}")
+                _leaderboard_fetch_state[hostname] = "ok"
         except FleetAPIError as e:
             with _device_sessions_lock:
                 cached = _device_sessions_cache.get(hostname)
+            new_state = "failed_cached" if cached is not None else "failed_nocache"
+            with _leaderboard_fetch_state_lock:
+                prev_state = _leaderboard_fetch_state.get(hostname)
+                should_print = prev_state != new_state
+                _leaderboard_fetch_state[hostname] = new_state
             if cached is not None:
                 results[hostname] = (label, cached)
-                web_print(f"[{ts()}] {ANSI_YELLOW}WARN   Leaderboard: {label} fetch failed, using last known sessions ({e}){ANSI_RESET}")
+                if should_print:
+                    web_print(f"[{ts()}] {ANSI_YELLOW}WARN   Leaderboard: {label} fetch failed, using last known sessions ({e}){ANSI_RESET}")
             else:
-                web_print(f"[{ts()}] {ANSI_YELLOW}WARN   Leaderboard: no session data for {label} yet ({e}){ANSI_RESET}")
+                if should_print:
+                    web_print(f"[{ts()}] {ANSI_YELLOW}WARN   Leaderboard: no session data for {label} yet ({e}){ANSI_RESET}")
 
     threads = []
-    for d in devices:
-        hostname = d.get("hostname")
-        if not hostname: continue
-        label = device_label(d)
-        if get_status(d) == "offline":
+    for hostname, label in device_lbl.items():
+        if device_status[hostname] == "offline":
             # The proxy to an offline rig always fails — skip the network
             # round-trip and serve whatever it last reported.
             with _device_sessions_lock:
@@ -713,6 +1224,7 @@ def build_api_leaderboard(client: FleetAPIClient) -> dict | None:
     _update_live_tracker(devices, today_str)
 
     seen_ids: set[str] = set()
+    confirmed_ops: set[str] = set()
     for label, groups in results.values():
         for rec in groups:
             if not session_is_today(rec, today_str): continue
@@ -723,32 +1235,98 @@ def build_api_leaderboard(client: FleetAPIClient) -> dict | None:
             op = clean_str(rec.get("operator"))
             by_pi[label] = by_pi.get(label, 0.0) + dur
             by_op[op] = by_op.get(op, 0.0) + dur
+            if label in confirmed_labels:
+                confirmed_ops.add(op)
 
-    # Devices with no reachable session list at all: fall back to the
-    # sessions this monitor observed itself via status transitions.
+    # ── Single merge point for observed/self-tracked session time ──────────────
+    # Covers BOTH: (a) devices with no reachable session list at all this
+    # cycle, and (b) devices whose API list is fetchable but hasn't ingested
+    # the in-progress/just-finished session yet. Exactly one pass, one hostname
+    # touched once, using max() rather than an additive "top-up" — so a
+    # hostname can never be counted from both its API total AND its observed
+    # total; whichever is larger wins outright.
     with _device_sessions_lock:
-        observed_snapshot = {h: list(v) for h, v in _observed_sessions.items()}
-    for d in devices:
-        hostname = d.get("hostname") or ""
-        if not hostname or hostname in results: continue
-        label = device_label(d)
-        for obs in observed_snapshot.get(hostname, []):
-            if obs.get("date") != today_str: continue
-            dur = float(obs.get("duration_s") or 0)
-            op = clean_str(obs.get("operator"))
-            by_pi[label] = by_pi.get(label, 0.0) + dur
-            by_op[op] = by_op.get(op, 0.0) + dur
+        observed_hosts = list(_observed_totals.keys())
+    for hostname in observed_hosts:
+        label = device_lbl.get(hostname, hostname)
+        st = _observed_totals.get(hostname)
+        if not st or st.get("date") != today_str:
+            continue
+        # If this device is CURRENTLY recording, the "Live recordings" loop
+        # below will separately add its current segment's duration fresh
+        # from fleet status — so only fold in the BANKED (already-finalized)
+        # portion here. Folding in cur_dur too would add the live segment
+        # twice: once here, once in the live loop. For devices that aren't
+        # currently recording (offline/idle), nothing else will touch them,
+        # so the full banked_s + cur_dur estimate is used.
+        is_live_now = device_status.get(hostname) == "recording"
+        obs_dur = st.get("banked_s", 0.0) + (0.0 if is_live_now else st.get("cur_dur", 0.0))
+        obs_op = st.get("cur_op") or "Unknown"
+        if obs_dur <= 0:
+            continue
+        api_dur = by_pi.get(label, 0.0)
+        if obs_dur > api_dur:
+            # Move the whole Pi total up to the observed value rather than
+            # adding a "gap" — arithmetically identical when done once, but
+            # immune to double-adding if this hostname is ever visited twice.
+            by_pi[label] = obs_dur
+            by_op[obs_op] = by_op.get(obs_op, 0.0) + (obs_dur - api_dur)
+            # This label's total no longer purely reflects a clean API fetch —
+            # don't let it reset the floor as if it were fully confirmed.
+            confirmed_labels.discard(label)
+            confirmed_ops.discard(obs_op)
 
     _save_leaderboard_state()
 
     # Live recordings aren't in mcap-sync yet — add their running time.
-    for d in devices:
-        if get_status(d) == "recording":
-            dur = float(d.get("recording_duration_s") or 0)
-            label = device_label(d)
-            op = clean_str(d.get("operator"))
-            by_pi[label] = by_pi.get(label, 0.0) + dur
-            by_op[op] = by_op.get(op, 0.0) + dur
+    # Uses the SAME status snapshot taken at the top of this function, so a
+    # device that was classified "offline" for fetch purposes can't also be
+    # treated as "recording" here just because time passed during the fetch.
+    for hostname, status in device_status.items():
+        if status != "recording":
+            continue
+        # Guard: a hostname whose observed/committed session already covers
+        # today (e.g. it's mid-TTL waiting to reconnect) is handled above —
+        # only add live time for devices genuinely reporting live right now.
+        d = next((dd for dd in devices if dd.get("hostname") == hostname), None)
+        if d is None:
+            continue
+        dur = float(d.get("recording_duration_s") or 0)
+        label = device_lbl[hostname]
+        op = clean_str(d.get("operator"))
+        by_pi[label] = by_pi.get(label, 0.0) + dur
+        by_op[op] = by_op.get(op, 0.0) + dur
+
+    # ── Floor: never let an ESTIMATED total drop compared to last cycle ────────
+    # Clears at midnight so stale data from yesterday doesn't carry forward.
+    # Confirmed labels/operators (backed by a clean, successful API fetch this
+    # cycle) are trusted completely and RESET the floor to match, even if
+    # that's lower than before — this is what lets a previously-inflated
+    # estimate self-correct once the real API total comes in, instead of
+    # being locked in permanently.
+    with _pi_floor_lock:
+        if _pi_total_floor["day"] != today_str:
+            _pi_total_floor["day"] = today_str
+            _pi_total_floor["pi"] = {}
+            _pi_total_floor["op"] = {}
+        for label, total in by_pi.items():
+            if label in confirmed_labels:
+                _pi_total_floor["pi"][label] = total   # trust fully, reset floor
+                continue
+            floor = _pi_total_floor["pi"].get(label, 0.0)
+            if total < floor:
+                by_pi[label] = floor          # hold the floor
+            else:
+                _pi_total_floor["pi"][label] = total   # raise the floor
+        for op, total in by_op.items():
+            if op in confirmed_ops:
+                _pi_total_floor["op"][op] = total       # trust fully, reset floor
+                continue
+            floor = _pi_total_floor["op"].get(op, 0.0)
+            if total < floor:
+                by_op[op] = floor
+            else:
+                _pi_total_floor["op"][op] = total
 
     def ranked(source: dict[str, float], hide_unnamed: bool = False) -> list[dict]:
         return [
@@ -760,10 +1338,10 @@ def build_api_leaderboard(client: FleetAPIClient) -> dict | None:
     return {"pi": ranked(by_pi, hide_unnamed=True), "operator": ranked(by_op), "source": "api"}
 
 def _leaderboard_refresher():
-    """Rebuilds the leaderboard in the background. The per-device fan-out can
-    take tens of seconds when rigs are slow, and the embedded HTTP server is
-    single-threaded — building inside a request handler would freeze the
-    whole dashboard, so /rankings only ever serves the latest snapshot."""
+    """Rebuilds the leaderboard in the background. Also runs a full session
+    backfill once per day (or on first boot) to populate historical hours."""
+    _last_backfill: list[float] = [0.0]  # mutable cell: timestamp of last backfill
+
     while True:
         client = api_client or dashboard_auth.get_any_client()
         if client is None:
@@ -779,6 +1357,21 @@ def _leaderboard_refresher():
                 _leaderboard_cache["ts"] = time.time()
                 _leaderboard_cache["data"] = data
         _flush_past_days_to_cache()
+
+        # Backfill: run on startup, then every 5 minutes
+        now = time.time()
+        if now - _last_backfill[0] >= 300:
+            try:
+                threading.Thread(
+                    target=backfill_daily_hours,
+                    args=(client,),
+                    daemon=True,
+                    name="backfill"
+                ).start()
+            except Exception as e:
+                web_print(f"[{ts()}] WARN   Backfill launch failed: {e}")
+            _last_backfill[0] = now
+
         time.sleep(LEADERBOARD_CACHE_TTL)
 
 def get_api_leaderboard() -> dict | None:
@@ -890,8 +1483,6 @@ class EmbeddedUIServer(BaseHTTPRequestHandler):
 
     def _require_auth(self):
         token = self._bearer_token()
-        # Accept the machine auto-token (generated at fleet.shiftiq.us login)
-        # so the local HTML page never needs a separate OTP sign-in.
         email = _check_auto_token(token) or dashboard_auth.check_session(token)
         if not email:
             _send_json(self, 401, {"error": "authentication required"})
@@ -918,15 +1509,42 @@ class EmbeddedUIServer(BaseHTTPRequestHandler):
             email = dashboard_auth.check_session(self._bearer_token())
             return _send_json(self, 200, {"authenticated": bool(email), "email": email})
 
-        # ── Unauthenticated bootstrap endpoint ────────────────────────────
-        # Returns the machine auto-token so the HTML page can sign itself in
-        # without a second OTP flow. Only reachable on localhost.
         if path == '/auth/auto-token':
             if _AUTO_TOKEN:
                 return _send_json(self, 200, {"token": _AUTO_TOKEN, "email": _AUTO_EMAIL})
             return _send_json(self, 503, {"error": "python not yet authenticated"})
 
-        if path not in ('/logs', '/rankings', '/devices', '/start', '/stop', '/snapshot', '/stats'):
+        if path == '/locations':
+            if self._require_auth() is None:
+                return
+            return _send_json(self, 200, _device_locations)
+
+        if path == '/task_history':
+            if self._require_auth() is None:
+                return
+            with _task_history_lock:
+                snap = dict(_completed_tasks)
+            return _send_json(self, 200, snap)
+
+        if path == '/weekend_filter':
+            qs = parse_qs(urlparse(self.path).query)
+            date_str = (qs.get('date') or [''])[0]
+            return _send_json(self, 200, {"is_weekend": is_weekend(date_str)})
+
+        if path == '/test_notification':
+            if self._require_auth() is None:
+                return
+            # Return test alert for frontend to display
+            return _send_json(self, 200, {
+                "alerts": [
+                    {"hostname": "test-pi", "rig": "Test Pi (Critical)", "kind": "test_critical",
+                     "message": "🔔 TEST ALERT — This is a test critical notification with sound"},
+                    {"hostname": "test-pi-2", "rig": "Test Pi (Resolved)", "kind": "test_resolved",
+                     "message": "✓ TEST RESOLVED — This is a test resolved notification"}
+                ]
+            })
+
+        if path not in ('/logs', '/rankings', '/devices', '/start', '/stop', '/snapshot', '/stats', '/stats_range'):
             self.send_response(404); self.end_headers()
             return
         if self._require_auth() is None:
@@ -944,8 +1562,6 @@ class EmbeddedUIServer(BaseHTTPRequestHandler):
             payload["active"] = loop_active
             _send_json(self, 200, payload)
         elif path == '/rankings':
-            # Serves the background refresher's latest snapshot; falls back
-            # to the locally accumulated log totals if none exists yet.
             leaderboard = get_api_leaderboard()
             if leaderboard is not None:
                 leaderboard = dict(leaderboard)
@@ -975,40 +1591,105 @@ class EmbeddedUIServer(BaseHTTPRequestHandler):
         elif path == '/stats':
             today_str = get_date_str()
             with log_lock:
-                # Use ui_live_pi/ui_live_operator — same source as /rankings.
-                # Exclude unnamed rpi5-xxxx-xxxx hostnames from all totals.
                 today_stats = daily_totals.get(today_str, {"total": 0, "by_pi": {}, "by_operator": {}})
                 by_pi = {k: v for k, v in (today_stats.get("ui_live_pi") or today_stats.get("by_pi", {})).items()
                          if not is_unnamed_pi(k)}
                 total_s = sum(by_pi.values())
-                # Hours by day — merge daily_totals with _daily_hours_cache for older days
-                merged_days: dict[str, float] = {}
-                for day, secs in _daily_hours_cache.items():
-                    merged_days[day] = secs
+                # Filter out weekends from daily totals
+                merged_days: dict[str, float] = dict(_daily_hours_cache)
                 for day in sorted(daily_totals.keys()):
+                    if day == today_str or is_weekend(day):
+                        continue
                     day_data = daily_totals[day]
                     src_pi = day_data.get("ui_live_pi") or day_data.get("by_pi", {})
                     day_s  = sum(v for k, v in src_pi.items() if not is_unnamed_pi(k)) if src_pi else 0
-                    if day_s > 0:
+                    if day_s > merged_days.get(day, 0):
                         merged_days[day] = day_s
+                merged_days[today_str] = total_s
                 hours_by_day = [{"date": d, "hours": round(s / 3600, 3)}
                                  for d, s in sorted(merged_days.items())]
-            # Frame health from last rig cache poll
-            dev_data = _rig_cache.get("data") or {}
+            with _rig_lock:
+                dev_data = _rig_cache.get("data") or {}
             rigs_now = dev_data.get("rigs", [])
-            fh_now   = [r["frame_health_pct"] for r in rigs_now
+            fh_live  = [r["frame_health_pct"] for r in rigs_now
                         if r.get("frame_health_pct") is not None and r.get("online")]
             with _health_lock:
                 history = list(_HEALTH_HISTORY)
+            if fh_live:
+                avg_fh = round(sum(fh_live) / len(fh_live), 2)
+                min_fh = round(min(fh_live), 2)
+            elif history:
+                avg_fh = history[-1]["avg"]
+                min_fh = history[-1]["min"]
+            else:
+                avg_fh = None
+                min_fh = None
             _send_json(self, 200, {
                 "total_hours_today":    round(total_s / 3600, 3),
-                "avg_frame_health_pct": round(sum(fh_now)/len(fh_now), 2) if fh_now else None,
-                "min_frame_health_pct": round(min(fh_now), 2) if fh_now else None,
+                "avg_frame_health_pct": avg_fh,
+                "min_frame_health_pct": min_fh,
                 "active_recording_rigs": sum(1 for r in rigs_now if r.get("status") == "recording"),
                 "total_rigs": len(rigs_now),
                 "hours_by_day": hours_by_day,
                 "frame_health_history": history[-360:],
                 "last_updated_ms": int(time.time() * 1000),
+            })
+        elif path == '/stats_range':
+            qs = parse_qs(urlparse(self.path).query)
+            days_param = (qs.get('days') or [''])[0]
+            days = sorted({d.strip() for d in days_param.split(',') if d.strip() and not is_weekend(d.strip())})
+            if not days:
+                days = [get_date_str()]
+
+            today_str = get_date_str()
+            by_pi: dict[str, float] = {}
+            by_op: dict[str, float] = {}
+
+            if today_str in days:
+                board = get_api_leaderboard()
+                if board:
+                    for p in board.get("pi", []):
+                        by_pi[p["name"]] = by_pi.get(p["name"], 0.0) + parse_duration_from_log(p["duration"])
+                    for o in board.get("operator", []):
+                        by_op[o["name"]] = by_op.get(o["name"], 0.0) + parse_duration_from_log(o["duration"])
+                else:
+                    with log_lock:
+                        stats = daily_totals.get(today_str, {"by_pi": {}, "by_operator": {}})
+                        for k, v in (stats.get("ui_live_pi") or stats.get("by_pi", {})).items():
+                            if not is_unnamed_pi(k):
+                                by_pi[k] = by_pi.get(k, 0.0) + v
+                        for k, v in (stats.get("ui_live_operator") or stats.get("by_operator", {})).items():
+                            by_op[k] = by_op.get(k, 0.0) + v
+
+            past_days = [d for d in days if d != today_str]
+            if past_days:
+                with _pi_session_cache_lock:
+                    cache_snapshot = {h: dict(v) for h, v in _pi_session_cache.items()}
+                for hostname, entry in cache_snapshot.items():
+                    label = entry.get("label", hostname)
+                    if is_unnamed_pi(label):
+                        continue
+                    for sess in entry.get("sessions", {}).values():
+                        if sess.get("date") not in past_days:
+                            continue
+                        dur = sess.get("duration_s", 0)
+                        if dur <= 0:
+                            continue
+                        op = sess.get("operator") or "Unknown"
+                        by_pi[label] = by_pi.get(label, 0.0) + dur
+                        by_op[op] = by_op.get(op, 0.0) + dur
+
+            total_s = sum(by_pi.values())
+
+            def ranked(source: dict[str, float]) -> list[dict]:
+                return [{"name": k, "duration": format_time(v), "hours": round(v / 3600, 3)}
+                        for k, v in sorted(source.items(), key=lambda x: x[1], reverse=True)]
+
+            _send_json(self, 200, {
+                "days": days,
+                "total_hours": round(total_s / 3600, 3),
+                "hours_by_pi": ranked(by_pi),
+                "hours_by_operator": ranked(by_op),
             })
 
     def do_POST(self):
@@ -1029,10 +1710,23 @@ class EmbeddedUIServer(BaseHTTPRequestHandler):
             dashboard_auth.logout(self._bearer_token())
             return _send_json(self, 200, {"ok": True})
 
+        if path == '/set_location':
+            if self._require_auth() is None:
+                return
+            hostname = body.get('hostname', '')
+            location = body.get('location', '')
+            if hostname and location:
+                _device_locations[hostname] = location
+                _save_locations()
+                return _send_json(self, 200, {"ok": True})
+            return _send_json(self, 400, {"ok": False, "error": "missing hostname or location"})
+
         self.send_response(404); self.end_headers()
 
 def start_web_server():
     _load_leaderboard_state()
+    _load_locations()
+    _load_task_history()
     server = HTTPServer(('127.0.0.1', WEB_PORT), EmbeddedUIServer)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     threading.Thread(target=_leaderboard_refresher, daemon=True).start()
@@ -1127,6 +1821,7 @@ def run():
         sys.exit(1)
 
     _load_daily_hours_cache()
+    _load_pi_session_cache()
     load_daily_totals()
     start_web_server()
     start_key_listener()
@@ -1156,25 +1851,39 @@ def run():
             was_recording = hostname in recording_cache
 
             if new_s == "recording":
-                recording_cache[hostname] = {"duration": d.get("recording_duration_s", 0), "operator": clean_str(d.get("operator")), "task": clean_str(d.get("task")), "label": label}
+                live_dur = float(d.get("recording_duration_s") or 0)
+                prev_dur = recording_cache.get(hostname, {}).get("duration", 0)
+                recording_cache[hostname] = {
+                    "duration":       max(live_dur, 0),
+                    "_prev_duration": prev_dur if prev_dur > live_dur else live_dur,
+                    "operator":       clean_str(d.get("operator")),
+                    "task":           clean_str(d.get("task")),
+                    "label":          label,
+                }
 
             if old_s is None:
                 if was_recording and new_s not in ("recording", "offline"):
                     info = recording_cache.pop(hostname)
-                    log_session_end(label, info["operator"], info["task"], info["duration"])
+                    dur_to_commit = info["duration"] if info["duration"] >= 5 else info.get("_prev_duration", info["duration"])
+                    log_session_end(label, info["operator"], info["task"], dur_to_commit)
+                    _archive_completed_task(hostname, label, info["operator"], info["task"], dur_to_commit, time.time() - dur_to_commit)
                 elif new_s == "recording":
                     web_print(f"{ANSI_REC}[{ts()}] CHANGE {label:<30}  Started | Op: {d.get('operator')} | Task: {d.get('task')}{ANSI_RESET}")
             elif new_s != old_s:
                 if was_recording and new_s not in ("recording", "offline"):
                     info = recording_cache.pop(hostname)
-                    web_print(f"{ANSI_REC}[{ts()}] CHANGE {label:<30}  {old_s} → STOPPED | Op: {info['operator']}{ANSI_RESET}")
-                    log_session_end(label, info["operator"], info["task"], info["duration"])
-                    threading.Thread(target=fetch_and_log_tasks, args=(hostname, label, info["operator"], info["task"], info["duration"])).start()
+                    dur_to_commit = info["duration"] if info["duration"] >= 5 else info.get("_prev_duration", info["duration"])
+                    web_print(f"{ANSI_REC}[{ts()}] CHANGE {label:<30}  {old_s} → STOPPED | Op: {info['operator']} | Task: {info['task']} | {format_time(dur_to_commit)}{ANSI_RESET}")
+                    log_session_end(label, info["operator"], info["task"], dur_to_commit)
+                    _archive_completed_task(hostname, label, info["operator"], info["task"], dur_to_commit, time.time() - dur_to_commit)
+                    threading.Thread(target=fetch_and_log_tasks, args=(hostname, label, info["operator"], info["task"], dur_to_commit)).start()
                 elif new_s == "recording" and not was_recording:
-                    web_print(f"{ANSI_REC}[{ts()}] CHANGE {label:<30}  {old_s} → RECORDING | Op: {d.get('operator')}{ANSI_RESET}")
+                    web_print(f"{ANSI_REC}[{ts()}] CHANGE {label:<30}  {old_s} → RECORDING | Op: {d.get('operator')} | Task: {d.get('task')}{ANSI_RESET}")
             prev_status[hostname] = new_s
 
 if __name__ == "__main__":
     try: run()
     except KeyboardInterrupt: pass
-    finally: _flush_past_days_to_cache()
+    finally:
+        _flush_past_days_to_cache()
+        _save_health_history()
