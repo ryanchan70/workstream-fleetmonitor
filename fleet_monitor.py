@@ -22,7 +22,7 @@ from api_client import FleetAPIClient, FleetAPIError
 from auth import DashboardAuth
 
 # ── Config ────────────────────────────────────────────────────────────────────
-POLL_INTERVAL = 5
+POLL_INTERVAL = 15
 WEB_PORT = 8080
 
 # Critical alert thresholds
@@ -31,8 +31,8 @@ STORAGE_MIN_FREE_PCT = 10.0   # free disk % below this => critical
 STORAGE_MIN_FREE_GB  = 50.0   # free disk GB below this => critical
 TEMP_OVERHEAT_C = 70.0        # CPU/SSD overheating threshold
 
-# Alert deduplication: don't spam same alert within 15 minutes
-ALERT_DEBOUNCE_SEC = 900
+# Alert deduplication: don't spam same alert within 10 minutes
+ALERT_DEBOUNCE_SEC = 600
 
 # ANSI Color Codes
 ANSI_BRIGHT_RED   = "\033[91m"
@@ -63,8 +63,15 @@ api_client: FleetAPIClient | None = None
 _device_locations: dict[str, str] = {}  # hostname -> "location_name"
 _completed_tasks: dict[str, list] = {}   # hostname -> [{"name": "", "op": "", "dur": s, "ts": unix}]
 _task_history_lock = threading.Lock()
-_LOCATIONS_FILE = ".device_locations.json"
-_TASK_HISTORY_FILE = ".task_history.json"
+# Runtime caches, generated logs and secrets live under local/ so the repo
+# root holds only what the Vercel build and git actually need. Resolved
+# against this file rather than the cwd so the script runs from anywhere.
+_LOCAL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "local")
+_CACHE_DIR = os.path.join(_LOCAL_DIR, "caches")
+os.makedirs(_CACHE_DIR, exist_ok=True)
+
+_LOCATIONS_FILE = os.path.join(_CACHE_DIR, ".device_locations.json")
+_TASK_HISTORY_FILE = os.path.join(_CACHE_DIR, ".task_history.json")
 
 # ── Alert history (prevent spam) ──────────────────────────────────────────
 _last_alert_ts: dict[str, float] = {}  # "hostname|kind" -> unix timestamp
@@ -198,7 +205,7 @@ def _check_auto_token(token: str | None) -> str | None:
 # ── Frame health history (rolling 2-hour window at 5-s poll rate) ─────────────
 _HEALTH_HISTORY: collections.deque = collections.deque(maxlen=1440)
 _health_lock = threading.Lock()
-_HEALTH_HISTORY_FILE = ".frame_health_cache.json"
+_HEALTH_HISTORY_FILE = os.path.join(_CACHE_DIR, ".frame_health_cache.json")
 _health_save_counter = 0   # save every 60 entries (~5 min at 5-s poll)
 
 def _load_health_history():
@@ -225,7 +232,7 @@ def _save_health_history():
 
 # ── Persistent daily hours cache ──────────────────────────────────────────
 # Survives restarts; keyed by YYYY-MM-DD, value in seconds (named pis only).
-_DAILY_HOURS_FILE = ".daily_hours_cache.json"
+_DAILY_HOURS_FILE = os.path.join(_CACHE_DIR, ".daily_hours_cache.json")
 _daily_hours_cache: dict[str, float] = {}
 _daily_hours_lock = threading.Lock()
 
@@ -276,7 +283,7 @@ def _flush_past_days_to_cache():
 # id, and survives restarts. It is the durable source used to (a) speed up
 # backfill on subsequent runs and (b) keep counting a Pi's time in daily
 # totals even after it goes offline and can no longer be reached directly.
-_PI_SESSION_CACHE_FILE = ".pi_session_cache.json"
+_PI_SESSION_CACHE_FILE = os.path.join(_CACHE_DIR, ".pi_session_cache.json")
 _pi_session_cache: dict[str, dict] = {}   # hostname -> {"label":.., "sessions": {sid: {...}}}
 _pi_session_cache_lock = threading.Lock()
 
@@ -590,10 +597,73 @@ def parse_duration_from_log(duration_str: str) -> float:
         return sign * (abs(float(h)) * 3600 + float(m) * 60 + float(s))
     return 0.0
 
+# ── Log file layout ───────────────────────────────────────────────────────
+# Each kind of log gets its own subfolder so the repo root stays clean.
+OPERATOR_LOG_DIR  = os.environ.get("FLEET_OPERATOR_LOG_DIR",  os.path.join(_LOCAL_DIR, "logs", "operator_sessions"))
+RECORDING_LOG_DIR = os.environ.get("FLEET_RECORDING_LOG_DIR", os.path.join(_LOCAL_DIR, "logs", "recording_logs"))
+
+
+def _log_path(directory: str, filename: str) -> str:
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except Exception:
+        pass
+    return os.path.join(directory, filename)
+
+
+def operator_log_path(date_str: str) -> str:
+    return _log_path(OPERATOR_LOG_DIR, f"operator_sessions_{date_str}.txt")
+
+
+def recording_log_path(date_str: str) -> str:
+    return _log_path(RECORDING_LOG_DIR, f"daily_recording_log_{date_str}.txt")
+
+
+def _field(value: str) -> str:
+    """Sanitises a value for a pipe-delimited line.
+
+    Real locations already contain pipes ("Kung Fu Tea | Woodside Road"), which
+    silently corrupts the column layout and breaks anything parsing these logs.
+    """
+    return str(value).replace("|", "/").strip()
+
+
+def operator_session_line(start_unix, operator, task, duration_s,
+                          location="", label="", suffix="") -> str:
+    """One operator-session row.
+
+        09:03:24 | Konstantin Kostin | Chair building | 00:48:21 (2901.6s) | Workstream Menlo Office
+
+    The leading time is when the RECORDING STARTED, not when this line was
+    written. Previously every session flushed in one polling batch shared that
+    batch's timestamp, so a whole afternoon of work appeared to happen at
+    13:03:01.
+    """
+    if start_unix:
+        try:
+            started = datetime.datetime.fromtimestamp(float(start_unix)).strftime("%H:%M:%S")
+        except Exception:
+            started = "--:--:--"
+    else:
+        started = "--:--:--"
+
+    parts = [
+        started,
+        _field(operator),
+        _field(task),
+        f"{format_time(duration_s)} ({float(duration_s):.1f}s)",
+    ]
+    if location and location != "Unknown":
+        parts.append(_field(location))
+    if label:
+        parts.append(_field(label))
+    return " | ".join(parts) + suffix
+
+
 def load_daily_totals():
     with log_lock:
         today_str = get_date_str()
-        log_filename = f"daily_recording_log_{today_str}.txt"
+        log_filename = recording_log_path(today_str)
 
         if today_str not in daily_totals:
             daily_totals[today_str] = {"total": 0, "by_pi": {}, "by_operator": {}}
@@ -620,7 +690,7 @@ def load_daily_totals():
 def fetch_and_log_tasks(hostname, label, fallback_op=None, fallback_task=None, fallback_dur=None):
     """Pulls this device's sessions from the mcap-sync API and logs any new ones from today."""
     today_str = get_date_str()
-    op_filename = f"operator_sessions_{today_str}.txt"
+    op_filename = operator_log_path(today_str)
     success = False
     groups = []
 
@@ -642,10 +712,10 @@ def fetch_and_log_tasks(hostname, label, fallback_op=None, fallback_task=None, f
         if session_id in logged_session_ids: continue
         logged_session_ids.add(session_id)
 
-        loc_str = f" | Location: {loc:<20}" if loc and loc != "Unknown" else ""
         with log_lock:
             with open(op_filename, "a") as f:
-                f.write(f"[{ts()}] Operator: {op:<20} | Pi: {label:<18} | Task: {task:<25}{loc_str} | Session Duration: {format_time(dur)} ({dur:.2f}s)\n")
+                f.write(operator_session_line(
+                    _session_start_unix(rec), op, task, dur, loc, label) + "\n")
 
     if not success and fallback_dur is not None:
         op   = clean_str(fallback_op)
@@ -655,7 +725,11 @@ def fetch_and_log_tasks(hostname, label, fallback_op=None, fallback_task=None, f
             logged_session_ids.add(session_id)
             with log_lock:
                 with open(op_filename, "a") as f:
-                    f.write(f"[{ts()}] Operator: {op:<20} | Pi: {label:<18} | Task: {task:<25} | Session Duration: {format_time(fallback_dur)} ({fallback_dur:.2f}s) [fallback]\n")
+                    # No API record, so no true start time — derive it from the
+                    # duration we observed rather than stamping "now".
+                    f.write(operator_session_line(
+                        time.time() - fallback_dur, op, task, fallback_dur,
+                        "", label, suffix=" [fallback]") + "\n")
 
 def poll_all_device_tasks():
     with log_lock: snapshot = dict(device_cache)
@@ -692,7 +766,7 @@ def log_session_end(label: str, op: str, task: str, dur: float):
         day_stats["by_pi"][label] = day_stats["by_pi"].get(label, 0) + dur
         day_stats["by_operator"][op] = day_stats["by_operator"].get(op, 0) + dur
 
-        log_filename = f"daily_recording_log_{today_str}.txt"
+        log_filename = recording_log_path(today_str)
         try:
             with open(log_filename, "a") as f:
                 f.write(f"[{ts()}] Session Ended | Pi: {label:<15} | Operator: {op:<15} | Task: {task:<15} | Session Duration: {format_time(dur)} ({dur:.2f}s)\n")
@@ -727,7 +801,7 @@ def log_current_totals(reason: str):
         day_stats["ui_live_pi"] = snap_by_pi
         day_stats["ui_live_operator"] = snap_by_op
 
-        log_filename = f"daily_recording_log_{today_str}.txt"
+        log_filename = recording_log_path(today_str)
         try:
             with open(log_filename, "a") as f:
                 f.write(f"[{ts()}] === Snapshot Triggered By: {reason} ===\n")
@@ -1044,7 +1118,7 @@ _leaderboard_fetch_state_lock = threading.Lock()
 # reprint that every single run — only when the message actually changes.
 _last_backfill_message: str = ""
 _device_sessions_lock = threading.Lock()
-LEADERBOARD_STATE_FILE = ".leaderboard_cache.json"   # git-ignored
+LEADERBOARD_STATE_FILE = os.path.join(_CACHE_DIR, ".leaderboard_cache.json")
 
 def _trim_groups(groups: list[dict], today_str: str) -> list[dict]:
     keep = ("id", "session_uuid", "name", "operator", "task", "duration_s",
@@ -1397,7 +1471,7 @@ def device_label(device: dict) -> str:
 def verify_on_close():
     web_print(f"[{ts()}] INFO   Starting verification of daily totals against the API...")
     today_str = get_date_str()
-    log_filename = f"daily_recording_log_{today_str}.txt"
+    log_filename = recording_log_path(today_str)
 
     local_sessions = {}
     if os.path.exists(log_filename):
@@ -1757,16 +1831,16 @@ def execute_otp_flow(email: str) -> bool:
 
 def login() -> bool:
     try:
-        with open("secrets.json", "r") as sf:
+        with open(os.path.join(_LOCAL_DIR, "secrets.json"), "r") as sf:
             secrets_data = json.load(sf)
             email = secrets_data.get("email")
             password = secrets_data.get("password")
     except Exception:
-        print(f"[{ts()}] FATAL  Could not read secrets.json.")
+        print(f"[{ts()}] FATAL  Could not read local/secrets.json.")
         return False
 
     if not email:
-        print(f"[{ts()}] FATAL  \"email\" is missing from secrets.json.")
+        print(f"[{ts()}] FATAL  \"email\" is missing from local/secrets.json.")
         return False
 
     print(f"[{ts()}] DEBUG  Authenticating with {api_client.base_url}...")
@@ -1776,7 +1850,23 @@ def login() -> bool:
         print(f"[{ts()}] SUCCESS Authenticated with fleet.shiftiq.us.")
         return True
 
+    # A failed password no longer fires off a verification email on its own.
+    # A typo used to mean an unwanted code landing in the inbox every attempt,
+    # so the fallback is now opt-in.
     print(f"[{ts()}] {ANSI_YELLOW}WARN   Password login failed: {err}{ANSI_RESET}")
+
+    if not sys.stdin.isatty():
+        print(f"[{ts()}] FATAL  Check the password. To sign in with an emailed "
+              f"code instead, run interactively or use the dashboard.")
+        return False
+
+    try:
+        answer = input(f" Email a one-time code to {email} instead? [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    if answer not in ("y", "yes"):
+        print(f"[{ts()}] FATAL  Password login failed and no code was requested.")
+        return False
     return execute_otp_flow(email)
 
 def poll() -> list[dict] | None:

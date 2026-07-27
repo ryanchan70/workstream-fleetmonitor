@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Fleet Monitor Control Panel</title>
+    <link rel="icon" href="/favicon.ico" sizes="32x32">
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=Geist+Mono:wght@400;600&display=swap">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
     <style>
@@ -100,6 +101,19 @@
         }
         .status-on { background: rgba(16,185,129,0.15); color: var(--accent-green); }
         .status-off { background: rgba(239,68,68,0.15); color: var(--accent-red); }
+
+        /* The header copy of the status sits in a flex row beside the
+           notification switch, so it must not float like the one in the
+           terminal card header. */
+        .header-status-row {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            flex-wrap: wrap;
+            margin-top: 12px;
+        }
+        .header-status-row .notif-toggle { margin-top: 0; }
+        .loop-status-inline { float: none; font-size: 0.72rem; letter-spacing: 0.03em; }
 
         .terminal-box {
             background-color: #030712;
@@ -573,8 +587,95 @@
             margin-top: 12px;
         }
         .hidden { display: none !important; }
+        /* ── Top-right control cluster ──────────────────────────────────── */
+        .top-right-bar {
+            position: absolute;
+            top: 0;
+            right: 0;
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            z-index: 40;
+        }
+        .top-bar-link {
+            color: var(--text-muted);
+            font-size: 0.75rem;
+            text-decoration: underline;
+            white-space: nowrap;
+        }
+        .top-bar-link:hover { color: var(--accent-blue); }
+
+        .bell-wrap { position: relative; display: flex; }
+        .bell-btn {
+            background: none;
+            border: none;
+            padding: 2px;
+            cursor: pointer;
+            color: var(--text-muted);
+            line-height: 0;
+            border-radius: 6px;
+        }
+        .bell-btn:hover { color: var(--text-color); }
+        .bell-btn.has-alerts { color: var(--accent-red); }
+        .bell-btn:focus-visible { outline: 2px solid var(--accent-blue); outline-offset: 2px; }
+        .bell-badge {
+            position: absolute;
+            top: -5px;
+            right: -6px;
+            min-width: 15px;
+            height: 15px;
+            padding: 0 4px;
+            border-radius: 999px;
+            background: var(--accent-red);
+            color: #fff;
+            font-size: 0.6rem;
+            font-weight: 700;
+            line-height: 15px;
+            text-align: center;
+            pointer-events: none;
+        }
+        .alert-panel {
+            position: absolute;
+            top: 26px;
+            right: 0;
+            width: min(340px, calc(100vw - 40px));
+            max-height: 60vh;
+            overflow-y: auto;
+            background: var(--card-bg);
+            border: 1px solid #1f2937;
+            border-radius: 8px;
+            box-shadow: 0 12px 30px rgba(0,0,0,0.5);
+            z-index: 50;
+            text-align: left;
+        }
+        .alert-panel-head {
+            padding: 9px 12px;
+            border-bottom: 1px solid #1f2937;
+            font-size: 0.72rem;
+            font-weight: 700;
+            letter-spacing: 0.04em;
+            color: var(--text-muted);
+            text-transform: uppercase;
+        }
+        .alert-item {
+            display: flex;
+            gap: 9px;
+            padding: 9px 12px;
+            border-bottom: 1px solid #161d2b;
+            font-size: 0.76rem;
+        }
+        .alert-item:last-child { border-bottom: none; }
+        .alert-dot {
+            width: 7px; height: 7px; border-radius: 50%;
+            margin-top: 5px; flex-shrink: 0;
+            background: var(--accent-red);
+        }
+        .alert-dot.warn { background: var(--accent-yellow); }
+        .alert-item-rig { font-weight: 600; display: block; margin-bottom: 1px; }
+        .alert-item-msg { color: var(--text-muted); }
+        .alert-empty { padding: 14px 12px; font-size: 0.76rem; color: var(--text-muted); }
+
         #logout-link {
-            float: right;
             color: var(--text-muted);
             font-size: 0.75rem;
             cursor: pointer;
@@ -713,7 +814,14 @@
         <input id="auth-password" type="password" placeholder="your password" autocomplete="current-password">
         <div id="auth-error"></div>
         <button class="btn-primary" id="auth-send-btn" onclick="tryLogin()">Sign in</button>
-        <div id="auth-hint" style="margin-top: 12px;">If password fails, we'll send a verification code.</div>
+        <!-- Revealed only after a failed sign-in. Sending a code is always an
+             explicit choice, never an automatic consequence of a typo. -->
+        <div id="auth-otp-alt" class="hidden" style="margin-top: 12px;">
+            <button id="auth-otp-btn" onclick="sendCodeInstead()"
+                    style="width:100%;background:transparent;border:1px solid #1f2937;color:var(--text-muted);">
+                Email me a code instead
+            </button>
+        </div>
     </div>
 
     <div id="auth-step-code" class="hidden">
@@ -726,15 +834,36 @@
 </div>
 
 <div id="dashboard" class="container hidden">
-    <div class="full-width">
-        <span id="logout-link" onclick="logout()">Sign out (<span id="session-email"></span>)</span>
+    <div class="full-width" style="position: relative;">
+        <div class="top-right-bar">
+            <div class="bell-wrap">
+                <button type="button" id="alert-bell" class="bell-btn" onclick="toggleAlertPanel(event)"
+                        aria-haspopup="true" aria-expanded="false" aria-label="Unresolved alerts" title="Unresolved alerts">
+                    <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                         stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"></path>
+                        <path d="M13.73 21a2 2 0 0 1-3.46 0"></path>
+                    </svg>
+                    <span id="bell-badge" class="bell-badge hidden">0</span>
+                </button>
+                <div id="alert-panel" class="alert-panel hidden" aria-label="Unresolved alerts">
+                    <div class="alert-panel-head">Unresolved alerts</div>
+                    <div id="alert-panel-body"></div>
+                </div>
+            </div>
+            <a class="top-bar-link" href="/changelog.html">Changelog</a>
+            <span id="logout-link" onclick="logout()">Sign out (<span id="session-email"></span>)</span>
+        </div>
         <h1 class="page-title">ShiftIQ Fleet Monitor Console</h1>
         <p class="page-sub">Live API-backed status stream and automatic log timing calculations.</p>
-        <label class="notif-toggle" title="Browser push notifications for critical alerts">
-            <input type="checkbox" id="notif-switch" onchange="onNotifSwitch(this)">
-            <span class="notif-track"><span class="notif-thumb"></span></span>
-            <span id="notif-label-text">Push notifications off</span>
-        </label>
+        <div class="header-status-row">
+            <label class="notif-toggle" title="Browser push notifications for critical alerts">
+                <input type="checkbox" id="notif-switch" onchange="onNotifSwitch(this)">
+                <span class="notif-track"><span class="notif-thumb"></span></span>
+                <span id="notif-label-text">Push notifications off</span>
+            </label>
+            <span id="loop-status-top" class="loop-status loop-status-inline status-off">CONNECTING...</span>
+        </div>
         <div id="notif-help"></div>
     </div>
 
@@ -913,6 +1042,14 @@
 <script>
     const IS_LOCAL = location.protocol === 'file:' || ['127.0.0.1', 'localhost'].includes(location.hostname);
     const API_BASE = IS_LOCAL ? "http://127.0.0.1:8080" : "/api";
+
+    // Each tick is ONE serverless invocation: /api/summary runs the fleet poll
+    // (plus the hourly backfill when due) and returns devices + rankings +
+    // stats + logs + task history together. The old build hit five endpoints
+    // every 2s, which on Vercel is five billable invocations per tick per tab.
+    // At 20s one permanently open tab is ~4.3k invocations/day against Hobby's
+    // 100k/month, and ~4.3k Upstash commands/day against its 10k/day free tier.
+    const POLL_MS = 20000;
     const TOKEN_KEY = "fleet_dashboard_token";
     let pollTimer = null;
     let pendingToken = null;
@@ -928,6 +1065,9 @@
         document.getElementById('auth-error').textContent = '';
         document.getElementById('auth-code-error').textContent = '';
         document.getElementById('auth-code').value = '';
+        // Re-hide the code offer; it should only reappear after a real failure.
+        const alt = document.getElementById('auth-otp-alt');
+        if (alt) alt.classList.add('hidden');
     }
 
     async function tryLogin() {
@@ -941,26 +1081,51 @@
         const btn = document.getElementById('auth-send-btn');
         btn.disabled = true;
         try {
-            // Try password login first
-            const res = await fetch(API_BASE + '/auth/verify-code', {
+            let res = await fetch(API_BASE + '/auth/login', {
                 method: 'POST',
-                mode: 'cors',
-                headers: { "Content-Type": "application/json", "ngrok-skip-browser-warning": "true" },
-                body: JSON.stringify({ email, code: password })  // Try password as code first
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ email, password })
             });
-            const data = await res.json();
+            // Older local builds have no /auth/login; they verified the
+            // password through the code endpoint instead.
+            if (res.status === 404) {
+                res = await fetch(API_BASE + '/auth/verify-code', {
+                    method: 'POST',
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ email, code: password })
+                });
+            }
+            const data = await res.json().catch(() => ({}));
             if (res.ok && data.ok) {
-                // Password worked
                 localStorage.setItem(TOKEN_KEY, data.token);
                 enterDashboard(email);
                 return;
             }
-            // Password didn't work, fall back to OTP
-            requestOTP(email);
+
+            // A failed password does NOT send a verification email any more.
+            // It used to fire one off automatically, so every typo put an
+            // unwanted code in the inbox. Requesting one is now deliberate.
+            errEl.textContent = data.error || 'Incorrect email or password.';
+            const alt = document.getElementById('auth-otp-alt');
+            if (alt) alt.classList.remove('hidden');
         } catch (e) {
-            errEl.textContent = 'Could not reach the local dashboard server.';
+            errEl.textContent = 'Could not reach the dashboard API.';
         } finally {
             btn.disabled = false;
+        }
+    }
+
+    // Only ever runs from an explicit click.
+    async function sendCodeInstead() {
+        const email = document.getElementById('auth-email').value.trim();
+        const errEl = document.getElementById('auth-error');
+        if (!email) { errEl.textContent = 'Enter an email address first.'; return; }
+        const b = document.getElementById('auth-otp-btn');
+        if (b) { b.disabled = true; b.textContent = 'Sending…'; }
+        try {
+            await requestOTP(email);
+        } finally {
+            if (b) { b.disabled = false; b.textContent = 'Email me a code instead'; }
         }
     }
 
@@ -1055,41 +1220,21 @@
         }
         setNotifUI();
         fetchUpdates();
-        if (!pollTimer) pollTimer = setInterval(fetchUpdates, 2000);
+        if (!pollTimer) pollTimer = setInterval(fetchUpdates, POLL_MS);
     }
 
     async function checkSession() {
-        if (IS_LOCAL) {
-            try {
-                const res = await fetch(API_BASE + '/auth/auto-token', {
-                    mode: 'cors',
-                    headers: { "ngrok-skip-browser-warning": "true" }
-                });
-                if (res.ok) {
-                    const data = await res.json();
-                    if (data.token) {
-                        localStorage.setItem(TOKEN_KEY, data.token);
-                        enterDashboard(data.email);
-                        return;
-                    }
-                }
-            } catch (e) { /* server not up yet */ }
-        }
-
+        // No auto-token bootstrap. That endpoint returned a full-access token
+        // without authentication — safe only on loopback, never on a public
+        // URL. Sessions are validated server-side against Redis.
         const token = localStorage.getItem(TOKEN_KEY);
         if (!token) return;
         try {
-            const res = await fetch(API_BASE + '/auth/status', {
-                mode: 'cors',
-                headers: { ...authHeaders(), "ngrok-skip-browser-warning": "true" }
-            });
+            const res = await fetch(API_BASE + '/auth/status', { headers: { ...authHeaders() } });
             const data = await res.json();
-            if (data.authenticated) {
-                enterDashboard(data.email);
-            } else {
-                localStorage.removeItem(TOKEN_KEY);
-            }
-        } catch (e) { /* stay on the login screen if offline */ }
+            if (data.authenticated) enterDashboard(data.email);
+            else localStorage.removeItem(TOKEN_KEY);
+        } catch (e) { /* stay on the login screen if the API is unreachable */ }
     }
 
     // ── Terminal warning filter ─────────────────────────────────────────
@@ -1478,6 +1623,10 @@
         (alerts || []).filter(a => isMonitored(a.hostname)).forEach(a => {
             const key = a.hostname + '|' + a.kind;
             current.add(key);
+            // The server sets notify=false while a condition is ongoing but
+            // inside its quiet period, so a rig that has been low on disk all
+            // afternoon keeps its warning without re-alerting every poll.
+            if (a.notify === false) return;
             if (!notifiedAlerts.has(key)) {
                 notifiedAlerts.add(key);
                 playNotificationSound();
@@ -1488,7 +1637,70 @@
             }
         });
         [...notifiedAlerts].forEach(k => { if (!current.has(k)) notifiedAlerts.delete(k); });
+        renderAlertBell(alerts);
     }
+
+    // ── Notification bell ────────────────────────────────────────────────
+    // "Unresolved" is every monitored alert the server is still reporting,
+    // minus the resolved/cleared ones. notify=false is deliberately NOT a
+    // filter here: that flag only suppresses re-notifying during the quiet
+    // period, and a rig that has been low on disk all afternoon is exactly
+    // what the bell should keep showing.
+    function isResolvedAlert(a) {
+        return /resolved|cleared/i.test(a.kind || '') || /resolved/i.test(a.message || '');
+    }
+
+    function unresolvedAlerts(alerts) {
+        return (alerts || []).filter(a => isMonitored(a.hostname) && !isResolvedAlert(a));
+    }
+
+    function renderAlertBell(alerts) {
+        const list  = unresolvedAlerts(alerts);
+        const bell  = document.getElementById('alert-bell');
+        const badge = document.getElementById('bell-badge');
+        const body  = document.getElementById('alert-panel-body');
+        if (!bell || !badge || !body) return;
+
+        badge.textContent = list.length > 99 ? '99+' : String(list.length);
+        badge.classList.toggle('hidden', list.length === 0);
+        bell.classList.toggle('has-alerts', list.length > 0);
+        bell.title = list.length
+            ? list.length + ' unresolved alert' + (list.length === 1 ? '' : 's')
+            : 'No unresolved alerts';
+
+        body.innerHTML = list.length
+            ? list.map(a =>
+                '<div class="alert-item">' +
+                    '<span class="alert-dot' + (/warn/i.test(a.kind || '') ? ' warn' : '') + '"></span>' +
+                    '<span><span class="alert-item-rig">' + esc(a.rig || a.hostname || '') + '</span>' +
+                    '<span class="alert-item-msg">' + esc(a.message || '') + '</span></span>' +
+                '</div>').join('')
+            : '<div class="alert-empty">Nothing unresolved. All monitored rigs are healthy.</div>';
+    }
+
+    function toggleAlertPanel(evt) {
+        if (evt) evt.stopPropagation();
+        const panel = document.getElementById('alert-panel');
+        const bell  = document.getElementById('alert-bell');
+        const open  = panel.classList.toggle('hidden') === false;
+        bell.setAttribute('aria-expanded', String(open));
+    }
+
+    document.addEventListener('click', (e) => {
+        const panel = document.getElementById('alert-panel');
+        if (!panel || panel.classList.contains('hidden')) return;
+        if (e.target.closest('.bell-wrap')) return;
+        panel.classList.add('hidden');
+        document.getElementById('alert-bell').setAttribute('aria-expanded', 'false');
+    });
+
+    document.addEventListener('keydown', (e) => {
+        if (e.key !== 'Escape') return;
+        const panel = document.getElementById('alert-panel');
+        if (!panel || panel.classList.contains('hidden')) return;
+        panel.classList.add('hidden');
+        document.getElementById('alert-bell').setAttribute('aria-expanded', 'false');
+    });
 
     function parseAnsi(text) {
         let html = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -1644,9 +1856,12 @@
     }
 
     function dailyBarColors() {
+        // Selection has to read at a glance across a 30-bar chart, so the
+        // selected blue is near-solid and a stop darker, and the unselected
+        // green is dialled back to sit behind it.
         return lastDayDates.map(d => selectedDays && selectedDays.has(d)
-            ? { bg: 'rgba(96,165,250,0.55)', border: '#60a5fa' }
-            : { bg: 'rgba(16,185,129,0.45)', border: '#10b981' });
+            ? { bg: 'rgba(37,99,235,0.88)',  border: '#60a5fa' }
+            : { bg: 'rgba(16,185,129,0.22)', border: 'rgba(16,185,129,0.55)' });
     }
 
     async function fetchRangeStats() {
@@ -2037,66 +2252,46 @@
         }
     }
 
+    let pollInFlight = false;
+
+    // The status is mirrored in two places — the terminal card header and the
+    // header row beside the notification switch — so it stays visible when the
+    // terminal card is collapsed or scrolled past.
+    function setLoopStatus(text, cls, title) {
+        [['loop-status', ''], ['loop-status-top', ' loop-status-inline']].forEach(function (pair) {
+            const el = document.getElementById(pair[0]);
+            if (!el) return;
+            el.textContent = text;
+            el.className = 'loop-status' + pair[1] + ' ' + cls;
+            el.title = title || '';
+        });
+    }
+
     async function fetchUpdates() {
+        if (pollInFlight) return;          // never stack requests on a slow link
+        pollInFlight = true;
         try {
-            const logRes = await fetch(API_BASE + '/logs', {
-                mode: 'cors',
-                headers: { ...authHeaders(), "ngrok-skip-browser-warning": "true" }
-            });
-            if (logRes.status === 401) return logout();
-            lastLogs = await logRes.json();
-            renderTerminal();
+            const res = await fetch(API_BASE + '/summary', { headers: { ...authHeaders() } });
+            if (res.status === 401) return logout();
+            if (!res.ok) throw new Error('summary ' + res.status);
+            const d = await res.json();
 
-            const devRes = await fetch(API_BASE + '/devices', {
-                mode: 'cors',
-                headers: { ...authHeaders(), "ngrok-skip-browser-warning": "true" }
-            });
-            if (devRes.status === 401) return logout();
-            if (devRes.ok) {
-                const devData = await devRes.json();
-                renderRigs(devData);
-                handleAlerts(devData.alerts);
-            }
-
-            const rankRes = await fetch(API_BASE + '/rankings', {
-                mode: 'cors',
-                headers: { ...authHeaders(), "ngrok-skip-browser-warning": "true" }
-            });
-            if (rankRes.status === 401) return logout();
-            const data = await rankRes.json();
-
-            const statusEl = document.getElementById('loop-status');
-            if (data.active) {
-                statusEl.textContent = "LOOP ACTIVE";
-                statusEl.className = "loop-status status-on";
+            if (d.poll && d.poll.error) {
+                setLoopStatus("POLL ERROR", "status-off", d.poll.error);
             } else {
-                statusEl.textContent = "LOOP PAUSED";
-                statusEl.className = "loop-status status-off";
+                setLoopStatus("LOOP ACTIVE", "status-on", '');
             }
 
-            const statsRes = await fetch(API_BASE + '/stats', {
-                mode: 'cors',
-                headers: { ...authHeaders(), "ngrok-skip-browser-warning": "true" }
-            });
-            if (statsRes.ok) {
-                const statsData = await statsRes.json();
-                renderStats(statsData);
-                fetchRangeStats();
-            }
-
-            const taskRes = await fetch(API_BASE + '/task_history', {
-                mode: 'cors',
-                headers: { ...authHeaders(), "ngrok-skip-browser-warning": "true" }
-            });
-            if (taskRes.ok) {
-                const taskData = await taskRes.json();
-                renderTaskHistory(taskData);
-            }
+            if (Array.isArray(d.logs)) { lastLogs = d.logs; renderTerminal(); }
+            if (d.devices) { renderRigs(d.devices); handleAlerts(d.devices.alerts); }
+            if (d.stats)   { renderStats(d.stats); fetchRangeStats(); }
+            if (d.task_history) renderTaskHistory(d.task_history);
 
         } catch (e) {
-            document.getElementById('loop-status').textContent = "MONITOR OFFLINE";
-            document.getElementById('loop-status').className = "loop-status status-off";
-            console.error("Connection failure", e);
+            setLoopStatus("MONITOR OFFLINE", "status-off", String(e && e.message || e));
+            console.error("Summary fetch failed", e);
+        } finally {
+            pollInFlight = false;
         }
     }
 

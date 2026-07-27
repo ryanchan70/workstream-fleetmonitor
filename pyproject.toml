@@ -4,5 +4,6 @@ version = "1.0.0"
 requires-python = ">=3.12"
 dependencies = ["requests"]
 
-[tool.vercel]
-entrypoint = "main:app"
+# The old `[tool.vercel] entrypoint = "main:app"` pointed at the superseded
+# WSGI build (now legacy/main.py). Routing is defined in vercel.json instead:
+# every /api/* request rewrites to the api/index.py serverless function.

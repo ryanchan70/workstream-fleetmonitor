@@ -1,15 +1,85 @@
+# ─────────────────────────────────────────────────────────────────────────
+# Allowlist. Everything is ignored unless explicitly permitted below.
+#
+# Deliberately inverted: this repo sits next to secrets.json, .env.local and
+# a pile of generated caches. With a normal denylist, any new secret or cache
+# file is committed by default and you only find out afterwards. Here the
+# default is "ignored", so a new file has to be opted in.
+#
+# (The previous version used `*.json`, which also excluded package.json and
+# vercel.json — files the build actually needs.)
+# ─────────────────────────────────────────────────────────────────────────
+*
+
+# Descend into directories so the rules below can match inside them.
+!*/
+
+# ── Source ───────────────────────────────────────────────────────────────
+!.gitignore
+!.vercelignore
+!*.py
+!*.html
+!favicon.ico
+!*.md
+
+# ── Config / manifests ───────────────────────────────────────────────────
+!pyproject.toml
+!requirements.txt
+!package.json
+!package-lock.json
+!vercel.json
+!fly.toml
+!Dockerfile
+!.dockerfile
+
+# ─────────────────────────────────────────────────────────────────────────
+# Re-ignored AFTER the allowlist, because later rules win. Without this,
+# `!*.py` above would happily pull in every .py inside node_modules.
+# ─────────────────────────────────────────────────────────────────────────
+
+# ── Local-only working directory ─────────────────────────────────────────
+# Runtime caches, generated logs, secrets, and the unused Fly.io/Docker/npm
+# leftovers. Ignored wholesale — the allowlist above would otherwise pull in
+# local/package.json, local/*.md and every .py under local/node_modules.
+local/
+
+# ── Secrets — never commit ───────────────────────────────────────────────
+secrets.json
+.env
+.env.*
+*.local
+
+# ── Vendored / build output ──────────────────────────────────────────────
+node_modules/
+__pycache__/
+*.py[cod]
+.vercel/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# ── Runtime state written by fleet_monitor.py ────────────────────────────
+# Rebuilt automatically from the fleet API. Committing it causes merge
+# conflicts and puts operator names into git history.
+.daily_hours_cache.json
+.dashboard_sessions.json
+.frame_health_cache.json
+.leaderboard_cache.json
+.pi_session_cache.json
+.task_history.json
+.device_locations.json
+*.tmp
+
+# ── Generated logs ───────────────────────────────────────────────────────
+operator_sessions/
+recording_logs/
 daily_recording_log_*.txt
 operator_sessions_*.txt
-*.txt
-!requirements.txt
 *.log
-*.json
-.*.json
-.dashboard_sessions.json
-.leaderboard_cache.json
 
+# ── OS noise ─────────────────────────────────────────────────────────────
 .DS_Store
-__pycache__/
-*.pyc
-.vercel
-.env*
+Thumbs.db

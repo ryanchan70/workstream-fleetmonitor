@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Changelog — Fleet Monitor</title>
+    <link rel="icon" href="/favicon.ico" sizes="32x32">
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=Geist+Mono:wght@400;600&display=swap">
+    <style>
+        :root {
+            --bg-color: #0b0f19;
+            --card-bg: #111827;
+            --text-color: #e5e7eb;
+            --text-muted: #9ca3af;
+            --accent-blue: #3b82f6;
+            --accent-green: #10b981;
+            --border: #1f2937;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            padding: 22px 20px 60px;
+            background: var(--bg-color);
+            color: var(--text-color);
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            font-size: 0.9rem;
+            line-height: 1.6;
+        }
+        .wrap { max-width: 780px; margin: 0 auto; }
+
+        .back-link {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            color: var(--text-muted);
+            font-size: 0.78rem;
+            text-decoration: none;
+            padding: 5px 10px 5px 7px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            background: var(--card-bg);
+        }
+        .back-link:hover { color: var(--text-color); border-color: #374151; }
+        .back-link:focus-visible { outline: 2px solid var(--accent-blue); outline-offset: 2px; }
+
+        .doc { margin-top: 22px; }
+        .doc h1 {
+            font-size: 1.3rem;
+            margin: 0 0 4px;
+            text-transform: capitalize;
+        }
+        .doc h2 {
+            font-size: 1rem;
+            margin: 30px 0 10px;
+            padding-bottom: 6px;
+            border-bottom: 1px solid var(--border);
+            color: var(--accent-blue);
+            font-family: 'Geist Mono', monospace;
+        }
+        .doc h3 {
+            font-size: 0.86rem;
+            margin: 18px 0 8px;
+            color: var(--accent-green);
+            letter-spacing: 0.01em;
+        }
+        .doc ul { margin: 8px 0; padding-left: 20px; }
+        .doc li { margin: 5px 0; }
+        .doc li > ul { margin: 4px 0 6px; }
+        .doc strong { color: #fff; font-weight: 600; }
+        .doc code {
+            font-family: 'Geist Mono', monospace;
+            font-size: 0.82em;
+            background: #0d1424;
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            padding: 1px 5px;
+        }
+        .doc a { color: var(--accent-blue); }
+        .doc hr { border: none; border-top: 1px solid var(--border); margin: 26px 0; }
+        .status { color: var(--text-muted); font-size: 0.82rem; margin-top: 22px; }
+    </style>
+</head>
+<body>
+<div class="wrap">
+    <a class="back-link" href="/" aria-label="Back to the fleet monitor">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M19 12H5"></path><path d="m12 19-7-7 7-7"></path>
+        </svg>
+        Back to monitor
+    </a>
+
+    <div id="doc" class="doc"><p class="status">Loading changelog…</p></div>
+</div>
+
+<script>
+    const TOKEN_KEY = "fleet_dashboard_token";
+
+    function esc(s) {
+        return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    // Inline renderer for the subset of Markdown changelog.md actually uses:
+    // ATX headings, nested bullet lists, bold/italic, inline code, links and
+    // rules. Deliberately not a CDN dependency for a page this small.
+    function renderInline(text) {
+        let s = esc(text);
+        s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
+        s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+        s = s.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+        s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g,
+                      '<a href="$2" rel="noopener noreferrer">$1</a>');
+        return s;
+    }
+
+    function renderMarkdown(md) {
+        const out = [];
+        const indents = [];    // indent width of each open <ul>
+        const liOpen  = [];    // whether that <ul> currently has an open <li>
+
+        // A nested list has to be emitted INSIDE the parent <li>, not beside
+        // it, so the parent's <li> is left open until a sibling or the close
+        // of its list arrives.
+        const closeLi = () => {
+            if (liOpen.length && liOpen[liOpen.length - 1]) {
+                out.push('</li>');
+                liOpen[liOpen.length - 1] = false;
+            }
+        };
+        const closeList = () => {
+            closeLi();
+            out.push('</ul>');
+            indents.pop();
+            liOpen.pop();
+        };
+        const closeDeeperThan = (indent) => {
+            while (indents.length && indents[indents.length - 1] > indent) closeList();
+        };
+        const closeAll = () => { while (indents.length) closeList(); };
+
+        for (const raw of md.replace(/\r\n/g, '\n').split('\n')) {
+            const line = raw.trimEnd();
+            if (!line.trim()) continue;
+
+            const bullet = line.match(/^(\s*)[-*+]\s+(.*)$/);
+            if (bullet) {
+                const indent = bullet[1].replace(/\t/g, '    ').length;
+                closeDeeperThan(indent);
+                if (!indents.length || indents[indents.length - 1] < indent) {
+                    out.push('<ul>');           // opens inside the parent <li>
+                    indents.push(indent);
+                    liOpen.push(false);
+                } else {
+                    closeLi();                  // sibling at the same level
+                }
+                out.push('<li>' + renderInline(bullet[2]));
+                liOpen[liOpen.length - 1] = true;
+                continue;
+            }
+
+            closeAll();
+
+            const heading = line.match(/^(#{1,6})\s+(.*)$/);
+            if (heading) {
+                const level = Math.min(heading[1].length, 6);
+                out.push('<h' + level + '>' + renderInline(heading[2]) + '</h' + level + '>');
+            } else if (/^([-*_])\1{2,}$/.test(line.trim())) {
+                out.push('<hr>');
+            } else {
+                out.push('<p>' + renderInline(line.trim()) + '</p>');
+            }
+        }
+        closeAll();
+        return out.join('\n');
+    }
+
+    (async function load() {
+        const doc = document.getElementById('doc');
+        const token = localStorage.getItem(TOKEN_KEY);
+        if (!token) {
+            doc.innerHTML = '<p class="status">Not signed in. ' +
+                '<a href="/">Sign in on the monitor</a> to read the changelog.</p>';
+            return;
+        }
+        try {
+            const res = await fetch('/api/changelog', {
+                headers: { 'Authorization': 'Bearer ' + token }
+            });
+            if (res.status === 401) {
+                doc.innerHTML = '<p class="status">Session expired. ' +
+                    '<a href="/">Sign in again</a>.</p>';
+                return;
+            }
+            if (!res.ok) throw new Error('changelog ' + res.status);
+            const data = await res.json();
+            doc.innerHTML = renderMarkdown(data.markdown || '');
+        } catch (e) {
+            doc.innerHTML = '<p class="status">Could not load the changelog: ' +
+                            esc(e.message || e) + '</p>';
+        }
+    })();
+</script>
+</body>
+</html>
