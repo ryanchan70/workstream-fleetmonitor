@@ -269,7 +269,6 @@ def backfill(force: bool = False) -> dict:
         return {"skipped": "locked"}
 
     try:
-        R.jset("backfill:last", time.time())
         devices = fleet.fleet_status()
         if not devices:
             return {"skipped": "no devices"}
@@ -306,6 +305,11 @@ def backfill(force: bool = False) -> dict:
                 entry = {
                     "date": C.session_date(rec),
                     "duration_s": dur,
+                    # Stored so past-day rankings can name the rig. Every
+                    # hostname is of the form rpi5-xxxx-xxxx, which trips
+                    # is_unnamed_pi() — without the label the session gets
+                    # filtered out of stats_range entirely.
+                    "label": label,
                     "operator": C.clean_str(rec.get("operator")),
                     "name": rec.get("name"),
                     "task": C.task_label(rec),
@@ -348,6 +352,11 @@ def backfill(force: bool = False) -> dict:
                       if v > float(existing_days.get(d, 0) or 0)}
             if merged:
                 R.hset_many_json("daily_hours", merged)
+
+        # Stamped only once the sweep has actually succeeded. Stamping up front
+        # meant any failure — an unreachable fleet API, missing credentials —
+        # still counted as "done" and suppressed every retry for a full hour.
+        R.jset("backfill:last", time.time())
 
         _log(f"INFO   Backfill — {len(fetched)} device(s), {len(by_day)} past day(s).")
         return {"devices": len(fetched), "days": len(by_day)}

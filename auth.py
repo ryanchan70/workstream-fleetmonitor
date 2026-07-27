@@ -21,7 +21,10 @@ from api_client import BASE_URL, FleetAPIClient
 
 PENDING_TTL_S = 5 * 60          # window to enter a code after requesting one
 SESSION_TTL_S = 12 * 60 * 60    # dashboard session lifetime
-SESSIONS_FILE = ".dashboard_sessions.json"   # git-ignored
+# Kept under local/ with the other runtime state; git-ignored either way.
+SESSIONS_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "local", "caches",
+    ".dashboard_sessions.json")
 
 
 class DashboardAuth:

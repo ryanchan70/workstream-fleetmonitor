@@ -18,7 +18,8 @@
 !.gitignore
 !.vercelignore
 !*.py
-!index.html
+!*.html
+!favicon.ico
 !*.md
 
 # ── Config / manifests ───────────────────────────────────────────────────
@@ -35,6 +36,12 @@
 # Re-ignored AFTER the allowlist, because later rules win. Without this,
 # `!*.py` above would happily pull in every .py inside node_modules.
 # ─────────────────────────────────────────────────────────────────────────
+
+# ── Local-only working directory ─────────────────────────────────────────
+# Runtime caches, generated logs, secrets, and the unused Fly.io/Docker/npm
+# leftovers. Ignored wholesale — the allowlist above would otherwise pull in
+# local/package.json, local/*.md and every .py under local/node_modules.
+local/
 
 # ── Secrets — never commit ───────────────────────────────────────────────
 secrets.json

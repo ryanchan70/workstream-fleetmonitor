@@ -2,6 +2,10 @@
 # Vercel respects .gitignore too, but this repo's .gitignore is an allowlist,
 # so being explicit here avoids surprises.
 
+# Local-only working directory: caches, generated logs, secrets, and the
+# unused Fly.io / Docker / npm leftovers. None of it belongs in the bundle.
+local/
+
 node_modules/
 __pycache__/
 *.py[cod]

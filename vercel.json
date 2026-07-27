@@ -5,9 +5,13 @@
     "api/index.py": {
       "memory": 1024,
       "maxDuration": 60,
-      "includeFiles": "{api/_lib/**,api_client.py,auth.py}"
+      "includeFiles": "{api/_lib/**,api_client.py,auth.py,changelog.md}"
     }
   },
+
+  "redirects": [
+    { "source": "/", "destination": "/index.html", "permanent": false }
+  ],
 
   "rewrites": [
     { "source": "/api/(.*)", "destination": "/api/index" }

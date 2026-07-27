@@ -40,7 +40,12 @@ GET /api/health   ->  {"ok": true, "redis": true}
 ## Layout
 
 ```
-index.html              dashboard (static, served at /)
+public/index.html       dashboard (static). Vercel treats this repo as a
+                        `framework: python` backend project, so static assets
+                        are served ONLY out of public/ — a file at the repo
+                        root falls through to the Python catch-all instead.
+public/favicon.ico      same reason
+
 vercel.json             routes every /api/* to one function
 .vercelignore           keeps local-only files out of the bundle
 requirements.txt        requests (needed by api_client.py)
@@ -85,7 +90,7 @@ does not read. Removed; routing lives in `vercel.json`.
 
 ## Polling
 
-The dashboard drives everything. One request every 5 seconds to
+The dashboard drives everything. One request every 20 seconds to
 `/api/summary`, which runs a poll cycle and returns devices + rankings + stats
 + logs + task history in a single response. Backfill runs inside that same
 request on first boot and then hourly, gated by a Redis timestamp — no cron,
@@ -100,10 +105,11 @@ stopped recording" *notification* for a stop that happened with no tab open.
 
 ### Invocation budget
 
-One tab at 5s ≈ 17k invocations/day; Hobby includes 100k/month. A permanently
-open tab will exceed that. Raise `POLL_MS` in `index.html` if needed — 30s is
-about 2.9k/day. Upstash free tier is 10k commands/day and each poll is roughly
-10–15 commands, so the same arithmetic applies.
+One tab at the default 20s ≈ 4.3k invocations/day, against the 100k/month
+Hobby includes — a permanently open tab fits with room to spare. `POLL_MS` in
+`public/index.html` controls it: 5s is ≈17k/day and will blow the budget, 30s
+is ≈2.9k/day. Upstash free tier is 10k commands/day and each poll is roughly
+10–15 commands, so that tier is the tighter constraint of the two.
 
 ---
 

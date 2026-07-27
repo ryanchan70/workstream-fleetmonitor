@@ -115,6 +115,8 @@ class handler(BaseHTTPRequestHandler):
                 return self._json(200, self._task_history())
             if route == "logs":
                 return self._json(200, R.log_read())
+            if route == "changelog":
+                return self._json(200, {"markdown": self._changelog()})
             if route == "locations":
                 return self._json(200, R.hgetall_json("locations"))
             if route == "poll":
@@ -229,6 +231,23 @@ class handler(BaseHTTPRequestHandler):
         d = R.jget("rigs", {}) or {}
         return {"rigs": d.get("rigs", []), "alerts": d.get("alerts", []), "active": True}
 
+    def _changelog(self):
+        """changelog.md, served to /changelog.html.
+
+        The file stays in the repo root as the single source of truth and is
+        pulled into the bundle by `includeFiles` in vercel.json, rather than
+        being duplicated into public/. Behind the auth gate with everything
+        else — release notes are not public.
+        """
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "changelog.md")
+        try:
+            with open(path, encoding="utf-8") as f:
+                return f.read()
+        except OSError:
+            return "# changelog\n\nNo changelog.md found in the deployment."
+
     def _stats(self):
         today = C.get_date_str()
         lb = R.jget("leaderboard", {}) or {}
@@ -287,6 +306,13 @@ class handler(BaseHTTPRequestHandler):
 
         past = [d for d in days if d != today]
         if past:
+            # Hostnames are all rpi5-xxxx-xxxx, which is_unnamed_pi() rejects,
+            # so falling back to the hostname would drop every past session.
+            # Sessions written before the label was stored are resolved against
+            # the live rig list instead.
+            rig_labels = {r.get("hostname"): r.get("label")
+                          for r in (R.jget("rigs", {}) or {}).get("rigs", [])
+                          if r.get("hostname") and r.get("label")}
             hosts = R.cmd("KEYS", R.P + "sessions:*") or []
             for key in hosts:
                 host = str(key).split("sessions:", 1)[-1]
@@ -296,7 +322,7 @@ class handler(BaseHTTPRequestHandler):
                     dur = float(sess.get("duration_s") or 0)
                     if dur <= 0:
                         continue
-                    label = sess.get("label") or host
+                    label = sess.get("label") or rig_labels.get(host) or host
                     if C.is_unnamed_pi(label):
                         continue
                     by_pi[label] = by_pi.get(label, 0.0) + dur

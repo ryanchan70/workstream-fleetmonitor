@@ -63,8 +63,15 @@ api_client: FleetAPIClient | None = None
 _device_locations: dict[str, str] = {}  # hostname -> "location_name"
 _completed_tasks: dict[str, list] = {}   # hostname -> [{"name": "", "op": "", "dur": s, "ts": unix}]
 _task_history_lock = threading.Lock()
-_LOCATIONS_FILE = ".device_locations.json"
-_TASK_HISTORY_FILE = ".task_history.json"
+# Runtime caches, generated logs and secrets live under local/ so the repo
+# root holds only what the Vercel build and git actually need. Resolved
+# against this file rather than the cwd so the script runs from anywhere.
+_LOCAL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "local")
+_CACHE_DIR = os.path.join(_LOCAL_DIR, "caches")
+os.makedirs(_CACHE_DIR, exist_ok=True)
+
+_LOCATIONS_FILE = os.path.join(_CACHE_DIR, ".device_locations.json")
+_TASK_HISTORY_FILE = os.path.join(_CACHE_DIR, ".task_history.json")
 
 # ── Alert history (prevent spam) ──────────────────────────────────────────
 _last_alert_ts: dict[str, float] = {}  # "hostname|kind" -> unix timestamp
@@ -198,7 +205,7 @@ def _check_auto_token(token: str | None) -> str | None:
 # ── Frame health history (rolling 2-hour window at 5-s poll rate) ─────────────
 _HEALTH_HISTORY: collections.deque = collections.deque(maxlen=1440)
 _health_lock = threading.Lock()
-_HEALTH_HISTORY_FILE = ".frame_health_cache.json"
+_HEALTH_HISTORY_FILE = os.path.join(_CACHE_DIR, ".frame_health_cache.json")
 _health_save_counter = 0   # save every 60 entries (~5 min at 5-s poll)
 
 def _load_health_history():
@@ -225,7 +232,7 @@ def _save_health_history():
 
 # ── Persistent daily hours cache ──────────────────────────────────────────
 # Survives restarts; keyed by YYYY-MM-DD, value in seconds (named pis only).
-_DAILY_HOURS_FILE = ".daily_hours_cache.json"
+_DAILY_HOURS_FILE = os.path.join(_CACHE_DIR, ".daily_hours_cache.json")
 _daily_hours_cache: dict[str, float] = {}
 _daily_hours_lock = threading.Lock()
 
@@ -276,7 +283,7 @@ def _flush_past_days_to_cache():
 # id, and survives restarts. It is the durable source used to (a) speed up
 # backfill on subsequent runs and (b) keep counting a Pi's time in daily
 # totals even after it goes offline and can no longer be reached directly.
-_PI_SESSION_CACHE_FILE = ".pi_session_cache.json"
+_PI_SESSION_CACHE_FILE = os.path.join(_CACHE_DIR, ".pi_session_cache.json")
 _pi_session_cache: dict[str, dict] = {}   # hostname -> {"label":.., "sessions": {sid: {...}}}
 _pi_session_cache_lock = threading.Lock()
 
@@ -592,8 +599,8 @@ def parse_duration_from_log(duration_str: str) -> float:
 
 # ── Log file layout ───────────────────────────────────────────────────────
 # Each kind of log gets its own subfolder so the repo root stays clean.
-OPERATOR_LOG_DIR  = os.environ.get("FLEET_OPERATOR_LOG_DIR",  "operator_sessions")
-RECORDING_LOG_DIR = os.environ.get("FLEET_RECORDING_LOG_DIR", "recording_logs")
+OPERATOR_LOG_DIR  = os.environ.get("FLEET_OPERATOR_LOG_DIR",  os.path.join(_LOCAL_DIR, "logs", "operator_sessions"))
+RECORDING_LOG_DIR = os.environ.get("FLEET_RECORDING_LOG_DIR", os.path.join(_LOCAL_DIR, "logs", "recording_logs"))
 
 
 def _log_path(directory: str, filename: str) -> str:
@@ -1111,7 +1118,7 @@ _leaderboard_fetch_state_lock = threading.Lock()
 # reprint that every single run — only when the message actually changes.
 _last_backfill_message: str = ""
 _device_sessions_lock = threading.Lock()
-LEADERBOARD_STATE_FILE = ".leaderboard_cache.json"   # git-ignored
+LEADERBOARD_STATE_FILE = os.path.join(_CACHE_DIR, ".leaderboard_cache.json")
 
 def _trim_groups(groups: list[dict], today_str: str) -> list[dict]:
     keep = ("id", "session_uuid", "name", "operator", "task", "duration_s",
@@ -1824,16 +1831,16 @@ def execute_otp_flow(email: str) -> bool:
 
 def login() -> bool:
     try:
-        with open("secrets.json", "r") as sf:
+        with open(os.path.join(_LOCAL_DIR, "secrets.json"), "r") as sf:
             secrets_data = json.load(sf)
             email = secrets_data.get("email")
             password = secrets_data.get("password")
     except Exception:
-        print(f"[{ts()}] FATAL  Could not read secrets.json.")
+        print(f"[{ts()}] FATAL  Could not read local/secrets.json.")
         return False
 
     if not email:
-        print(f"[{ts()}] FATAL  \"email\" is missing from secrets.json.")
+        print(f"[{ts()}] FATAL  \"email\" is missing from local/secrets.json.")
         return False
 
     print(f"[{ts()}] DEBUG  Authenticating with {api_client.base_url}...")
