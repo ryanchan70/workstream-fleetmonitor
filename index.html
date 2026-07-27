@@ -713,7 +713,14 @@
         <input id="auth-password" type="password" placeholder="your password" autocomplete="current-password">
         <div id="auth-error"></div>
         <button class="btn-primary" id="auth-send-btn" onclick="tryLogin()">Sign in</button>
-        <div id="auth-hint" style="margin-top: 12px;">If password fails, we'll send a verification code.</div>
+        <!-- Revealed only after a failed sign-in. Sending a code is always an
+             explicit choice, never an automatic consequence of a typo. -->
+        <div id="auth-otp-alt" class="hidden" style="margin-top: 12px;">
+            <button id="auth-otp-btn" onclick="sendCodeInstead()"
+                    style="width:100%;background:transparent;border:1px solid #1f2937;color:var(--text-muted);">
+                Email me a code instead
+            </button>
+        </div>
     </div>
 
     <div id="auth-step-code" class="hidden">
@@ -913,6 +920,12 @@
 <script>
     const IS_LOCAL = location.protocol === 'file:' || ['127.0.0.1', 'localhost'].includes(location.hostname);
     const API_BASE = IS_LOCAL ? "http://127.0.0.1:8080" : "/api";
+
+    // Each tick is ONE serverless invocation: /api/summary runs the fleet poll
+    // (plus the hourly backfill when due) and returns devices + rankings +
+    // stats + logs + task history together. The old build hit five endpoints
+    // every 2s, which on Vercel is five billable invocations per tick per tab.
+    const POLL_MS = 5000;
     const TOKEN_KEY = "fleet_dashboard_token";
     let pollTimer = null;
     let pendingToken = null;
@@ -928,6 +941,9 @@
         document.getElementById('auth-error').textContent = '';
         document.getElementById('auth-code-error').textContent = '';
         document.getElementById('auth-code').value = '';
+        // Re-hide the code offer; it should only reappear after a real failure.
+        const alt = document.getElementById('auth-otp-alt');
+        if (alt) alt.classList.add('hidden');
     }
 
     async function tryLogin() {
@@ -941,26 +957,51 @@
         const btn = document.getElementById('auth-send-btn');
         btn.disabled = true;
         try {
-            // Try password login first
-            const res = await fetch(API_BASE + '/auth/verify-code', {
+            let res = await fetch(API_BASE + '/auth/login', {
                 method: 'POST',
-                mode: 'cors',
-                headers: { "Content-Type": "application/json", "ngrok-skip-browser-warning": "true" },
-                body: JSON.stringify({ email, code: password })  // Try password as code first
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ email, password })
             });
-            const data = await res.json();
+            // Older local builds have no /auth/login; they verified the
+            // password through the code endpoint instead.
+            if (res.status === 404) {
+                res = await fetch(API_BASE + '/auth/verify-code', {
+                    method: 'POST',
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ email, code: password })
+                });
+            }
+            const data = await res.json().catch(() => ({}));
             if (res.ok && data.ok) {
-                // Password worked
                 localStorage.setItem(TOKEN_KEY, data.token);
                 enterDashboard(email);
                 return;
             }
-            // Password didn't work, fall back to OTP
-            requestOTP(email);
+
+            // A failed password does NOT send a verification email any more.
+            // It used to fire one off automatically, so every typo put an
+            // unwanted code in the inbox. Requesting one is now deliberate.
+            errEl.textContent = data.error || 'Incorrect email or password.';
+            const alt = document.getElementById('auth-otp-alt');
+            if (alt) alt.classList.remove('hidden');
         } catch (e) {
-            errEl.textContent = 'Could not reach the local dashboard server.';
+            errEl.textContent = 'Could not reach the dashboard API.';
         } finally {
             btn.disabled = false;
+        }
+    }
+
+    // Only ever runs from an explicit click.
+    async function sendCodeInstead() {
+        const email = document.getElementById('auth-email').value.trim();
+        const errEl = document.getElementById('auth-error');
+        if (!email) { errEl.textContent = 'Enter an email address first.'; return; }
+        const b = document.getElementById('auth-otp-btn');
+        if (b) { b.disabled = true; b.textContent = 'Sending…'; }
+        try {
+            await requestOTP(email);
+        } finally {
+            if (b) { b.disabled = false; b.textContent = 'Email me a code instead'; }
         }
     }
 
@@ -1055,41 +1096,21 @@
         }
         setNotifUI();
         fetchUpdates();
-        if (!pollTimer) pollTimer = setInterval(fetchUpdates, 2000);
+        if (!pollTimer) pollTimer = setInterval(fetchUpdates, POLL_MS);
     }
 
     async function checkSession() {
-        if (IS_LOCAL) {
-            try {
-                const res = await fetch(API_BASE + '/auth/auto-token', {
-                    mode: 'cors',
-                    headers: { "ngrok-skip-browser-warning": "true" }
-                });
-                if (res.ok) {
-                    const data = await res.json();
-                    if (data.token) {
-                        localStorage.setItem(TOKEN_KEY, data.token);
-                        enterDashboard(data.email);
-                        return;
-                    }
-                }
-            } catch (e) { /* server not up yet */ }
-        }
-
+        // No auto-token bootstrap. That endpoint returned a full-access token
+        // without authentication — safe only on loopback, never on a public
+        // URL. Sessions are validated server-side against Redis.
         const token = localStorage.getItem(TOKEN_KEY);
         if (!token) return;
         try {
-            const res = await fetch(API_BASE + '/auth/status', {
-                mode: 'cors',
-                headers: { ...authHeaders(), "ngrok-skip-browser-warning": "true" }
-            });
+            const res = await fetch(API_BASE + '/auth/status', { headers: { ...authHeaders() } });
             const data = await res.json();
-            if (data.authenticated) {
-                enterDashboard(data.email);
-            } else {
-                localStorage.removeItem(TOKEN_KEY);
-            }
-        } catch (e) { /* stay on the login screen if offline */ }
+            if (data.authenticated) enterDashboard(data.email);
+            else localStorage.removeItem(TOKEN_KEY);
+        } catch (e) { /* stay on the login screen if the API is unreachable */ }
     }
 
     // ── Terminal warning filter ─────────────────────────────────────────
@@ -1478,6 +1499,10 @@
         (alerts || []).filter(a => isMonitored(a.hostname)).forEach(a => {
             const key = a.hostname + '|' + a.kind;
             current.add(key);
+            // The server sets notify=false while a condition is ongoing but
+            // inside its quiet period, so a rig that has been low on disk all
+            // afternoon keeps its warning without re-alerting every poll.
+            if (a.notify === false) return;
             if (!notifiedAlerts.has(key)) {
                 notifiedAlerts.add(key);
                 playNotificationSound();
@@ -2037,66 +2062,40 @@
         }
     }
 
+    let pollInFlight = false;
+
     async function fetchUpdates() {
+        if (pollInFlight) return;          // never stack requests on a slow link
+        pollInFlight = true;
         try {
-            const logRes = await fetch(API_BASE + '/logs', {
-                mode: 'cors',
-                headers: { ...authHeaders(), "ngrok-skip-browser-warning": "true" }
-            });
-            if (logRes.status === 401) return logout();
-            lastLogs = await logRes.json();
-            renderTerminal();
-
-            const devRes = await fetch(API_BASE + '/devices', {
-                mode: 'cors',
-                headers: { ...authHeaders(), "ngrok-skip-browser-warning": "true" }
-            });
-            if (devRes.status === 401) return logout();
-            if (devRes.ok) {
-                const devData = await devRes.json();
-                renderRigs(devData);
-                handleAlerts(devData.alerts);
-            }
-
-            const rankRes = await fetch(API_BASE + '/rankings', {
-                mode: 'cors',
-                headers: { ...authHeaders(), "ngrok-skip-browser-warning": "true" }
-            });
-            if (rankRes.status === 401) return logout();
-            const data = await rankRes.json();
+            const res = await fetch(API_BASE + '/summary', { headers: { ...authHeaders() } });
+            if (res.status === 401) return logout();
+            if (!res.ok) throw new Error('summary ' + res.status);
+            const d = await res.json();
 
             const statusEl = document.getElementById('loop-status');
-            if (data.active) {
+            if (d.poll && d.poll.error) {
+                statusEl.textContent = "POLL ERROR";
+                statusEl.className = "loop-status status-off";
+                statusEl.title = d.poll.error;
+            } else {
                 statusEl.textContent = "LOOP ACTIVE";
                 statusEl.className = "loop-status status-on";
-            } else {
-                statusEl.textContent = "LOOP PAUSED";
-                statusEl.className = "loop-status status-off";
+                statusEl.title = '';
             }
 
-            const statsRes = await fetch(API_BASE + '/stats', {
-                mode: 'cors',
-                headers: { ...authHeaders(), "ngrok-skip-browser-warning": "true" }
-            });
-            if (statsRes.ok) {
-                const statsData = await statsRes.json();
-                renderStats(statsData);
-                fetchRangeStats();
-            }
-
-            const taskRes = await fetch(API_BASE + '/task_history', {
-                mode: 'cors',
-                headers: { ...authHeaders(), "ngrok-skip-browser-warning": "true" }
-            });
-            if (taskRes.ok) {
-                const taskData = await taskRes.json();
-                renderTaskHistory(taskData);
-            }
+            if (Array.isArray(d.logs)) { lastLogs = d.logs; renderTerminal(); }
+            if (d.devices) { renderRigs(d.devices); handleAlerts(d.devices.alerts); }
+            if (d.stats)   { renderStats(d.stats); fetchRangeStats(); }
+            if (d.task_history) renderTaskHistory(d.task_history);
 
         } catch (e) {
-            document.getElementById('loop-status').textContent = "MONITOR OFFLINE";
-            document.getElementById('loop-status').className = "loop-status status-off";
-            console.error("Connection failure", e);
+            const statusEl = document.getElementById('loop-status');
+            statusEl.textContent = "MONITOR OFFLINE";
+            statusEl.className = "loop-status status-off";
+            console.error("Summary fetch failed", e);
+        } finally {
+            pollInFlight = false;
         }
     }
 
