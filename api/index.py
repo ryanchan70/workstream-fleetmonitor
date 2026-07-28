@@ -85,7 +85,18 @@ class handler(BaseHTTPRequestHandler):
         qs = parse_qs(urlparse(self.path).query)
 
         if route == "health":
-            return self._json(200, {"ok": True, "redis": R.configured()})
+            # Timezone is reported because a container that silently lacks a
+            # tz database is the difference between "today" meaning the shift
+            # in California and meaning UTC — and that failure is invisible
+            # from the dashboard until totals reset mid-afternoon.
+            return self._json(200, {
+                "ok": True,
+                "redis": R.configured(),
+                "tz": "America/Los_Angeles" if C.PACIFIC is not None else "fallback-dst-rule",
+                "today": C.get_date_str(),
+                "now": C.ts(),
+                "night": logic.is_night(),
+            })
 
         if route == "auth/status":
             try:
@@ -114,13 +125,17 @@ class handler(BaseHTTPRequestHandler):
             if route == "task_history":
                 return self._json(200, self._task_history())
             if route == "logs":
-                return self._json(200, R.log_read())
+                return self._json(200, self._logs())
             if route == "changelog":
                 return self._json(200, {"markdown": self._changelog()})
+            # Submissions are write-only from the page; this is how they get
+            # read back out. Authenticated, like everything else here.
+            if route == "feedback":
+                return self._json(200, {"feedback": R.feedback_read(100)})
             if route == "locations":
                 return self._json(200, R.hgetall_json("locations"))
             if route == "poll":
-                return self._json(200, logic.poll())
+                return self._json(200, logic.poll(force="force" in qs))
             if route == "backfill":
                 force = "force" in qs
                 return self._json(200, logic.backfill(force=force))
@@ -165,12 +180,31 @@ class handler(BaseHTTPRequestHandler):
             if self._auth() is None:
                 return
 
+            if route == "feedback":
+                text = (body.get("text") or "").strip()
+                if not text:
+                    return self._json(400, {"ok": False, "error": "Write something first."})
+                if len(text) > 2000:
+                    return self._json(400, {"ok": False,
+                                            "error": "Keep it under 2000 characters."})
+                # The signed-in email is taken from the session, never from the
+                # request body — otherwise anyone could file feedback as
+                # someone else.
+                R.feedback_push({
+                    "text": text,
+                    "email": R.session_email(self._token()) or "",
+                    "at": time.time(),
+                    "when": C.get_date_str() + " " + C.ts(),
+                })
+                return self._json(200, {"ok": True})
+
             if route == "set_location":
                 host, loc = body.get("hostname"), body.get("location")
                 if not host or not loc:
                     return self._json(400, {"ok": False, "error": "missing hostname/location"})
                 R.cmd("HSET", R.P + "locations", host, json.dumps(loc))
                 return self._json(200, {"ok": True})
+
         except R.RedisUnavailable as e:
             return self._json(503, {"error": str(e)})
         except Exception as e:
@@ -227,9 +261,24 @@ class handler(BaseHTTPRequestHandler):
         return self._issue(email)
 
     # ── data assembly ────────────────────────────────────────────────────
+    # Statuses written by an older build that is still deployed against the
+    # same Redis. Preview and idling both mean "up, not recording"; surfacing
+    # them raw made rigs drop out of the Idle group for a few seconds every
+    # time the other deployment won the poll.
+    _LEGACY_STATUS = {"preview": "idle", "idling": "idle"}
+
     def _devices(self):
         d = R.jget("rigs", {}) or {}
-        return {"rigs": d.get("rigs", []), "alerts": d.get("alerts", []), "active": True}
+        rigs = d.get("rigs", [])
+        for r in rigs:
+            s = r.get("status")
+            if s in self._LEGACY_STATUS:
+                r["status"] = self._LEGACY_STATUS[s]
+        return {"rigs": rigs, "alerts": d.get("alerts", []), "active": True,
+                # Milliseconds since the fleet was last actually polled, so
+                # the UI can say how stale it is rather than implying live.
+                "updated": d.get("updated"),
+                "night": logic.is_night()}
 
     def _changelog(self):
         """changelog.md, served to /changelog.html.
@@ -336,12 +385,76 @@ class handler(BaseHTTPRequestHandler):
             "hours_by_operator": C.ranked(by_op),
         }
 
+    # Completed tasks reach Redis by two routes that describe the same real
+    # recording:
+    #   poll()     writes "live|<host>|<start>|<dur>" the moment a rig stops
+    #   backfill() writes the fleet API's own session id once it shows up
+    # Both land in tasks:<host>, so every session was listed twice — once the
+    # backfill caught up. Neither key can be derived from the other (the live
+    # start time is estimated from the running duration), so they are matched
+    # on the interval they occupy instead.
+    _LIVE_PREFIX = "live|"
+
+    @staticmethod
+    def _same_session(a, b):
+        """True if two task records describe one recording on one rig."""
+        sa, da = float(a.get("start_time") or 0), float(a.get("duration_s") or 0)
+        sb, db = float(b.get("start_time") or 0), float(b.get("duration_s") or 0)
+        if not sa or not sb:
+            return False
+        shorter = min(da, db)
+        if shorter <= 0:
+            # No duration to compare: fall back to starts within two minutes.
+            return abs(sa - sb) <= 120
+        overlap = min(sa + da, sb + db) - max(sa, sb)
+        return overlap > shorter * 0.5
+
+    def _dedupe_tasks(self, pairs):
+        """Collapse records that describe the same recording.
+
+        A rig cannot record two sessions at once, so any two records on one
+        host that overlap in time are the same session seen twice. That covers
+        the live/backfill pair above and also the occasional duplicate the
+        fleet API itself returns (a session that was split or re-uploaded
+        appears as both a long record and a shorter one inside it).
+
+        Ordering decides which copy survives: API records before live ones —
+        their duration is authoritative, where the live one is whatever the
+        counter read at the moment we noticed the stop — then longest first,
+        so a fragment never displaces the full session.
+        """
+        ordered = sorted(
+            pairs,
+            key=lambda p: (p[0].startswith(self._LIVE_PREFIX),
+                           -float(p[1].get("duration_s") or 0)),
+        )
+        kept = []
+        for _sid, e in ordered:
+            if not any(self._same_session(e, k) for k in kept):
+                kept.append(e)
+        return kept
+
+    # RESOLVED and stop-CRITICAL lines are no longer written, but the log is a
+    # capped ring buffer that still holds hours of them. Filtering on read
+    # clears the backlog immediately instead of waiting for it to scroll out.
+    def _logs(self, limit=500):
+        out = []
+        for line in (R.log_read(limit) or []):
+            s = str(line)
+            if " RESOLVED " in s:
+                continue
+            if " CRITICAL " in s and "stopped recording" in s:
+                continue
+            out.append(line)
+        return out
+
     def _task_history(self):
         out = {}
         for key in (R.cmd("KEYS", R.P + "tasks:*") or []):
             host = str(key).split("tasks:", 1)[-1]
-            items = [v for v in R.hgetall_json("tasks:" + host).values()
+            pairs = [(str(k), v) for k, v in R.hgetall_json("tasks:" + host).items()
                      if isinstance(v, dict)]
+            items = self._dedupe_tasks(pairs)
             if items:
                 items.sort(key=lambda t: t.get("start_time") or 0, reverse=True)
                 out[host] = items[:50]
@@ -357,7 +470,10 @@ class handler(BaseHTTPRequestHandler):
         result = {}
         if "nopoll" not in qs:
             try:
-                result["poll"] = logic.poll()
+                # ?force=1 is the manual refresh button: one invocation that
+                # both forces the sweep and returns the fresh payload, rather
+                # than a separate /poll call followed by a /summary.
+                result["poll"] = logic.poll(force="force" in qs)
             except Exception as e:
                 result["poll"] = {"error": f"{type(e).__name__}: {e}"}
             try:
@@ -373,6 +489,6 @@ class handler(BaseHTTPRequestHandler):
                          "active": True, "source": lb.get("source", "api")},
             "stats": self._stats(),
             "task_history": self._task_history(),
-            "logs": R.log_read(300),
+            "logs": self._logs(300),
         })
         return result

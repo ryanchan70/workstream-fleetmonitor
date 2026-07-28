@@ -4,13 +4,44 @@
 
 ### **MAJOR FEATURE: OPERATIONAL VERCEL DEPLOYMENT!!**
 
-- removed auto-email after an incorrect password
+- **fixed the UTC bug** — all dates, totals and log timestamps are now Pacific,
+  so the day no longer rolls over at 5pm and Friday evenings stop counting as weekend
+
+- **fixed idle/servicing flickering to 0** — servicing survives the API dropping
+  it for a poll or two, and preview never surfaces as a status
+
+- selectable polling frequency (15s to 1h), manual refresh, and manual backfill
+
+- automatic hourly polling from 7pm to 9am Pacific
+
+- "last updated" on live rig status, "last seen online" on offline rigs
+
+- notification center
+
+- resolved alerts stay listed, just no longer red
+
+- "email me a code" button 
+
+- **status buttons moved up beside the sort control**, colour-coded, and no longer
+  disappear when a status happens to be empty
+
+- renamed idling to idle (green)
+
+- stat boxes now match the card behind them
 
 - **working completed tasks section**
 
-- updated aggregate colors
+- updated aggregate colors/opacity
+
+- github cleanup
+
+- added servicing rigs
 
 - changelog
+
+- multi-toggle buttons
+
+- wrote description for release 1.0.0
 
 ## 07/26
 
@@ -53,4 +84,14 @@
 
 - button to turn off polling
 
-###### last updated 07/24 4:25PM
+- 2 stat boxes side by side for mobile
+
+- mobile notifications (no service worker?)
+
+- show email button by default
+
+- mute sounds
+
+- saved passwords
+
+###### last updated 07/27 11:35AM

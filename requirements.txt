@@ -1,1 +1,5 @@
 requests
+# zoneinfo reads the OS tz database, which serverless base images do not
+# always ship. Without this the Pacific conversions silently fall back to a
+# hand-rolled DST rule; with it they use the real IANA data.
+tzdata

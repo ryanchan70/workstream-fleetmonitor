@@ -5,6 +5,11 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Fleet Monitor Control Panel</title>
     <link rel="icon" href="/favicon.ico" sizes="32x32">
+    <link rel="manifest" href="/manifest.webmanifest">
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="theme-color" content="#0b0f19">
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=Geist+Mono:wght@400;600&display=swap">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
     <style>
@@ -101,6 +106,9 @@
         }
         .status-on { background: rgba(16,185,129,0.15); color: var(--accent-green); }
         .status-off { background: rgba(239,68,68,0.15); color: var(--accent-red); }
+        /* Paused is deliberate, not a failure — amber, so it never reads as
+           an outage the way the red POLL ERROR state does. */
+        .status-paused { background: rgba(245,158,11,0.15); color: var(--accent-yellow); }
 
         /* The header copy of the status sits in a flex row beside the
            notification switch, so it must not float like the one in the
@@ -114,6 +122,41 @@
         }
         .header-status-row .notif-toggle { margin-top: 0; }
         .loop-status-inline { float: none; font-size: 0.72rem; letter-spacing: 0.03em; }
+
+        /* The failure detail used to live only in a title tooltip and the
+           console, so a poll error was visible but never explained. */
+        .poll-error {
+            margin-top: 9px;
+            padding: 8px 11px;
+            border: 1px solid rgba(239,68,68,0.35);
+            border-left-width: 3px;
+            border-radius: 6px;
+            background: rgba(239,68,68,0.07);
+            color: #fca5a5;
+            font-family: 'Geist Mono', monospace;
+            font-size: 0.72rem;
+            line-height: 1.5;
+            overflow-wrap: anywhere;
+            max-width: 900px;
+        }
+        .poll-error b { color: #fecaca; font-weight: 600; }
+
+        /* ── Terminal log formatting ────────────────────────────────────── */
+        .log-line { display: block; }
+        .log-ts  { color: #4b5563; }
+        .log-tag { font-weight: 700; letter-spacing: 0.05em; }
+        .log-rig { color: #f3f4f6; font-weight: 600; }
+        .log-critical { color: #fca5a5; }
+        .log-critical .log-tag { color: #ef4444; }
+        .log-resolved { color: #86efac; }
+        .log-resolved .log-tag { color: #10b981; }
+        .log-warn     { color: #fde68a; }
+        .log-warn .log-tag     { color: #f59e0b; }
+        .log-info     { color: #bfdbfe; }
+        .log-info .log-tag     { color: #3b82f6; }
+        .log-change   { color: #cbd5e1; }
+        .log-change .log-tag   { color: #a78bfa; }
+        .log-plain    { color: #9ca3af; }
 
         .terminal-box {
             background-color: #030712;
@@ -324,7 +367,8 @@
         .badge-idle      { background: rgba(16,185,129,0.15); color: var(--accent-green); }
         .badge-uploading { background: rgba(59,130,246,0.15); color: var(--accent-blue); }
         .badge-offline   { background: rgba(156,163,175,0.15); color: var(--text-muted); }
-        .badge-other     { background: rgba(245,158,11,0.15); color: var(--accent-yellow); }
+        .badge-other     { background: rgba(148,163,184,0.15); color: #cbd5e1; }
+        .badge-servicing { background: rgba(245,158,11,0.20); color: #fbbf24; }
         .rig-meta {
             color: var(--text-muted);
             font-size: 0.8rem;
@@ -358,18 +402,144 @@
             cursor: pointer;
             user-select: none;
             transition: all 0.15s ease;
+            /* Unselected pills sit back so the selection reads at a glance
+               across 50 of them. */
+            opacity: 0.45;
         }
-        .rig-pill:hover { border-color: var(--accent-blue); }
+        .rig-pill:hover { border-color: var(--accent-blue); opacity: 0.8; }
         .rig-pill.on {
+            opacity: 1;
             background: rgba(59,130,246,0.15);
-            color: var(--accent-blue);
             border-color: var(--accent-blue);
         }
-        /* Color-tinted rig pills by status */
+        /* Color-tinted rig pills by status. These match the tile badges —
+           uploading was amber here but blue on its badge, which read as a
+           second servicing colour once servicing became yellow. */
         .rig-pill.recording { border-color: #ef4444; color: #f87171; }
-        .rig-pill.uploading { border-color: #f59e0b; color: #fcd34d; }
-        .rig-pill.idle { border-color: #10b981; color: #6ee7b7; }
-        .rig-pill.offline { border-color: #6b7280; color: #9ca3af; }
+        .rig-pill.uploading { border-color: #3b82f6; color: #93c5fd; }
+        .rig-pill.idle      { border-color: #10b981; color: #34d399; }
+        .rig-pill.offline   { border-color: #6b7280; color: #9ca3af; }
+        .rig-pill.servicing { border-color: #f59e0b; color: #fbbf24; }
+
+        /* ── Header actions: manual refresh / backfill / rate ───────────── */
+        .action-btn {
+            font-family: inherit;
+            font-size: 0.7rem;
+            font-weight: 600;
+            padding: 5px 10px;
+            border-radius: 6px;
+            border: 1px solid #283245;
+            background: transparent;
+            color: var(--text-muted);
+            cursor: pointer;
+            white-space: nowrap;
+        }
+        .action-btn:hover:not(:disabled) { border-color: var(--accent-blue); color: #93c5fd; }
+        .action-btn:focus-visible { outline: 2px solid var(--accent-blue); outline-offset: 2px; }
+        /* During the cooldown the button says what it is doing and why it is
+           not available, rather than silently ignoring clicks. */
+        .action-btn:disabled { opacity: 0.4; cursor: default; }
+        .rate-select {
+            font-family: inherit;
+            font-size: 0.7rem;
+            font-weight: 600;
+            padding: 5px 6px;
+            border-radius: 6px;
+            border: 1px solid #283245;
+            background: var(--bg-color);
+            color: var(--text-muted);
+            cursor: pointer;
+        }
+        .rate-select:focus-visible { outline: 2px solid var(--accent-blue); outline-offset: 2px; }
+        .updated-stamp {
+            font-size: 0.72rem;
+            font-weight: 400;
+            color: var(--text-muted);
+            white-space: nowrap;
+        }
+        /* Stale data must not look live. */
+        .updated-stamp.stale { color: var(--accent-yellow); }
+        .updated-stamp.night::after {
+            content: ' · night mode';
+            opacity: 0.7;
+        }
+        .sr-only {
+            position: absolute; width: 1px; height: 1px;
+            padding: 0; margin: -1px; overflow: hidden;
+            clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+        }
+
+        /* ── Bulk status selection ──────────────────────────────────────── */
+        /* Sits inline with the sort controls in the card header, so the whole
+           selection toolbar is on one level. */
+        .group-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 7px;
+            align-items: center;
+        }
+        .group-btn {
+            font-family: inherit;
+            font-size: 0.7rem;
+            font-weight: 600;
+            padding: 5px 10px;
+            border-radius: 6px;
+            border: 1px solid #283245;
+            background: transparent;
+            color: var(--text-muted);
+            cursor: pointer;
+            /* Unselected sits back, matching the rig pills below it. */
+            opacity: 0.55;
+            transition: opacity 0.15s ease, background 0.15s ease;
+        }
+        .group-btn:hover { opacity: 1; }
+        .group-btn.all-on { opacity: 1; }
+        .group-btn .gb-n { opacity: 0.7; font-weight: 400; }
+        .group-btn:focus-visible { outline: 2px solid var(--accent-blue); outline-offset: 2px; }
+
+        /* Colour-coded to the status they select, so the toolbar doubles as
+           the legend for the pills and badges underneath. */
+        .group-btn.g-recording { border-color: #ef4444; color: #f87171; }
+        .group-btn.g-uploading { border-color: #3b82f6; color: #93c5fd; }
+        .group-btn.g-idle      { border-color: #10b981; color: #34d399; }
+        .group-btn.g-servicing { border-color: #f59e0b; color: #fbbf24; }
+        .group-btn.g-offline   { border-color: #6b7280; color: #9ca3af; }
+        .group-btn.g-recording.all-on { background: rgba(239,68,68,0.16); }
+        .group-btn.g-uploading.all-on { background: rgba(59,130,246,0.16); }
+        .group-btn.g-idle.all-on      { background: rgba(16,185,129,0.16); }
+        .group-btn.g-servicing.all-on { background: rgba(245,158,11,0.16); }
+        .group-btn.g-offline.all-on   { background: rgba(107,114,128,0.20); }
+
+        /* A status with no rigs right now stays in place rather than
+           vanishing — the toolbar must not reshuffle under a tapping finger
+           every time the fleet changes. */
+        .group-btn.g-empty {
+            opacity: 0.28;
+            cursor: default;
+            border-color: #283245;
+            color: var(--text-muted);
+        }
+        .group-btn.g-empty:hover { opacity: 0.28; }
+
+        /* ── Servicing ──────────────────────────────────────────────────── */
+        .rig-tile.servicing {
+            border-color: rgba(245,158,11,0.40);
+            background-image: linear-gradient(rgba(245,158,11,0.04), rgba(245,158,11,0.04));
+        }
+        .service-note {
+            margin-top: 8px;
+            padding: 7px 9px;
+            border-left: 3px solid rgba(245,158,11,0.55);
+            border-radius: 4px;
+            background: rgba(245,158,11,0.07);
+            font-size: 0.72rem;
+            line-height: 1.45;
+            color: #fcd34d;
+            overflow-wrap: anywhere;
+        }
+        .service-note .sn-issue { font-weight: 600; }
+        .service-note .sn-meta  { color: var(--text-muted); font-size: 0.68rem; display: block; margin-top: 2px; }
+        .service-note .sn-detail { color: #d9c08a; display: block; margin-top: 3px; }
 
         .toggle-label {
             float: right;
@@ -503,7 +673,10 @@
             .stat-row { grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; }
         }
         .stat-box {
-            background: #0b0f19;
+            /* Matches the card it sits in. It used to be the page background
+               (#0b0f19), which read as a slightly-off patch against the
+               card header directly above it. The border does the separating. */
+            background: var(--card-bg);
             border: 1px solid #1f2937;
             border-radius: 10px;
             padding: 10px 8px;
@@ -569,6 +742,29 @@
             color: var(--text-main);
             margin-bottom: 16px;
         }
+        /* The reveal button sits inside the field, so the input keeps its own
+           bottom margin and the button must not inherit it. */
+        .pw-wrap { position: relative; }
+        .pw-wrap input { padding-right: 66px; }
+        .pw-toggle {
+            position: absolute;
+            top: 50%;
+            right: 8px;
+            transform: translateY(-50%);
+            margin-top: -8px;          /* offset the input's margin-bottom */
+            padding: 6px 9px;
+            font-size: 0.72rem;
+            font-weight: 600;
+            font-family: inherit;
+            color: var(--text-muted);
+            background: transparent;
+            border: 1px solid #1f2937;
+            border-radius: 6px;
+            cursor: pointer;
+        }
+        .pw-toggle:hover { color: var(--text-color); border-color: #374151; }
+        .pw-toggle:focus-visible { outline: 2px solid var(--accent-blue); outline-offset: 2px; }
+
         #auth-gate .btn-primary {
             background-color: var(--accent-blue);
             width: 100%;
@@ -649,6 +845,10 @@
             text-align: left;
         }
         .alert-panel-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
             padding: 9px 12px;
             border-bottom: 1px solid #1f2937;
             font-size: 0.72rem;
@@ -671,9 +871,93 @@
             background: var(--accent-red);
         }
         .alert-dot.warn { background: var(--accent-yellow); }
+        .alert-dot.done { background: #4b5563; }
+        /* Acknowledged: still listed, but visually retired so it cannot be
+           confused with something that still needs attention. */
+        .alert-item.resolved { opacity: 0.55; }
+        .alert-item.resolved .alert-item-rig { font-weight: 500; }
+        .alert-resolve.undo:hover { border-color: var(--accent-yellow); color: var(--accent-yellow); }
+        .alert-subhead {
+            font-size: 0.65rem;
+            border-top: 1px solid #1f2937;
+            background: rgba(255,255,255,0.02);
+        }
+        .alert-item-body { min-width: 0; flex: 1; }
         .alert-item-rig { font-weight: 600; display: block; margin-bottom: 1px; }
-        .alert-item-msg { color: var(--text-muted); }
+        .alert-item-msg { color: var(--text-muted); display: block; overflow-wrap: anywhere; }
+        /* Who was on the rig and what they were doing when it fired — without
+           this the panel says "storage low" and you still have to go find the
+           tile to know whether anyone is affected. */
+        .alert-item-who {
+            display: block;
+            margin-top: 3px;
+            font-size: 0.7rem;
+            color: #6b7280;
+            overflow-wrap: anywhere;
+        }
+        .alert-item-who .aw-op { color: #9ca3af; font-weight: 600; }
+        .alert-resolve {
+            flex-shrink: 0;
+            align-self: flex-start;
+            font-family: inherit;
+            font-size: 0.62rem;
+            font-weight: 700;
+            letter-spacing: 0.03em;
+            text-transform: uppercase;
+            padding: 3px 7px;
+            border-radius: 5px;
+            border: 1px solid #283245;
+            background: transparent;
+            color: var(--text-muted);
+            cursor: pointer;
+        }
+        .alert-resolve:hover { border-color: var(--accent-green); color: var(--accent-green); }
+        .alert-resolve:focus-visible { outline: 2px solid var(--accent-blue); outline-offset: 2px; }
+        .alert-clear-all {
+            font-family: inherit;
+            font-size: 0.62rem;
+            font-weight: 700;
+            letter-spacing: 0.03em;
+            text-transform: uppercase;
+            padding: 0;
+            border: none;
+            background: none;
+            color: var(--accent-blue);
+            cursor: pointer;
+        }
         .alert-empty { padding: 14px 12px; font-size: 0.76rem; color: var(--text-muted); }
+
+        /* Small screens: the top-right cluster is absolutely positioned and
+           would sit on top of the title, and a dropdown anchored to an element
+           near the right edge gets clipped by the viewport. Below 640px the
+           cluster flows normally and the panel pins to the viewport instead of
+           to the bell. */
+        @media (max-width: 640px) {
+            .top-right-bar {
+                position: static;
+                margin-bottom: 10px;
+                /* nowrap + an ellipsised sign-out link keeps this a single
+                   row, so the bell cannot get orphaned onto a second line. */
+                flex-wrap: nowrap;
+                gap: 10px;
+            }
+            #logout-link { max-width: 100%; min-width: 0; }
+            /* The bell is pushed to the far right, matching where it sits on
+               desktop. `.bell-wrap` deliberately keeps position: relative —
+               making it static anchored the absolutely-positioned badge to
+               the page header instead of to the bell, which is why the count
+               appeared on the opposite side of the screen from the icon. */
+            .bell-wrap { order: 3; margin-left: auto; flex-shrink: 0; }
+            .alert-panel {
+                position: fixed;
+                top: 62px;
+                left: 12px;
+                right: 12px;
+                width: auto;
+                max-height: 65vh;
+            }
+            .bell-badge { top: -4px; right: -5px; }
+        }
 
         #logout-link {
             color: var(--text-muted);
@@ -809,14 +1093,21 @@
 
     <div id="auth-step-email">
         <label for="auth-email">Email</label>
-        <input id="auth-email" type="email" placeholder="you@example.com" autocomplete="email">
+        <input id="auth-email" type="email" placeholder="you@workstream.com" autocomplete="email">
         <label for="auth-password" style="margin-top: 12px;">Password</label>
-        <input id="auth-password" type="password" placeholder="your password" autocomplete="current-password">
+        <div class="pw-wrap">
+            <input id="auth-password" type="password" placeholder="we're working on it" autocomplete="current-password">
+            <button type="button" id="pw-toggle" class="pw-toggle" onclick="togglePassword()"
+                    aria-label="Show" aria-pressed="false" title="Show password">Show</button>
+        </div>
         <div id="auth-error"></div>
         <button class="btn-primary" id="auth-send-btn" onclick="tryLogin()">Sign in</button>
-        <!-- Revealed only after a failed sign-in. Sending a code is always an
-             explicit choice, never an automatic consequence of a typo. -->
-        <div id="auth-otp-alt" class="hidden" style="margin-top: 12px;">
+        <!-- Always visible. It used to appear only after a failed sign-in,
+             which meant anyone who did not know their password had to guess
+             wrong once before being offered the way in that actually works.
+             Clicking it is still an explicit choice — no code is ever sent
+             automatically. -->
+        <div id="auth-otp-alt" style="margin-top: 12px;">
             <button id="auth-otp-btn" onclick="sendCodeInstead()"
                     style="width:100%;background:transparent;border:1px solid #1f2937;color:var(--text-muted);">
                 Email me a code instead
@@ -847,7 +1138,11 @@
                     <span id="bell-badge" class="bell-badge hidden">0</span>
                 </button>
                 <div id="alert-panel" class="alert-panel hidden" aria-label="Unresolved alerts">
-                    <div class="alert-panel-head">Unresolved alerts</div>
+                    <div class="alert-panel-head">
+                        <span>Unresolved alerts</span>
+                        <button type="button" id="alert-clear-all" class="alert-clear-all hidden"
+                                onclick="resolveAllAlerts(event)">Resolve all</button>
+                    </div>
                     <div id="alert-panel-body"></div>
                 </div>
             </div>
@@ -855,15 +1150,26 @@
             <span id="logout-link" onclick="logout()">Sign out (<span id="session-email"></span>)</span>
         </div>
         <h1 class="page-title">ShiftIQ Fleet Monitor Console</h1>
-        <p class="page-sub">Live API-backed status stream and automatic log timing calculations.</p>
+        <p class="page-sub">Workstreamlined. For doers who get more done&trade;. </p>
         <div class="header-status-row">
             <label class="notif-toggle" title="Browser push notifications for critical alerts">
                 <input type="checkbox" id="notif-switch" onchange="onNotifSwitch(this)">
                 <span class="notif-track"><span class="notif-thumb"></span></span>
                 <span id="notif-label-text">Push notifications off</span>
             </label>
+            <label class="notif-toggle" title="Stop fetching fleet updates in this tab">
+                <input type="checkbox" id="poll-switch" onchange="onPollSwitch(this)" checked>
+                <span class="notif-track"><span class="notif-thumb"></span></span>
+                <span id="poll-label-text">Polling on</span>
+            </label>
+            <label class="notif-toggle" title="Audible chime when a new alert arrives">
+                <input type="checkbox" id="sound-switch" onchange="onSoundSwitch(this)" checked>
+                <span class="notif-track"><span class="notif-thumb"></span></span>
+                <span id="sound-label-text">Alert sound on</span>
+            </label>
             <span id="loop-status-top" class="loop-status loop-status-inline status-off">CONNECTING...</span>
         </div>
+        <div id="poll-error" class="poll-error hidden"></div>
         <div id="notif-help"></div>
     </div>
 
@@ -871,22 +1177,36 @@
         <div class="card-header" onclick="toggleCard('rig-body','rig-chev','rig-collapsed')">
             <div style="display:flex;align-items:center;gap:10px 14px;flex-wrap:wrap;min-width:0;">
                 <h2 style="margin:0">Live Rig Status</h2>
+                <span id="rig-updated" class="updated-stamp"></span>
                 <span id="rig-counts-all" style="font-size:0.78rem;color:var(--text-muted);font-weight:400;"></span>
                 <!-- Sort controls live in the header row; stopPropagation keeps
                      clicks here from collapsing the card. -->
                 <div class="rig-controls" onclick="event.stopPropagation()">
                     <div class="sort-menu">
                         <button class="sort-button" onclick="toggleSortMenu()">
-                            <span id="sort-label">Name</span>
+                            <span id="sort-label">Status</span>
                             <span style="font-size:0.7rem;">▼</span>
                         </button>
                         <div id="sort-dropdown" class="sort-dropdown-content">
-                            <div class="sort-option active" onclick="applySorting('name')">Name</div>
+                            <div class="sort-option" onclick="applySorting('name')">Name</div>
                             <div class="sort-option" onclick="applySorting('storage')">Storage</div>
-                            <div class="sort-option" onclick="applySorting('status')">Status</div>
+                            <div class="sort-option active" onclick="applySorting('status')">Status</div>
                         </div>
                     </div>
                     <button class="sort-reverse-btn" id="reverse-btn" onclick="toggleReverse()" title="Reverse sort order">⇅</button>
+                    <button type="button" id="manual-poll-btn" class="action-btn" onclick="manualPoll()"
+                            title="Force an immediate fleet poll">&#8635; Refresh</button>
+                    <label for="poll-rate" class="sr-only">Rig polling frequency</label>
+                    <select id="poll-rate" class="rate-select" onchange="onPollRate(this)"
+                            title="How often this tab asks for fleet updates">
+                        <option value="15000">15s</option>
+                        <option value="30000">30s</option>
+                        <option value="60000">1m</option>
+                        <option value="300000">5m</option>
+                        <option value="900000">15m</option>
+                        <option value="3600000">1h</option>
+                    </select>
+                    <div id="rig-groups" class="group-row"></div>
                 </div>
             </div>
             <span class="chevron" id="rig-chev">▾</span>
@@ -907,6 +1227,8 @@
             <div style="display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;">
                 <h2 style="margin:0;">Aggregate Fleet Stats</h2>
                 <span id="stat-last-updated" style="font-size:0.75rem;color:var(--text-muted);font-weight:400;"></span>
+                <button type="button" id="backfill-btn" class="action-btn" onclick="manualBackfill(event)"
+                        title="Re-sweep session history for every rig">&#8635; Backfill</button>
             </div>
             <span class="chevron" id="stats-chev">▾</span>
         </div>
@@ -1049,10 +1371,211 @@
     // every 2s, which on Vercel is five billable invocations per tick per tab.
     // At 20s one permanently open tab is ~4.3k invocations/day against Hobby's
     // 100k/month, and ~4.3k Upstash commands/day against its 10k/day free tier.
-    const POLL_MS = 20000;
     const TOKEN_KEY = "fleet_dashboard_token";
     let pollTimer = null;
     let pendingToken = null;
+
+    // ── Polling cadence ──────────────────────────────────────────────────
+    const POLL_RATES = [15000, 30000, 60000, 300000, 900000, 3600000];
+    const DEFAULT_POLL_MS = 30000;
+    const NIGHT_POLL_MS = 3600000;
+
+    let pollRateMs = DEFAULT_POLL_MS;
+    try {
+        const stored = parseInt(localStorage.getItem('fleet_poll_rate_ms'), 10);
+        if (POLL_RATES.includes(stored)) pollRateMs = stored;
+    } catch (e) {}
+
+    // Evaluated on the FLEET's clock, not the viewer's. A tab open in another
+    // timezone must not throttle while the floor in California is mid-shift,
+    // nor keep polling all night because it happens to be morning there.
+    function pacificHour() {
+        try {
+            return parseInt(new Intl.DateTimeFormat('en-US', {
+                timeZone: 'America/Los_Angeles', hour: 'numeric', hour12: false,
+            }).format(new Date()), 10);
+        } catch (e) {
+            return new Date().getHours();      // no Intl tz data: viewer's clock
+        }
+    }
+
+    function isNight() {
+        const h = pacificHour();
+        return h >= 19 || h < 9;
+    }
+
+    // Outside shift hours everything coasts at hourly, unless the chosen rate
+    // is already slower — the switch should never speed polling up.
+    function effectivePollMs() {
+        return isNight() ? Math.max(pollRateMs, NIGHT_POLL_MS) : pollRateMs;
+    }
+
+    let timerRateMs = null;
+
+    function restartPollTimer() {
+        if (pollTimer) clearInterval(pollTimer);
+        timerRateMs = effectivePollMs();
+        pollTimer = setInterval(() => fetchUpdates(), timerRateMs);
+    }
+
+    // Crossing 7pm or 9am Pacific has to change the cadence on a tab that is
+    // already open. Checking inside the poll tick would not do it: at the 1h
+    // night rate the tab would not notice 9am until 10am. This costs nothing
+    // — no network, just a clock read.
+    setInterval(() => {
+        if (pollTimer && effectivePollMs() !== timerRateMs) {
+            restartPollTimer();
+            renderUpdatedStamp();
+        }
+    }, 60000);
+
+    function onPollRate(el) {
+        const v = parseInt(el.value, 10);
+        if (!POLL_RATES.includes(v)) return;
+        pollRateMs = v;
+        try { localStorage.setItem('fleet_poll_rate_ms', String(v)); } catch (e) {}
+        restartPollTimer();
+        renderUpdatedStamp();
+    }
+
+    function setPollRateUI() {
+        const el = document.getElementById('poll-rate');
+        if (el) el.value = String(pollRateMs);
+    }
+
+    // ── Manual actions ───────────────────────────────────────────────────
+    // Cooldowns are enforced by disabling the button and counting down on its
+    // label, so a double-tap cannot queue a second fleet sweep and the user
+    // can see when it will be available again.
+    function runCooldown(btn, seconds, idleLabel) {
+        let left = seconds;
+        btn.disabled = true;
+        const tick = () => {
+            btn.textContent = left > 0 ? idleLabel + ' (' + left + 's)' : idleLabel;
+            if (left <= 0) { btn.disabled = false; return; }
+            left--;
+            setTimeout(tick, 1000);
+        };
+        tick();
+    }
+
+    let manualPollBusy = false;
+    async function manualPoll() {
+        const btn = document.getElementById('manual-poll-btn');
+        if (!btn || btn.disabled || manualPollBusy) return;
+        manualPollBusy = true;
+        btn.textContent = '↻ Polling…';
+        btn.disabled = true;
+        try {
+            // ?force=1 bypasses the server's cadence gate (and the night
+            // throttle) in the same invocation that returns the fresh data.
+            await fetchUpdates(true, true);
+        } finally {
+            manualPollBusy = false;
+            runCooldown(btn, 5, '↻ Refresh');
+        }
+    }
+
+    let backfillBusy = false;
+    async function manualBackfill(evt) {
+        if (evt) evt.stopPropagation();
+        const btn = document.getElementById('backfill-btn');
+        if (!btn || btn.disabled || backfillBusy) return;
+        backfillBusy = true;
+        btn.textContent = '↻ Backfilling…';
+        btn.disabled = true;
+        try {
+            const res = await fetch(API_BASE + '/backfill?force=1', { headers: { ...authHeaders() } });
+            if (res.status === 401) return logout();
+            const d = await res.json().catch(() => ({}));
+            if (d.skipped) {
+                toast('Backfill skipped', 'Another sweep is already running.');
+            } else {
+                toast('Backfill complete',
+                      (d.sessions != null ? d.sessions + ' sessions across ' : '') +
+                      (d.rigs != null ? d.rigs + ' rigs' : 'History refreshed'), 'ok');
+            }
+            // A sweep rewrites the day totals and task history, so pull them.
+            await fetchUpdates(true);
+        } catch (e) {
+            toast('Backfill failed', String((e && e.message) || e));
+        } finally {
+            backfillBusy = false;
+            runCooldown(btn, 60, '↻ Backfill');
+        }
+    }
+
+    // ── Freshness ────────────────────────────────────────────────────────
+    let lastUpdatedMs = null;
+
+    function renderUpdatedStamp() {
+        const el = document.getElementById('rig-updated');
+        if (!el) return;
+        if (!lastUpdatedMs) { el.textContent = ''; el.className = 'updated-stamp'; return; }
+        const age = Date.now() - lastUpdatedMs;
+        el.textContent = 'Updated ' + fmtStamp(lastUpdatedMs);
+        // Stale means "older than two of whatever cadence is in force", so
+        // the warning does not fire simply because the user chose 15m.
+        const stale = age > effectivePollMs() * 2 + 20000;
+        el.className = 'updated-stamp' + (stale ? ' stale' : '') + (isNight() ? ' night' : '');
+        el.title = isNight()
+            ? 'Outside 9am–7pm Pacific the fleet is polled hourly. Use Refresh to force one.'
+            : '';
+    }
+
+    // The relative part of the stamp has to keep moving even when nothing is
+    // being fetched — a frozen "12s ago" is worse than no timestamp at all.
+    setInterval(renderUpdatedStamp, 15000);
+
+    // ── Per-tab switches ─────────────────────────────────────────────────
+    // Both are per-browser preferences, not fleet state: pausing stops this
+    // tab fetching (useful on a wallboard left open, or to stop burning
+    // invocations while working on something else), muting silences the
+    // chime without touching push notifications or the alert bell.
+    let pollPaused = false;
+    let soundMuted = false;
+    try { pollPaused = localStorage.getItem('fleet_poll_paused') === '1'; } catch (e) {}
+    try { soundMuted = localStorage.getItem('fleet_sound_muted') === '1'; } catch (e) {}
+
+    function setPollUI() {
+        const sw = document.getElementById('poll-switch');
+        const label = document.getElementById('poll-label-text');
+        if (sw) sw.checked = !pollPaused;
+        if (label) label.textContent = pollPaused ? 'Polling paused' : 'Polling on';
+        if (pollPaused) {
+            setLoopStatus('POLLING PAUSED', 'status-paused',
+                          'This tab is not fetching updates. Data is frozen at the last poll.');
+        }
+    }
+
+    function onPollSwitch(el) {
+        pollPaused = !el.checked;
+        try { localStorage.setItem('fleet_poll_paused', pollPaused ? '1' : '0'); } catch (e) {}
+        setPollUI();
+        // Resuming should show live data immediately rather than leaving the
+        // stale view up until the next tick. The label is reset first so it
+        // does not read PAUSED for the second the request is in flight.
+        if (!pollPaused) {
+            setLoopStatus('CONNECTING...', 'status-off', '');
+            fetchUpdates(true);
+        }
+    }
+
+    function setSoundUI() {
+        const sw = document.getElementById('sound-switch');
+        const label = document.getElementById('sound-label-text');
+        if (sw) sw.checked = !soundMuted;
+        if (label) label.textContent = soundMuted ? 'Alert sound muted' : 'Alert sound on';
+    }
+
+    function onSoundSwitch(el) {
+        soundMuted = !el.checked;
+        try { localStorage.setItem('fleet_sound_muted', soundMuted ? '1' : '0'); } catch (e) {}
+        setSoundUI();
+        // Unmuting plays one chime, so "on" is verified rather than assumed —
+        // the browser also needs this user gesture to unlock audio at all.
+        if (!soundMuted) playNotificationSound();
+    }
 
     function authHeaders() {
         const token = localStorage.getItem(TOKEN_KEY);
@@ -1065,9 +1588,11 @@
         document.getElementById('auth-error').textContent = '';
         document.getElementById('auth-code-error').textContent = '';
         document.getElementById('auth-code').value = '';
-        // Re-hide the code offer; it should only reappear after a real failure.
-        const alt = document.getElementById('auth-otp-alt');
-        if (alt) alt.classList.add('hidden');
+        // The code button is permanently visible, but its label and disabled
+        // state are left mid-send by sendCodeInstead() — reset them so a
+        // second attempt is not stuck on "Sending…".
+        const b = document.getElementById('auth-otp-btn');
+        if (b) { b.disabled = false; b.textContent = 'Email me a code instead'; }
     }
 
     async function tryLogin() {
@@ -1106,8 +1631,6 @@
             // It used to fire one off automatically, so every typo put an
             // unwanted code in the inbox. Requesting one is now deliberate.
             errEl.textContent = data.error || 'Incorrect email or password.';
-            const alt = document.getElementById('auth-otp-alt');
-            if (alt) alt.classList.remove('hidden');
         } catch (e) {
             errEl.textContent = 'Could not reach the dashboard API.';
         } finally {
@@ -1215,12 +1738,20 @@
             notifEnabled = false;   // permission was revoked since last visit
             localStorage.setItem('fleet_notif_enabled', '0');
         }
-        if (!SECURE_OK) {
-            notifHelp('Opened without a secure context (file://). Open http://127.0.0.1:8080 to enable browser notifications.');
+        // Covers the iOS-not-installed case too, not just insecure contexts.
+        if (!SECURE_OK || !NOTIF_SUPPORTED) {
+            notifHelp(notifBlockedReason());
         }
         setNotifUI();
-        fetchUpdates();
-        if (!pollTimer) pollTimer = setInterval(fetchUpdates, POLL_MS);
+        setPollUI();
+        setSoundUI();
+        setPollRateUI();
+        syncSortUI();
+        // Forced: a tab that just opened has nothing to show, and might not
+        // win the poll lease. The server's cadence gate makes this cheap if
+        // another device polled moments ago.
+        fetchUpdates(true);
+        restartPollTimer();
     }
 
     async function checkSession() {
@@ -1248,6 +1779,34 @@
         renderTerminal();
     }
 
+    // Every server log line is "[HH:MM:SS] LEVEL rest". Splitting on that lets
+    // the timestamp recede, the level carry the colour, and the rig name stand
+    // out — the dump was previously one flat grey wall of text.
+    const LOG_LEVELS = {
+        CRITICAL: 'log-critical', ERROR: 'log-critical', FATAL: 'log-critical',
+        RESOLVED: 'log-resolved',
+        WARN: 'log-warn', WARNING: 'log-warn',
+        INFO: 'log-info',
+        CHANGE: 'log-change',
+    };
+
+    function renderLogLine(raw) {
+        const m = String(raw).match(/^\[(\d{2}:\d{2}:\d{2})\]\s+([A-Z]+)\s+([\s\S]*)$/);
+        if (!m) return '<span class="log-line log-plain">' + parseAnsi(raw) + '</span>';
+
+        const cls = LOG_LEVELS[m[2]] || 'log-plain';
+        let rest = parseAnsi(m[3]);
+        // "Rig: message" and "Rig  STOPPED | ..." both lead with the rig name.
+        const named = m[3].match(/^([^:|]{1,40}?)(:\s|\s{2,})/);
+        if (named) {
+            rest = '<span class="log-rig">' + esc(named[1]) + '</span>' +
+                   parseAnsi(m[3].slice(named[1].length));
+        }
+        return '<span class="log-line ' + cls + '">' +
+               '<span class="log-ts">[' + m[1] + ']</span> ' +
+               '<span class="log-tag">' + esc(m[2]) + '</span> ' + rest + '</span>';
+    }
+
     function renderTerminal() {
         const terminalEl = document.getElementById('terminal');
         const lines = hideWarnings ? lastLogs.filter(l => !l.includes('WARN')) : lastLogs;
@@ -1255,7 +1814,10 @@
         // Store current scroll position before update
         const wasAtBottom = terminalEl.scrollHeight - terminalEl.scrollTop - terminalEl.clientHeight < 10;
 
-        terminalEl.innerHTML = lines.map(l => parseAnsi(l)).join('\n');
+        // Joined with '' rather than '\n': each line is its own block element
+        // now, and the box is white-space: pre-wrap, so a newline between them
+        // would render as a blank line.
+        terminalEl.innerHTML = lines.map(renderLogLine).join('');
 
         // Only auto-scroll if user was at the bottom, otherwise preserve position
         if (wasAtBottom) {
@@ -1267,11 +1829,15 @@
     const notifiedAlerts = new Set();
     let lastDevData = null;
     let knownRigs = [];
-    let currentSort = 'name';
+    let currentSort = 'status';
     let sortReverse = false;
     let monitoredRigs = null;
     try { monitoredRigs = JSON.parse(localStorage.getItem('fleet_monitored_rigs')); } catch (e) {}
-    try { currentSort = localStorage.getItem('fleet_sort_mode') || 'name'; } catch (e) {}
+    // Key is versioned: a stored preference from an older build silently won
+    // over the new default, so status-first looked broken for anyone who had
+    // ever opened the dashboard before. Bumping it resets once, and an
+    // explicit pick after that still sticks.
+    try { currentSort = localStorage.getItem('fleet_sort_mode_v3') || 'status'; } catch (e) {}
     try { sortReverse = localStorage.getItem('fleet_sort_reverse') === '1'; } catch (e) {}
 
     function isMonitored(hostname) {
@@ -1302,20 +1868,21 @@
         dropdown.classList.toggle('show');
     }
 
+    // The label and the tick in the dropdown were only ever updated by a
+    // click, so a mode restored from storage left the button reading "Status"
+    // while the grid was actually sorted by name. Called on load as well now.
+    function syncSortUI() {
+        const label = document.getElementById('sort-label');
+        if (label) label.textContent = currentSort.charAt(0).toUpperCase() + currentSort.slice(1);
+        document.querySelectorAll('.sort-option').forEach(opt => {
+            opt.classList.toggle('active', opt.textContent.trim().toLowerCase() === currentSort);
+        });
+    }
+
     function applySorting(sortMode) {
         currentSort = sortMode;
-        localStorage.setItem('fleet_sort_mode', currentSort);
-
-        // Update button label
-        document.getElementById('sort-label').textContent = sortMode.charAt(0).toUpperCase() + sortMode.slice(1);
-
-        // Update active state in dropdown
-        document.querySelectorAll('.sort-option').forEach(opt => opt.classList.remove('active'));
-        document.querySelectorAll('.sort-option').forEach(opt => {
-            if (opt.textContent.toLowerCase() === sortMode) {
-                opt.classList.add('active');
-            }
-        });
+        localStorage.setItem('fleet_sort_mode_v3', currentSort);
+        syncSortUI();
 
         // Close dropdown
         document.getElementById('sort-dropdown').classList.remove('show');
@@ -1342,7 +1909,8 @@
                 return bFree - aFree;  // High to low by default
             });
         } else if (mode === 'status') {
-            const statusOrder = { "recording": 0, "uploading": 1, "idle": 2, "offline": 3 };
+            const statusOrder = { "recording": 0, "uploading": 1, "idle": 2,
+                                 "servicing": 3, "offline": 4 };
             // NOTE: must be ?? and not ||. "recording" maps to 0, which is
             // falsy, so || would rewrite it to 99 and sort recording LAST.
             sorted.sort((a, b) => (statusOrder[a.status] ?? 99) - (statusOrder[b.status] ?? 99));
@@ -1367,10 +1935,134 @@
             pills.push('<span class="rig-pill' + (on ? ' on' : '') + statusClass + '" onclick="toggleRig(\'' + esc(r.hostname) + '\')">' + esc(r.label) + '</span>');
         });
         document.getElementById('rig-filter').innerHTML = pills.join('');
+        renderGroupButtons();
+    }
+
+    // ── Bulk selection by status ─────────────────────────────────────────
+    // Selecting "every recording rig" was 15 individual taps. These toggle a
+    // whole status at once: on if any of the group is unselected, off if the
+    // group is already fully selected.
+    const GROUP_ORDER = ['recording', 'uploading', 'idle', 'servicing', 'offline'];
+
+    function rigsWithStatus(status) {
+        return knownRigs.filter(r => r.status === status).map(r => r.hostname);
+    }
+
+    function toggleStatusGroup(status) {
+        const group = rigsWithStatus(status);
+        if (!group.length) return;
+        if (!Array.isArray(monitoredRigs)) monitoredRigs = knownRigs.map(r => r.hostname);
+
+        const allOn = group.every(h => monitoredRigs.includes(h));
+        if (allOn) {
+            monitoredRigs = monitoredRigs.filter(h => !group.includes(h));
+        } else {
+            const set = new Set(monitoredRigs);
+            group.forEach(h => set.add(h));
+            monitoredRigs = [...set];
+        }
+        // Mirrors toggleRig: "everything selected" is stored as null so the
+        // All pill and the counts stay consistent.
+        if (monitoredRigs.length === knownRigs.length) monitoredRigs = null;
+        saveMonitored();
+    }
+
+    function renderGroupButtons() {
+        const host = document.getElementById('rig-groups');
+        if (!host) return;
+        const all = !Array.isArray(monitoredRigs);
+        // Every status is always rendered, even at zero. Dropping the empty
+        // ones made Servicing and Idle appear and disappear as the fleet
+        // changed, which moved every other button out from under the cursor.
+        const html = GROUP_ORDER.map(status => {
+            const group = rigsWithStatus(status);
+            const empty = group.length === 0;
+            const on = !empty && (all || group.every(h => monitoredRigs.includes(h)));
+            const label = status.charAt(0).toUpperCase() + status.slice(1);
+            return '<button type="button" class="group-btn g-' + status +
+                   (empty ? ' g-empty' : '') + (on ? ' all-on' : '') +
+                   '"' + (empty ? ' disabled' : '') +
+                   ' onclick="toggleStatusGroup(\'' + status + '\')">' +
+                   label + ' <span class="gb-n">' + group.length + '</span></button>';
+        }).join('');
+        host.innerHTML = html;
     }
 
     function esc(s) {
         return String(s ?? '').replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    }
+
+    // For a value that lands inside a single-quoted JS string inside a
+    // double-quoted HTML attribute. HTML-escaping the quote is wrong here:
+    // the parser decodes entities before the JS is parsed, so &#39; would
+    // turn back into a quote and break out of the string. Escape for JS
+    // first, then for HTML.
+    function jsAttr(s) {
+        return esc(String(s ?? '').replace(/\\/g, '\\\\').replace(/'/g, "\\'"));
+    }
+
+    // Service mode is assigned by the fleet API, not here — the tile explains
+    // why the rig is out and since when, rather than offering a toggle.
+    function serviceNote(r) {
+        if (r.status !== 'servicing') return '';
+        const bits = [];
+        if (r.service_since) {
+            const d = new Date(r.service_since * 1000);
+            bits.push('since ' + d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) +
+                      ' ' + d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' }));
+        }
+        if (r.service_by) bits.push('flagged by ' + esc(r.service_by));
+        return '<div class="service-note">' +
+               '<span class="sn-issue">&#128295; ' + esc(r.service_issue || 'In service mode') + '</span>' +
+               (r.service_detail ? '<span class="sn-detail">' + esc(r.service_detail) + '</span>' : '') +
+               (bits.length ? '<span class="sn-meta">' + bits.join(' &middot; ') + '</span>' : '') +
+               '</div>';
+    }
+
+    function togglePassword() {
+        const input = document.getElementById('auth-password');
+        const btn = document.getElementById('pw-toggle');
+        if (!input || !btn) return;
+        const show = input.type === 'password';
+        input.type = show ? 'text' : 'password';
+        btn.textContent = show ? 'Hide' : 'Show';
+        btn.setAttribute('aria-pressed', String(show));
+        btn.setAttribute('aria-label', show ? 'Hide password' : 'Show password');
+        btn.title = btn.getAttribute('aria-label');
+        input.focus();
+    }
+
+    // Absolute time plus how long ago, because neither alone is enough: "18m
+    // ago" does not tell you which shift, and "4:12 PM" does not tell you at
+    // a glance that it just happened.
+    function fmtWhen(ms) {
+        if (!ms) return '';
+        const d = new Date(ms);
+        if (Number.isNaN(d.getTime())) return '';
+        const diff = Date.now() - ms;
+        const mins = Math.round(diff / 60000);
+        let rel;
+        if (diff < 45000) rel = 'just now';
+        else if (mins < 60) rel = mins + 'm ago';
+        else if (mins < 1440) rel = Math.round(mins / 60) + 'h ago';
+        else rel = Math.round(mins / 1440) + 'd ago';
+
+        const sameDay = d.toDateString() === new Date().toDateString();
+        const time = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+        const stamp = sameDay ? time
+            : d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ', ' + time;
+        return stamp + ' (' + rel + ')';
+    }
+
+    // hh:mm:ss mm/dd — the fixed-width form used for the rig status stamp,
+    // where the exact second matters more than "how long ago".
+    function fmtStamp(ms) {
+        if (!ms) return '';
+        const d = new Date(ms);
+        if (Number.isNaN(d.getTime())) return '';
+        const p = n => String(n).padStart(2, '0');
+        return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds()) +
+               ' ' + p(d.getMonth() + 1) + '/' + p(d.getDate());
     }
 
     function badgeClass(status) {
@@ -1378,13 +2070,17 @@
         if (status === 'idle') return 'badge-idle';
         if (status === 'uploading') return 'badge-uploading';
         if (status === 'offline') return 'badge-offline';
+        if (status === 'servicing') return 'badge-servicing';
         return 'badge-other';
     }
 
     function countRigs(rigs) {
-        const c = { online: 0, recording: 0, uploading: 0, offline: 0 };
+        const c = { online: 0, recording: 0, uploading: 0, offline: 0, servicing: 0 };
         (rigs || []).forEach(r => {
             if (r.status === 'offline') c.offline++;
+            // Servicing is deliberately outside the online/idle tallies: a rig
+            // on the bench is neither available nor a fault to chase.
+            else if (r.status === 'servicing') c.servicing++;
             else if (r.status === 'recording') { c.online++; c.recording++; }
             else if (r.status === 'uploading') { c.online++; c.uploading++; }
             else c.online++;
@@ -1397,11 +2093,13 @@
         if (c.uploading) parts.push(`<span style="color:var(--accent-blue)">⬆ ${c.uploading} up</span>`);
         const idle = c.online - c.recording - c.uploading;
         if (idle > 0) parts.push(`<span style="color:var(--accent-green)">${idle} idle</span>`);
+        if (c.servicing) parts.push(`<span style="color:var(--accent-yellow)">&#128295; ${c.servicing} servicing</span>`);
         if (c.offline) parts.push(`<span style="color:var(--text-muted)">${c.offline} offline</span>`);
         return parts.join(' &middot; ') + (total != null ? ` <span style="color:var(--text-muted);opacity:.6">/ ${total} total</span>` : '');
     }
 
     function playNotificationSound() {
+        if (soundMuted) return;
         try {
             const ctx = new (window.AudioContext || window.webkitAudioContext)();
             const osc = ctx.createOscillator();
@@ -1425,6 +2123,8 @@
             return;
         }
         knownRigs = data.rigs;
+        lastUpdatedMs = data.updated || null;
+        renderUpdatedStamp();
         renderFilter();
 
         const allCounts = countRigs(data.rigs);
@@ -1452,9 +2152,14 @@
         });
         grid.innerHTML = visible.map(r => {
             const crit = r.critical && r.critical.length > 0;
+            const servicing = r.status === 'servicing';
             const stats = [];
-            if (r.status === 'offline') {
-                stats.push('Offline — no live metrics');
+            // Keyed on `online`, not on the status: a servicing rig is usually
+            // offline too, and its metrics are just as stale.
+            if (!r.online) {
+                if (r.last_seen) stats.push('Last seen online ' + esc(fmtWhen(r.last_seen * 1000)));
+                else if (r.status === 'offline') stats.push('Offline — no live metrics');
+                else stats.push('Not currently online');
             } else {
                 if (r.status === 'recording') stats.push('&#9201; ' + esc(r.duration_label));
                 if (r.frame_health_pct != null) stats.push('&#127902; ' + r.frame_health_pct.toFixed(1) + '%');
@@ -1468,12 +2173,13 @@
             if (r.operator && r.operator !== 'Unknown') meta.push('Op: ' + esc(r.operator));
             if (r.task && r.task !== 'Unknown') meta.push('Task: ' + esc(r.task));
             const alertLines = (alertsByRig[r.hostname] || []).map(m => '<div class="rig-alert">&#9888; ' + esc(m) + '</div>').join('');
-            return `<div class="rig-tile${crit ? ' critical' : ''}">
+            return `<div class="rig-tile${crit ? ' critical' : ''}${servicing ? ' servicing' : ''}">
                 <div class="rig-name"><span class="rig-badge ${badgeClass(r.status)}">${esc(r.status)}</span>${esc(r.label)}</div>
                 <div class="rig-meta">${meta.join('<br>') || '<span style="opacity:.5">—</span>'}</div>
                 <div class="rig-stats">${stats.join(' &middot; ') || ''}</div>
                 ${thermalBadges(r)}
                 ${alertLines}
+                ${serviceNote(r)}
             </div>`;
         }).join('');
     }
@@ -1505,6 +2211,39 @@
     const NOTIF_SUPPORTED = ('Notification' in window);
     const SECURE_OK = window.isSecureContext === true;
 
+    // iPadOS reports itself as a Mac, so touch support is the tiebreaker.
+    const IS_IOS = /iP(hone|ad|od)/.test(navigator.userAgent) ||
+                   (/Macintosh/.test(navigator.userAgent) && 'ontouchend' in document);
+    const IS_STANDALONE = window.navigator.standalone === true ||
+                          window.matchMedia('(display-mode: standalone)').matches;
+
+    // Registered up front, not at notify time: Chrome on Android refuses
+    // `new Notification()` and needs a registration to already exist, and iOS
+    // only exposes the API at all to an installed PWA. The worker caches
+    // nothing — see public/sw.js.
+    let swReady = null;
+    if ('serviceWorker' in navigator && SECURE_OK) {
+        swReady = navigator.serviceWorker.register('/sw.js')
+            .then(reg => navigator.serviceWorker.ready.then(() => reg))
+            .catch(() => null);
+    }
+
+    // The honest answer for each platform, instead of a generic failure.
+    function notifBlockedReason() {
+        if (!SECURE_OK) {
+            return 'Notifications need a secure (https) context. In-page alerts are being used instead.';
+        }
+        if (!NOTIF_SUPPORTED) {
+            if (IS_IOS && !IS_STANDALONE) {
+                return 'On iPhone and iPad, browser notifications only work once this dashboard is ' +
+                       'installed: tap Share → Add to Home Screen, open it from the new icon, then ' +
+                       'flip this switch. In-page alerts work either way.';
+            }
+            return 'This browser does not support notifications. In-page alerts are being used instead.';
+        }
+        return '';
+    }
+
     function notifHelp(msg) {
         const el = document.getElementById('notif-help');
         if (el) el.textContent = msg || '';
@@ -1532,7 +2271,8 @@
         if (!NOTIF_SUPPORTED) {
             el.checked = false;
             notifEnabled = false;
-            notifHelp('This browser does not support the Notifications API. In-page alerts will still appear.');
+            notifHelp(notifBlockedReason() ||
+                      'This browser does not support the Notifications API. In-page alerts will still appear.');
             return;
         }
 
@@ -1599,22 +2339,31 @@
             requireInteraction: false,
         };
 
+        // Service worker first on mobile: Chrome for Android throws on the
+        // constructor, so trying it first would burn an exception every alert.
+        const viaWorker = async () => {
+            try {
+                const reg = (swReady && await swReady) ||
+                            (navigator.serviceWorker && await navigator.serviceWorker.getRegistration());
+                if (reg && reg.showNotification) {
+                    await reg.showNotification(title, opts);
+                    return true;
+                }
+            } catch (e) { /* fall through */ }
+            return false;
+        };
+
+        if (IS_IOS || /Android/.test(navigator.userAgent)) {
+            if (await viaWorker()) return;
+        }
+
         try {
             new Notification(title, opts);
             return;
         } catch (e) {
-            // Chrome/Android: constructor is not allowed; must go via a
-            // service worker registration.
-            try {
-                if ('serviceWorker' in navigator) {
-                    const reg = await navigator.serviceWorker.getRegistration();
-                    if (reg && reg.showNotification) {
-                        await reg.showNotification(title, opts);
-                        return;
-                    }
-                }
-            } catch (e2) { /* fall through — toast already shown */ }
-            notifHelp('This browser requires a service worker to display notifications. In-page alerts are being used instead.');
+            if (await viaWorker()) return;
+            notifHelp('This browser would not display a system notification. ' +
+                      'In-page alerts are being used instead.');
         }
     }
 
@@ -1650,12 +2399,98 @@
         return /resolved|cleared/i.test(a.kind || '') || /resolved/i.test(a.message || '');
     }
 
+    // ── Acknowledged alerts ──────────────────────────────────────────────
+    // "Resolve" here means acknowledged by a person, and is local to this
+    // browser — the fleet API has no ack endpoint, and inventing one would
+    // let one operator silence a real fault for everybody.
+    //
+    // Keyed hostname|kind, not by message: the storage message carries the
+    // live GB figure, so a message key would un-acknowledge itself on the
+    // next poll as the number drifted.
+    const ACK_KEY = 'fleet_acked_alerts';
+    let ackedAlerts = new Set();
+    try {
+        const raw = JSON.parse(localStorage.getItem(ACK_KEY) || '[]');
+        if (Array.isArray(raw)) ackedAlerts = new Set(raw);
+    } catch (e) {}
+
+    function saveAcked() {
+        try { localStorage.setItem(ACK_KEY, JSON.stringify([...ackedAlerts])); } catch (e) {}
+    }
+
+    function alertKey(a) { return (a.hostname || '') + '|' + (a.kind || ''); }
+
+    function resolveAlert(evt, key) {
+        if (evt) evt.stopPropagation();
+        ackedAlerts.add(key);
+        saveAcked();
+        if (lastDevData) renderAlertBell(lastDevData.alerts);
+    }
+
+    function unresolveAlert(evt, key) {
+        if (evt) evt.stopPropagation();
+        ackedAlerts.delete(key);
+        saveAcked();
+        if (lastDevData) renderAlertBell(lastDevData.alerts);
+    }
+
+    function resolveAllAlerts(evt) {
+        if (evt) evt.stopPropagation();
+        unresolvedAlerts(lastDevData && lastDevData.alerts).forEach(a => ackedAlerts.add(alertKey(a)));
+        saveAcked();
+        if (lastDevData) renderAlertBell(lastDevData.alerts);
+    }
+
+    // Acknowledgement lasts only as long as the condition does. Once the
+    // server stops reporting an alert, its key is dropped so the same fault
+    // recurring next week raises the bell again instead of staying silenced
+    // forever.
+    function pruneAcked(alerts) {
+        if (!ackedAlerts.size) return;
+        const live = new Set((alerts || []).map(alertKey));
+        let changed = false;
+        [...ackedAlerts].forEach(k => {
+            if (!live.has(k)) { ackedAlerts.delete(k); changed = true; }
+        });
+        if (changed) saveAcked();
+    }
+
     function unresolvedAlerts(alerts) {
-        return (alerts || []).filter(a => isMonitored(a.hostname) && !isResolvedAlert(a));
+        return (alerts || []).filter(a =>
+            isMonitored(a.hostname) && !isResolvedAlert(a) && !ackedAlerts.has(alertKey(a)));
+    }
+
+    // Alerts carry only hostname/kind/message, so the operator and task come
+    // from the matching rig in the same payload.
+    function alertWho(a) {
+        const rig = (knownRigs || []).find(r => r.hostname === a.hostname);
+        // clean_str() on the server fills missing fields with "Unknown", which
+        // as a subtitle reads like a fact ("Unknown · Unknown") rather than
+        // an absence. Blank is better.
+        const known = v => {
+            const s = String(v ?? '').trim();
+            return (!s || /^(unknown|none|n\/a|—|-)$/i.test(s)) ? '' : s;
+        };
+        const op = known(rig && rig.operator) || known(a.operator);
+        const task = known(rig && rig.task) || known(a.task);
+        if (!op && !task) return '';
+        const parts = [];
+        if (op) parts.push('<span class="aw-op">' + esc(op) + '</span>');
+        if (task) parts.push(esc(task));
+        return '<span class="alert-item-who">' + parts.join(' &middot; ') + '</span>';
+    }
+
+    // Acknowledged but still true on the fleet. Kept visible so the panel
+    // shows the whole picture, not just what is still shouting.
+    function acknowledgedAlerts(alerts) {
+        return (alerts || []).filter(a =>
+            isMonitored(a.hostname) && !isResolvedAlert(a) && ackedAlerts.has(alertKey(a)));
     }
 
     function renderAlertBell(alerts) {
+        pruneAcked(alerts);
         const list  = unresolvedAlerts(alerts);
+        const done  = acknowledgedAlerts(alerts);
         const bell  = document.getElementById('alert-bell');
         const badge = document.getElementById('bell-badge');
         const body  = document.getElementById('alert-panel-body');
@@ -1668,14 +2503,37 @@
             ? list.length + ' unresolved alert' + (list.length === 1 ? '' : 's')
             : 'No unresolved alerts';
 
-        body.innerHTML = list.length
-            ? list.map(a =>
-                '<div class="alert-item">' +
-                    '<span class="alert-dot' + (/warn/i.test(a.kind || '') ? ' warn' : '') + '"></span>' +
-                    '<span><span class="alert-item-rig">' + esc(a.rig || a.hostname || '') + '</span>' +
-                    '<span class="alert-item-msg">' + esc(a.message || '') + '</span></span>' +
-                '</div>').join('')
-            : '<div class="alert-empty">Nothing unresolved. All monitored rigs are healthy.</div>';
+        const item = (a, done) =>
+            '<div class="alert-item' + (done ? ' resolved' : '') + '">' +
+                '<span class="alert-dot' +
+                    (done ? ' done' : (/warn/i.test(a.kind || '') ? ' warn' : '')) + '"></span>' +
+                '<span class="alert-item-body">' +
+                    '<span class="alert-item-rig">' + esc(a.rig || a.hostname || '') + '</span>' +
+                    '<span class="alert-item-msg">' + esc(a.message || '') + '</span>' +
+                    alertWho(a) +
+                '</span>' +
+                '<button type="button" class="alert-resolve' + (done ? ' undo' : '') + '" ' +
+                    'title="' + (done ? 'Move back to unresolved' : 'Acknowledge in this browser') + '" ' +
+                    'onclick="' + (done ? 'unresolveAlert' : 'resolveAlert') +
+                    '(event, \'' + jsAttr(alertKey(a)) + '\')">' +
+                    (done ? 'Undo' : 'Resolve') + '</button>' +
+            '</div>';
+
+        // Resolved alerts stay in the panel — the condition is still true on
+        // the fleet, it has just been acknowledged — but drop out of the count
+        // and lose the red dot so they cannot be mistaken for live faults.
+        let html = list.map(a => item(a, false)).join('');
+        if (!list.length) {
+            html = '<div class="alert-empty">Nothing unresolved. All monitored rigs are healthy.</div>';
+        }
+        if (done.length) {
+            html += '<div class="alert-panel-head alert-subhead"><span>Resolved</span></div>' +
+                    done.map(a => item(a, true)).join('');
+        }
+        body.innerHTML = html;
+
+        const clearAll = document.getElementById('alert-clear-all');
+        if (clearAll) clearAll.classList.toggle('hidden', list.length === 0);
     }
 
     function toggleAlertPanel(evt) {
@@ -2265,35 +3123,161 @@
             el.className = 'loop-status' + pair[1] + ' ' + cls;
             el.title = title || '';
         });
+        // Failures also print the detail on the page, not just in a tooltip.
+        if (cls === 'status-off' && title) showPollError(title, text);
+        else clearPollError();
     }
 
-    async function fetchUpdates() {
-        if (pollInFlight) return;          // never stack requests on a slow link
-        pollInFlight = true;
+    function showPollError(detail, label) {
+        const el = document.getElementById('poll-error');
+        if (!el) return;
+        el.innerHTML = '<b>' + esc(label || 'ERROR') + '</b> &middot; ' + esc(detail);
+        el.classList.remove('hidden');
+    }
+
+    function clearPollError() {
+        const el = document.getElementById('poll-error');
+        if (el) el.classList.add('hidden');
+    }
+
+    // Slightly under the function's 60s maxDuration, so a request the server
+    // has already given up on does not keep the tab looking frozen.
+    const POLL_TIMEOUT_MS = 45000;
+
+    // ── One poller per browser ───────────────────────────────────────────
+    //
+    // Every open tab firing its own /api/summary multiplies invocations by
+    // the number of tabs for identical data. A localStorage lease elects a
+    // single polling tab per browser; the rest render from its BroadcastChannel
+    // message and never hit the network. Across separate devices this cannot
+    // dedupe, so the server also gates the poll cadence (POLL_MIN_INTERVAL_SEC)
+    // and those requests return cached state in well under a second.
+    //
+    // The lease is a timestamp, not a flag, so a tab that crashes or is closed
+    // without firing unload simply goes stale and another takes over.
+    const LEADER_KEY = 'fleet_poll_leader';
+    const TAB_ID = Math.random().toString(36).slice(2) + Date.now().toString(36);
+    // Clamped, because the poll rate is user-selectable. At the 1h setting an
+    // unclamped 2.5x lease would let one closed tab block every other tab for
+    // two and a half hours; the floor keeps a lone fast tab from fighting
+    // itself. Extra polls that slip through are absorbed by the server's own
+    // cadence gate.
+    function leaseStaleMs() {
+        return Math.min(Math.max(effectivePollMs() * 2.5, 30000), 300000);
+    }
+    let pollChannel = null;
+    try { pollChannel = new BroadcastChannel('fleet-monitor-poll'); } catch (e) { /* older browser */ }
+
+    function readLease() {
+        try { return JSON.parse(localStorage.getItem(LEADER_KEY) || 'null'); }
+        catch (e) { return null; }
+    }
+
+    // Returns true if this tab may poll on this tick.
+    function claimPollLease() {
+        const lease = readLease();
+        const now = Date.now();
+        if (lease && lease.id !== TAB_ID && (now - (lease.ts || 0)) < leaseStaleMs()) {
+            return false;                       // another live tab owns it
+        }
         try {
-            const res = await fetch(API_BASE + '/summary', { headers: { ...authHeaders() } });
+            localStorage.setItem(LEADER_KEY, JSON.stringify({ id: TAB_ID, ts: now }));
+        } catch (e) { return true; }            // storage blocked: just poll
+        return true;
+    }
+
+    window.addEventListener('pagehide', () => {
+        const lease = readLease();
+        if (lease && lease.id === TAB_ID) {
+            try { localStorage.removeItem(LEADER_KEY); } catch (e) { /* ignore */ }
+        }
+    });
+
+    if (pollChannel) {
+        pollChannel.onmessage = (ev) => {
+            if (!ev.data || ev.data.from === TAB_ID) return;
+            // A paused tab ignores peer broadcasts too. They are free, but
+            // accepting them would flip the status back to LOOP ACTIVE and
+            // keep the view updating, which is not what "paused" means.
+            if (pollPaused) return;
+            applySummary(ev.data.summary, true);
+        };
+    }
+
+    function applySummary(d, fromPeer) {
+        if (!d) return;
+        if (d.poll && d.poll.error) {
+            setLoopStatus("POLL ERROR", "status-off", d.poll.error);
+        } else if (fromPeer) {
+            setLoopStatus("LOOP ACTIVE", "status-on", 'Shared from another tab.');
+        } else {
+            setLoopStatus("LOOP ACTIVE", "status-on", '');
+        }
+
+        if (Array.isArray(d.logs)) { lastLogs = d.logs; renderTerminal(); }
+        if (d.devices) { renderRigs(d.devices); handleAlerts(d.devices.alerts); }
+        if (d.stats)   { renderStats(d.stats); fetchRangeStats(); }
+        if (d.task_history) renderTaskHistory(d.task_history);
+    }
+
+    // `force`      — bypass this tab's visibility/lease gates (local)
+    // `forcePoll`  — also bypass the SERVER's cadence gate (the Refresh button)
+    async function fetchUpdates(force, forcePoll) {
+        // Checked before `force`, unlike the visibility and lease gates: a
+        // paused tab must stay paused when it regains focus, otherwise the
+        // switch would only hold until the next tab-switch. A manual Refresh
+        // is an explicit instruction, so it still goes through.
+        if (pollPaused && !forcePoll) return;
+        if (pollInFlight) return;          // never stack requests on a slow link
+        // A background tab does not need live data. This is the single biggest
+        // saving: tabs left open overnight stop costing anything at all.
+        if (!force && document.visibilityState === 'hidden') return;
+        if (!force && !claimPollLease()) return;
+
+        pollInFlight = true;
+        const ctl = new AbortController();
+        const abortTimer = setTimeout(() => ctl.abort(), POLL_TIMEOUT_MS);
+        try {
+            const res = await fetch(API_BASE + '/summary' + (forcePoll ? '?force=1' : ''),
+                                    { headers: { ...authHeaders() }, signal: ctl.signal });
             if (res.status === 401) return logout();
+            // 504 is Vercel killing the invocation at maxDuration, not the
+            // monitor being unreachable — say so rather than "OFFLINE".
+            if (res.status === 504 || res.status === 502) {
+                setLoopStatus("POLL TIMEOUT", "status-off",
+                              "The fleet poll exceeded the serverless time limit. Retrying.");
+                return;
+            }
             if (!res.ok) throw new Error('summary ' + res.status);
             const d = await res.json();
 
-            if (d.poll && d.poll.error) {
-                setLoopStatus("POLL ERROR", "status-off", d.poll.error);
-            } else {
-                setLoopStatus("LOOP ACTIVE", "status-on", '');
+            applySummary(d, false);
+            if (pollChannel) {
+                try { pollChannel.postMessage({ from: TAB_ID, summary: d }); }
+                catch (e) { /* payload too large for this browser; harmless */ }
             }
 
-            if (Array.isArray(d.logs)) { lastLogs = d.logs; renderTerminal(); }
-            if (d.devices) { renderRigs(d.devices); handleAlerts(d.devices.alerts); }
-            if (d.stats)   { renderStats(d.stats); fetchRangeStats(); }
-            if (d.task_history) renderTaskHistory(d.task_history);
-
         } catch (e) {
-            setLoopStatus("MONITOR OFFLINE", "status-off", String(e && e.message || e));
+            if (e && e.name === 'AbortError') {
+                setLoopStatus("POLL TIMEOUT", "status-off",
+                              "No response within " + (POLL_TIMEOUT_MS / 1000) + "s. Retrying.");
+            } else {
+                setLoopStatus("MONITOR OFFLINE", "status-off", String(e && e.message || e));
+            }
             console.error("Summary fetch failed", e);
         } finally {
+            clearTimeout(abortTimer);
             pollInFlight = false;
         }
     }
+
+    // Coming back to a hidden tab, refresh at once rather than showing data
+    // frozen at whenever it was backgrounded.
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState !== 'visible') return;
+        if (document.getElementById('dashboard').classList.contains('hidden')) return;
+        fetchUpdates(true);
+    });
 
     checkSession();
 </script>

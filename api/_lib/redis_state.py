@@ -176,6 +176,30 @@ def log_read(limit: int = 500):
     return list(reversed(raw))
 
 
+# ── Feedback ──────────────────────────────────────────────────────────────
+# Capped like the log: this is a suggestion box, not a ticket system, and it
+# must not be able to grow without bound from the public-facing page.
+FEEDBACK_MAX = 200
+
+
+def feedback_push(entry: dict):
+    pipeline([
+        ["LPUSH", P + "feedback", json.dumps(entry, separators=(",", ":"))],
+        ["LTRIM", P + "feedback", 0, FEEDBACK_MAX - 1],
+    ])
+
+
+def feedback_read(limit: int = 50):
+    raw = cmd("LRANGE", P + "feedback", 0, int(limit) - 1) or []
+    out = []
+    for r in raw:
+        try:
+            out.append(json.loads(r))
+        except Exception:
+            pass
+    return out
+
+
 # ── Frame health history ──────────────────────────────────────────────────
 def health_push(entry: dict, maxlen: int = 1440):
     pipeline([

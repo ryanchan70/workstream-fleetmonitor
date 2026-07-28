@@ -9,6 +9,7 @@ Both take a Redis lock, so several tabs polling at once cannot double-count.
 """
 
 import json
+import random
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -18,8 +19,43 @@ from . import redis_state as R
 
 # Budget for fanning out per-device session fetches. Vercel kills the
 # invocation at maxDuration, so this stays well inside it.
-SESSION_FETCH_BUDGET = 20.0
-SESSION_FETCH_WORKERS = 8
+SESSION_FETCH_BUDGET = 8.0
+SESSION_FETCH_WORKERS = 12
+
+# Every open tab on every device fires its own /api/summary. The Redis lock
+# already stops them doing the work concurrently, but back-to-back requests
+# from different devices would still each run a full fleet poll. This gate
+# makes the poll cadence a property of the fleet rather than of how many
+# tabs happen to be open: the first request in a window does the work, the
+# rest get the cached state in well under a second.
+#
+# Deliberately below POLL_MS (20s) so a single lone tab is never gated by
+# its own jitter.
+POLL_MIN_INTERVAL_SEC = 15.0
+
+# Outside shift hours the fleet is not doing anything worth watching at 15s
+# resolution, so the gate widens to hourly and every open tab coasts on the
+# cached state. Evaluated on the fleet's clock, not the viewer's: a tab open
+# in another timezone must not throttle while the floor in California is
+# still mid-shift, nor keep polling all night because it is morning there.
+NIGHT_START_HOUR = 19        # 7pm Pacific
+NIGHT_END_HOUR = 9           # 9am Pacific
+NIGHT_MIN_INTERVAL_SEC = 3600.0
+
+
+def is_night(now_pacific=None) -> bool:
+    h = (now_pacific or C.pacific_now()).hour
+    return h >= NIGHT_START_HOUR or h < NIGHT_END_HOUR
+
+
+def poll_min_interval() -> float:
+    return NIGHT_MIN_INTERVAL_SEC if is_night() else POLL_MIN_INTERVAL_SEC
+
+# Per-device session fetches per poll cycle. The whole fleet does not need
+# checking at once — each cycle takes the next slice, so a rig is refreshed
+# every ceil(online / RIG_SHARD_TARGET) cycles instead of all of them
+# hammering the fleet API on the same tick.
+RIG_SHARD_TARGET = 12
 
 
 def _log(*lines):
@@ -27,6 +63,61 @@ def _log(*lines):
         R.log_push([f"[{C.ts()}] {l}" for l in lines])
     except R.RedisUnavailable:
         pass
+
+
+def _time_shard(items, per_cycle):
+    """The slice of `items` due for checking in the current cycle.
+
+    Keyed off wall-clock time rather than a stored cursor, so it advances
+    once per POLL_MIN_INTERVAL_SEC no matter which tab or device happened to
+    drive the poll. Striding (items[i::n]) rather than chunking keeps each
+    slice spread across the fleet instead of clustering by hostname.
+    """
+    items = sorted(items)
+    if len(items) <= per_cycle:
+        return items
+    shards = -(-len(items) // per_cycle)      # ceil
+    idx = int(time.time() // POLL_MIN_INTERVAL_SEC) % shards
+    return items[idx::shards]
+
+
+def _gather(fn, keys, budget):
+    """Run fn over keys in parallel, returning whatever finished within budget.
+
+    `with ThreadPoolExecutor(...)` cannot be used here. Its __exit__ calls
+    shutdown(wait=True), which blocks until *every* submitted future is done —
+    so a `break` at the deadline, or as_completed() raising, still waited for
+    all the outstanding fetches. With 34 rigs online, 8 workers and a 15s
+    per-request timeout with one retry, that was up to ~150s against a 60s
+    maxDuration, which is what produced the 504s.
+
+    Shutting down with wait=False and cancel_futures=True drops the queued
+    work and returns immediately. Anything that did not finish is simply
+    absent from the result; callers fall back to the last cached value and
+    the next poll picks it up.
+    """
+    out = {}
+    keys = list(keys)
+    if not keys:
+        return out
+
+    deadline = time.time() + budget
+    ex = ThreadPoolExecutor(max_workers=SESSION_FETCH_WORKERS)
+    try:
+        futs = {ex.submit(fn, k): k for k in keys}
+        try:
+            for fut in as_completed(futs, timeout=max(0.1, deadline - time.time())):
+                try:
+                    out[futs[fut]] = fut.result()
+                except Exception:
+                    pass            # one bad device must not sink the poll
+                if time.time() >= deadline:
+                    break
+        except Exception:
+            pass                    # as_completed timed out; keep partials
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+    return out
 
 
 # ── Poll ──────────────────────────────────────────────────────────────────
@@ -41,6 +132,16 @@ def poll(force: bool = False) -> dict:
         return {"skipped": "locked"}
 
     try:
+        last = float(R.jget("poll:last", 0) or 0)
+        age = time.time() - last
+        interval = poll_min_interval()
+        # `force` is the manual refresh button. It skips the cadence gate but
+        # still respects the lock, so mashing it cannot stack fleet sweeps.
+        if not force and age < interval:
+            return {"skipped": "recent", "age_s": round(age, 1),
+                    "interval_s": interval, "night": is_night()}
+        R.jset("poll:last", time.time())
+
         devices = fleet.fleet_status()
         if not devices:
             return {"skipped": "no devices"}
@@ -58,23 +159,91 @@ def poll(force: bool = False) -> dict:
         # Debouncing the evaluation itself made a still-failing rig look like
         # it had recovered, so the log oscillated CRITICAL -> RESOLVED ->
         # CRITICAL every 15 minutes while nothing actually changed.
+        service_memory = R.jget("service_memory", {}) or {}
         rigs, alerts = C.evaluate_rigs(
             devices,
             locations=locations,
             should_alert=None,
             prev_status=prev_status,
+            service_memory=service_memory,
         )
+
+        # Refresh the memory only from rigs the API actually flagged this
+        # cycle. Stamping a sticky rig with `now` would keep renewing its own
+        # lease and it could never leave servicing.
+        now = time.time()
+        new_memory = {}
+        for r in rigs:
+            if r["status"] != "servicing":
+                continue
+            host = r["hostname"]
+            if r.get("service_sticky"):
+                prev = service_memory.get(host)
+                if isinstance(prev, dict):
+                    new_memory[host] = prev        # keep the original ts; it expires
+            else:
+                new_memory[host] = {"ts": now, "svc": {
+                    "issue": r.get("service_issue") or "",
+                    "detail": r.get("service_detail") or "",
+                    "by": r.get("service_by") or "",
+                    "flagged_at": r.get("service_since"),
+                }}
+        R.jset("service_memory", new_memory, ttl=3600)
+
+        # "Last seen online" for the offline tiles.
+        #
+        # The fleet API has its own `last_seen`, but it reports 0 for exactly
+        # the devices this is needed for — an unreachable Pi has no last
+        # contact time to give. So it is authoritative when non-zero (it is
+        # the real last contact, not merely when we happened to poll) and we
+        # fall back to stamping the poll time ourselves.
+        #
+        # Consequence worth knowing: a rig that is already offline when this
+        # first runs has no history, and stays blank until it comes back once.
+        by_host = {d.get("hostname"): d for d in devices if d.get("hostname")}
+        last_online = R.jget("last_online", {}) or {}
+        for r in rigs:
+            host = r["hostname"]
+            api_seen = 0.0
+            try:
+                api_seen = float((by_host.get(host) or {}).get("last_seen") or 0)
+            except (TypeError, ValueError):
+                api_seen = 0.0
+            # Sanity: a plausible epoch, not a 0/uptime counter.
+            if api_seen < 1_000_000_000:
+                api_seen = 0.0
+
+            stamp = api_seen or (now if r.get("online") else 0.0)
+            if stamp:
+                # Monotonic: never let a stale API value walk the time back.
+                prev = float(last_online.get(host) or 0)
+                last_online[host] = max(prev, stamp)
+
+            if not r.get("online"):
+                seen = last_online.get(host)
+                r["last_seen"] = float(seen) if seen else None
+        # Bounded: drop hosts the fleet no longer reports at all.
+        live_hosts = {r["hostname"] for r in rigs}
+        last_online = {h: t for h, t in last_online.items() if h in live_hosts}
+        R.jset("last_online", last_online)
 
         active = R.jget("active_alerts", {}) or {}
         current = {f"{a['hostname']}|{a['kind']}": a for a in alerts}
 
         # Transitions fire exactly once per incident.
+        #
+        # Two things deliberately do NOT reach the terminal:
+        #   recording_stopped — a rig stopping (usually by dropping offline)
+        #     already prints a CHANGE line carrying the operator and the run
+        #     length, which is the useful record. The CRITICAL was a duplicate
+        #     of the same event with less information.
+        #   resolutions — every incident was printed twice, and a wall of
+        #     "cleared" lines pushed the live faults off the top of the log.
+        # Both still raise alerts and notifications; this only governs what
+        # gets written to the terminal dump.
         for k, a in current.items():
-            if k not in active:
+            if k not in active and a.get("kind") != "recording_stopped":
                 _log(f"CRITICAL {a['rig']}: {a['message']}")
-        for k, a in list(active.items()):
-            if k not in current:
-                _log(f"RESOLVED {a['rig']}: cleared — {a.get('message','')}")
         R.jset("active_alerts", current)
 
         # The quiet period applies only to re-notifying. A newly-appeared
@@ -174,27 +343,36 @@ def _rebuild_leaderboard(devices, today, observed):
     status = {d.get("hostname"): C.get_status(d) for d in devices if d.get("hostname")}
     labels = {d.get("hostname"): C.device_label(d) for d in devices if d.get("hostname")}
 
-    cached = R.hgetall_json("today_sessions")
+    # Cached sessions are re-filtered against today, so the fallbacks below
+    # cannot drag yesterday's work into today's totals after a rollover.
+    cached = {h: [g for g in (v or []) if C.session_is_today(g, today)]
+              for h, v in (R.hgetall_json("today_sessions") or {}).items()
+              if isinstance(v, list)}
     results = {}
-    deadline = time.time() + SESSION_FETCH_BUDGET
 
-    targets = [h for h, s in status.items() if s != "offline"]
-    if targets:
-        with ThreadPoolExecutor(max_workers=SESSION_FETCH_WORKERS) as ex:
-            futs = {ex.submit(fleet.device_sessions, h): h for h in targets}
-            for fut in as_completed(futs, timeout=max(1.0, deadline - time.time())):
-                h = futs[fut]
-                try:
-                    groups = [g for g in (fut.result() or [])
-                              if C.session_is_today(g, today)]
-                    results[h] = groups
-                except Exception:
-                    pass
-                if time.time() > deadline:
-                    break
+    def _hours(groups):
+        return sum(float(g.get("duration_s") or 0) for g in (groups or []))
 
-    # Devices we could not reach keep their last known sessions rather than
-    # dropping to zero and collapsing the operator totals.
+    # Only this cycle's slice is fetched. Everything else keeps its cached
+    # sessions via the fallback below, so the numbers stay complete while the
+    # per-poll cost stops scaling with fleet size.
+    targets = _time_shard([h for h, s in status.items() if s != "offline"],
+                          RIG_SHARD_TARGET)
+    for h, groups in _gather(fleet.device_sessions, targets,
+                             SESSION_FETCH_BUDGET).items():
+        todays = [g for g in (groups or []) if C.session_is_today(g, today)]
+        # A device that answers with nothing is almost always a failed or
+        # truncated fetch, not a rig that un-recorded its morning. Taking the
+        # larger of the two keeps the total monotonic through the day, which
+        # is what it should be: today's recorded hours only ever grow.
+        #
+        # Without this the total visibly collapsed — 70.4h to 41.7h between
+        # two consecutive polls — because an empty result overwrote the cache
+        # and the "not in results" fallback below could no longer save it.
+        results[h] = todays if _hours(todays) >= _hours(cached.get(h)) else cached[h]
+
+    # Devices outside this cycle's slice keep their last known sessions rather
+    # than dropping to zero and collapsing the operator totals.
     for h in status:
         if h not in results and h in cached:
             results[h] = cached[h]
@@ -276,19 +454,15 @@ def backfill(force: bool = False) -> dict:
         named = [(d.get("hostname"), C.device_label(d)) for d in devices
                  if d.get("hostname") and not C.is_unnamed_pi(C.device_label(d))]
 
-        deadline = time.time() + SESSION_FETCH_BUDGET * 2
-        fetched = {}
-        with ThreadPoolExecutor(max_workers=SESSION_FETCH_WORKERS) as ex:
-            futs = {ex.submit(fleet.device_sessions, h): (h, l) for h, l in named}
-            try:
-                for fut in as_completed(futs, timeout=max(1.0, deadline - time.time())):
-                    h, l = futs[fut]
-                    try:
-                        fetched[h] = (l, fut.result() or [])
-                    except Exception:
-                        pass
-            except Exception:
-                pass    # partial results are fine; next hour picks up the rest
+        # The budget means a sweep usually reaches only some of the fleet.
+        # In a fixed order the same devices would win every hour and the tail
+        # would never sync at all, so the order is shuffled: each sweep covers
+        # a different subset and Redis accumulates the union across hours.
+        random.shuffle(named)
+        labels = dict(named)
+        fetched = {h: (labels[h], groups or [])
+                   for h, groups in _gather(fleet.device_sessions, labels,
+                                            SESSION_FETCH_BUDGET * 2).items()}
 
         today = C.get_date_str()
         tasks_by_host = {}
@@ -356,6 +530,10 @@ def backfill(force: bool = False) -> dict:
         # Stamped only once the sweep has actually succeeded. Stamping up front
         # meant any failure — an unreachable fleet API, missing credentials —
         # still counted as "done" and suppressed every retry for a full hour.
+        # A sweep that reached no device at all is a failure too, not an
+        # hour's worth of "done".
+        if not fetched:
+            return {"skipped": "no sessions fetched"}
         R.jset("backfill:last", time.time())
 
         _log(f"INFO   Backfill — {len(fetched)} device(s), {len(by_day)} past day(s).")
