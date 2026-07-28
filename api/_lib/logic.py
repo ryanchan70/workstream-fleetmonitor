@@ -35,9 +35,14 @@ SESSION_FETCH_WORKERS = 12
 # tabs happen to be open: the first request in a window does the work, the
 # rest get the cached state in well under a second.
 #
-# Deliberately below POLL_MS (20s) so a single lone tab is never gated by
-# its own jitter.
-POLL_MIN_INTERVAL_SEC = 15.0
+# The floor matches the dashboard's default refresh, so a fleet sweep happens
+# once per tick and not twice. It used to sit at 15s while every tab asked
+# every 30s, which bought nothing: the extra sweep landed between two ticks and
+# nobody ever saw it, and sweeping is by far the most expensive thing a request
+# can do. A tab that has chosen a faster refresh says so (see below) and gets
+# it; POLL_FLOOR_SEC is how fast anyone may drive the fleet.
+POLL_MIN_INTERVAL_SEC = 30.0
+POLL_FLOOR_SEC = 15.0
 
 # Outside shift hours the fleet is not doing anything worth watching at 15s
 # resolution, so the gate widens to hourly and every open tab coasts on the
@@ -74,8 +79,27 @@ def is_night(now_pacific=None) -> bool:
     return h >= NIGHT_START_HOUR or h < NIGHT_END_HOUR
 
 
-def poll_min_interval() -> float:
-    return NIGHT_MIN_INTERVAL_SEC if is_night() else POLL_MIN_INTERVAL_SEC
+def poll_min_interval(requested=None) -> float:
+    """How often the fleet may be swept, in seconds.
+
+    `requested` is the refresh rate the asking tab has chosen. Honouring it
+    keeps the rate picker on the dashboard meaningful without making everyone
+    else pay for a cadence they did not ask for and cannot see.
+
+    The tab that wins a cycle sets how long the gate holds, so with a mix of
+    rates open at once the picker means "as often as", not "exactly": a 15s tab
+    waits out a 30s tab's window if that one swept first. Erring that way is
+    deliberate — the wrong answer costs a fleet sweep, which is the most
+    expensive thing a request can do.
+    """
+    if is_night():
+        return NIGHT_MIN_INTERVAL_SEC
+    if requested is None:
+        return POLL_MIN_INTERVAL_SEC
+    try:
+        return max(POLL_FLOOR_SEC, min(float(requested), NIGHT_MIN_INTERVAL_SEC))
+    except (TypeError, ValueError):
+        return POLL_MIN_INTERVAL_SEC
 
 
 # Per-device session fetches per poll cycle. The whole fleet does not need
@@ -148,7 +172,7 @@ def _time_shard(items, per_cycle):
     if len(items) <= per_cycle:
         return items
     shards = -(-len(items) // per_cycle)      # ceil
-    idx = int(time.time() // POLL_MIN_INTERVAL_SEC) % shards
+    idx = int(time.time() // POLL_FLOOR_SEC) % shards
     return items[idx::shards]
 
 
@@ -257,7 +281,7 @@ def agent_alive(state) -> dict | None:
     return a if age <= max(3 * float(a.get("every") or 30), 90) else None
 
 
-def poll(force: bool = False, state=None, agent=None):
+def poll(force: bool = False, state=None, agent=None, requested=None):
     """One iteration of the fleet loop.
 
     Returns (result, state). The state is handed back because the caller is
@@ -270,7 +294,7 @@ def poll(force: bool = False, state=None, agent=None):
     st = state if state is not None else load_state()
     p = st.setdefault("poll", {})
 
-    interval = poll_min_interval()
+    interval = poll_min_interval(requested)
     age = time.time() - float(p.get("last") or 0)
     # Two gates, and the cheap one runs first. This reads the state the caller
     # already loaded to serve the view, so a tick that finds the poll recent —

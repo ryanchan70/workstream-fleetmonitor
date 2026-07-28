@@ -3380,7 +3380,13 @@
         const ctl = new AbortController();
         const abortTimer = setTimeout(() => ctl.abort(), POLL_TIMEOUT_MS);
         try {
-            const res = await fetch(API_BASE + '/summary' + (forcePoll ? '?force=1' : ''),
+            // The chosen refresh rate rides along, so the server sweeps the
+            // fleet once per tick rather than to a fixed cadence nobody asked
+            // for. Sweeping is the expensive half of a tick; at the 15s
+            // setting this asks for 15s sweeps and gets them.
+            const q = '?r=' + Math.round(effectivePollMs() / 1000) +
+                      (forcePoll ? '&force=1' : '');
+            const res = await fetch(API_BASE + '/summary' + q,
                                     { headers: { ...authHeaders() }, signal: ctl.signal });
             if (res.status === 401) return logout();
             // 504 is Vercel killing the invocation at maxDuration, not the

@@ -438,7 +438,11 @@ class handler(BaseHTTPRequestHandler):
                 # ?force=1 is the manual refresh button: one invocation that
                 # both forces the sweep and returns the fresh payload, rather
                 # than a separate /poll call followed by a /summary.
-                result["poll"], state = logic.poll(force="force" in qs, state=state)
+                # The tab's own refresh rate, so the picker on the dashboard
+                # means what it says without setting the floor for everyone.
+                result["poll"], state = logic.poll(
+                    force="force" in qs, state=state,
+                    requested=(qs.get("r") or [None])[0])
             except Exception as e:
                 result["poll"] = {"error": f"{type(e).__name__}: {e}"}
             try:
