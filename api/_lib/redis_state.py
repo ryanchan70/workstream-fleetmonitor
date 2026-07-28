@@ -311,11 +311,15 @@ def health_read(limit: int = 360):
 SESSION_TTL = 60 * 60 * 12
 
 # Every authenticated request validates its token, so this was a guaranteed
-# Redis command per request no matter what else got cached. Memoised for half
-# a minute instead. The cost of that window is a token staying usable on an
-# already-warm container for up to 30s after a logout elsewhere; the session
-# itself is 12 hours, so the exposure is negligible either way.
-SESSION_MEMO_TTL = 30.0
+# Redis command per request no matter what else got cached — once the rest of
+# the tick was free, it was a third of what a dashboard cost.
+#
+# The window is what a logout is worth: a token stays usable on an
+# already-warm container for this long after being destroyed elsewhere.
+# Against a 12-hour session, five minutes is not a meaningful difference in
+# exposure, and the logout still takes effect immediately on every container
+# that has not already seen the token.
+SESSION_MEMO_TTL = 300.0
 _SESS = "sess:"
 
 
