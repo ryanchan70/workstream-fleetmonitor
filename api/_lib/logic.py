@@ -204,7 +204,24 @@ def _migrate_state(st: dict) -> dict:
 
 
 # ── Poll ──────────────────────────────────────────────────────────────────
-def poll(force: bool = False, state=None):
+def agent_alive(state) -> dict | None:
+    """The agent's heartbeat, if one is polling and still current.
+
+    When agent.py is running on a machine you control it owns the fleet loop
+    entirely, and the serverless function stops calling out to fleet.shiftiq.us
+    at all — it only reads back what the agent left in Redis. Three missed
+    cycles (or ninety seconds, whichever is longer) and the function quietly
+    takes the loop back, so killing the agent degrades to the old behaviour
+    instead of freezing the dashboard.
+    """
+    a = ((state or {}).get("poll") or {}).get("agent")
+    if not isinstance(a, dict):
+        return None
+    age = time.time() - float(a.get("at") or 0)
+    return a if age <= max(3 * float(a.get("every") or 30), 90) else None
+
+
+def poll(force: bool = False, state=None, agent=None):
     """One iteration of the fleet loop.
 
     Returns (result, state). The state is handed back because the caller is
@@ -428,6 +445,11 @@ def poll(force: bool = False, state=None):
 
         by_pi, by_op = _rebuild_leaderboard(devices, today, observed)
         p["by_pi"], p["by_op"] = by_pi, by_op
+
+        # Rides along in the blob that is being written anyway, so claiming the
+        # loop costs the agent nothing.
+        if agent:
+            p["agent"] = {"at": time.time(), "id": agent[0], "every": agent[1]}
 
         # One LPUSH for the whole cycle rather than one per event.
         if lines:

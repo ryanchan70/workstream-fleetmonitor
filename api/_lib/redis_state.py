@@ -187,8 +187,11 @@ HISTORY_KEY = "history"
 HISTORY_MEMO_TTL = 20.0
 
 
-def state_load(memo_ttl: float = STATE_MEMO_TTL) -> dict:
-    hit = memo_get(STATE_KEY, memo_ttl)
+# Read at call time, not bound as a default argument: agent.py raises both of
+# these when it is the process doing the polling, because then the memo is not
+# a guess about staleness — it is the copy it just wrote.
+def state_load(memo_ttl: float | None = None) -> dict:
+    hit = memo_get(STATE_KEY, STATE_MEMO_TTL if memo_ttl is None else memo_ttl)
     if hit is not None:
         return hit
     return memo_set(STATE_KEY, jget(STATE_KEY, {}) or {})
@@ -199,8 +202,8 @@ def state_save(state: dict):
     jset(STATE_KEY, state)
 
 
-def history_load(memo_ttl: float = HISTORY_MEMO_TTL) -> dict:
-    hit = memo_get(HISTORY_KEY, memo_ttl)
+def history_load(memo_ttl: float | None = None) -> dict:
+    hit = memo_get(HISTORY_KEY, HISTORY_MEMO_TTL if memo_ttl is None else memo_ttl)
     if hit is not None:
         return hit
     return memo_set(HISTORY_KEY, jget(HISTORY_KEY, {}) or {})

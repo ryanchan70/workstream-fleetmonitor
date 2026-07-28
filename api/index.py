@@ -84,6 +84,22 @@ class handler(BaseHTTPRequestHandler):
         route = _norm(self.path)
         qs = parse_qs(urlparse(self.path).query)
 
+        if route == "agent":
+            # Who is driving the fleet loop, and how long ago. Unauthenticated
+            # like /health, and it deliberately reports no credentials — just
+            # the name the agent was started with.
+            try:
+                a = logic.agent_alive(logic.load_state())
+            except Exception:
+                a = None
+            return self._json(200, {
+                "agent": bool(a),
+                "id": (a or {}).get("id"),
+                "every_s": (a or {}).get("every"),
+                "age_s": round(time.time() - float((a or {}).get("at") or 0), 1) if a else None,
+                "polling": "agent" if a else "serverless",
+            })
+
         if route == "health":
             # Timezone is reported because a container that silently lacks a
             # tz database is the difference between "today" meaning the shift
@@ -389,6 +405,16 @@ class handler(BaseHTTPRequestHandler):
         """
         state = logic.load_state()
         result = {}
+        # An agent on the user's own hardware owns the loop while it is alive,
+        # and this drops to serving what it wrote. Manual refresh still forces
+        # a sweep here — that is the one case where somebody is waiting on it.
+        agent = logic.agent_alive(state)
+        if agent and "force" not in qs:
+            result["poll"] = {"skipped": "agent", "by": agent.get("id"),
+                              "age_s": round(time.time() - float(agent.get("at") or 0), 1)}
+            result.update(state.get("view") or {})
+            return result
+
         if "nopoll" not in qs:
             try:
                 # ?force=1 is the manual refresh button: one invocation that

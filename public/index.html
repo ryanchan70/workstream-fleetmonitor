@@ -1363,7 +1363,11 @@
 
 <script>
     const IS_LOCAL = location.protocol === 'file:' || ['127.0.0.1', 'localhost'].includes(location.hostname);
-    const API_BASE = IS_LOCAL ? "http://127.0.0.1:8080" : "/api";
+    // Same origin whenever the page came from a server — including agent.py's
+    // --serve, where "localhost" and "127.0.0.1" are different origins to the
+    // browser and hard-coding one of them would make every call a blocked
+    // cross-origin request. Only a file:// page has no origin to talk to.
+    const API_BASE = location.protocol === 'file:' ? "http://127.0.0.1:8080" : "/api";
 
     // Each tick is ONE serverless invocation: /api/summary runs the fleet poll
     // (plus the hourly backfill when due) and returns the live view — devices,
@@ -3300,7 +3304,12 @@
         } else if (source === 'peer') {
             setLoopStatus("LOOP ACTIVE", "status-on", 'Shared from another tab.');
         } else if (source !== 'cache') {
-            setLoopStatus("LOOP ACTIVE", "status-on", '');
+            // Worth saying which machine is doing the polling: if the agent
+            // dies, the dashboard keeps working and the only outward sign is
+            // this line changing back.
+            const by = d.poll && d.poll.skipped === 'agent' && d.poll.by;
+            setLoopStatus("LOOP ACTIVE", "status-on",
+                          by ? 'Fleet polled by agent on ' + by + '.' : '');
         }
         // 'cache' deliberately leaves the status alone: the data on screen is
         // real but old, and the updated stamp already says how old.
