@@ -52,6 +52,10 @@ NIGHT_MIN_INTERVAL_SEC = 3600.0
 # every tick, so it is capped tighter than the durable ring buffer behind it.
 LOG_VIEW_MAX = 250
 
+# Enough frame-health points to draw the chart on a fresh load; a tab that is
+# already open extends the line from each tick itself.
+HEALTH_SEED_MAX = 180
+
 # The frame-health series only needs enough resolution to seed the chart on
 # load — a tab that is already open appends each poll's reading to its own
 # copy. Pushing one point per poll was two Redis commands every 15 seconds
@@ -89,16 +93,16 @@ def _stamp(line: str) -> str:
     return f"[{C.ts()}] {line}"
 
 
-def _log(*lines):
-    """Append to the durable ring buffer.
+def _drain_legacy_log():
+    """The ring buffer the view's log tail replaced, read once on migration.
 
-    poll() collects its lines and passes them through the view instead; this
-    is for the paths that write a line outside a poll cycle.
+    Keeping it in step cost an LPUSH and an LTRIM on every cycle that emitted a
+    line, to duplicate 250 lines the state blob already carries durably.
     """
     try:
-        R.log_push([_stamp(l) for l in lines])
+        return R.log_read(LOG_VIEW_MAX) or []
     except R.RedisUnavailable:
-        pass
+        return []
 
 
 def _view_log(*lines, history_v=None, last_at=None):
@@ -118,7 +122,6 @@ def _view_log(*lines, history_v=None, last_at=None):
         if last_at:
             p["backfill_last"] = last_at
         R.state_save(st)
-        R.log_push(stamped)
     except R.RedisUnavailable:
         pass
 
@@ -432,7 +435,7 @@ def poll(force: bool = False, state=None, agent=None):
                 "min": round(min(readings), 2),
             }
             if now - float(p.get("health_at") or 0) >= HEALTH_PUSH_SEC:
-                R.health_push(health_point)
+                p["health"] = (list(p.get("health") or []) + [health_point])[-HEALTH_SEED_MAX:]
                 p["health_at"] = now
 
         # Idempotent observed-time tracker. Preserved verbatim in spirit from
@@ -503,13 +506,6 @@ def poll(force: bool = False, state=None, agent=None):
         if agent:
             p["agent"] = {"at": time.time(), "id": agent[0], "every": agent[1]}
 
-        # One LPUSH for the whole cycle rather than one per event.
-        if lines:
-            try:
-                R.log_push([_stamp(l) for l in lines])
-            except R.RedisUnavailable:
-                pass
-
         st["view"] = _build_view(st, rigs, alerts, by_pi, by_op,
                                  health_point, [_stamp(l) for l in lines])
         R.state_save(st)
@@ -541,7 +537,7 @@ def _build_view(st, rigs, alerts, by_pi, by_op, health_point, new_lines):
     # from an empty list, so a genuinely empty log is not re-read every cycle.
     if not st.get("poll", {}).get("logs_seeded"):
         st.setdefault("poll", {})["logs_seeded"] = True
-        logs = [l for l in (R.log_read(LOG_VIEW_MAX) or [])
+        logs = [l for l in (_drain_legacy_log() or [])
                 if " RESOLVED " not in str(l)
                 and not (" CRITICAL " in str(l) and "stopped recording" in str(l))]
     logs = (logs + list(new_lines))[-LOG_VIEW_MAX:]
@@ -723,17 +719,20 @@ def _history_touch(history: dict, tasks_by_host: dict):
 
 
 def _record_finished(finished):
-    """A recording just stopped: durable record plus a history patch."""
+    """A recording just stopped: patch it into the history blob.
+
+    It used to be written to a per-rig hash as well, which cost one command per
+    rig that stopped in the same cycle — ten of them at the end of a shift. The
+    blob is durable Redis state in its own right, so that was a second copy of
+    the same records earning nothing.
+    """
     entries = {}
     for f in finished:
-        entry = {
+        entries.setdefault(f["hostname"], []).append({
             "label": f["label"], "operator": f["operator"], "task": f["task"],
             "duration_s": f["duration_s"], "start_time": f["start_time"],
             "src": "live",
-        }
-        sid = f"live|{f['hostname']}|{f['start_time']}|{int(f['duration_s'])}"
-        R.hset_json(_TASKS + f["hostname"], sid, entry)
-        entries.setdefault(f["hostname"], []).append(entry)
+        })
 
     history = R.history_load()
     _history_touch(history, entries)
@@ -744,9 +743,10 @@ def _record_finished(finished):
 def _history_bootstrap(history: dict) -> bool:
     """Populate the blob from the per-rig hashes it replaced.
 
-    Runs once, on the first backfill after this shipped, and again only if the
-    blob is ever lost — otherwise every rig's history would read as empty
-    until it happened to record something new.
+    Runs once, on the first backfill after this shipped, so no rig's history
+    reads as empty until it happens to record something new. Nothing writes
+    those hashes any more; if the blob is ever lost this restores the snapshot
+    they hold, and the sweep refills the rest from the fleet API.
     """
     if history.get("tasks"):
         return False
@@ -872,12 +872,10 @@ def backfill(force: bool = False) -> dict:
 
         for host, m in sessions_by_host.items():
             R.hset_many_json(_SESSIONS + host, m)
-        # Still written per rig: the blob is the served copy, these hashes are
-        # what it can be rebuilt from if it is ever lost.
-        for host, entries in tasks_by_host.items():
-            R.hset_many_json(_TASKS + host, {
-                f"api|{int(e['start_time'] or 0)}|{int(e['duration_s'])}": e
-                for e in entries if e.get("start_time")})
+        # The task records go straight into the history blob below. The
+        # per-rig session hashes above stay: they accumulate across sweeps that
+        # each only reach part of the fleet, and the past-day totals are
+        # rebuilt from all of them.
 
         # Per-day totals for the chart, excluding today (handled live) and
         # weekends (excluded by request). The same pass builds the per-day
@@ -928,7 +926,8 @@ def backfill(force: bool = False) -> dict:
             history["days"] = [{"date": d, "hours": round(s / 3600, 3)}
                                for d, s in sorted(by_day.items())]
             history["breakdown"] = breakdown
-        history["health"] = R.health_read(360)
+        history["health"] = list((R.state_load().get("poll") or {}).get("health")
+                                 or R.health_read(360))
         R.history_save(history)
 
         _view_log(f"INFO   Backfill — {len(fetched)} device(s), {len(by_day)} past day(s).",
