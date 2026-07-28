@@ -1366,11 +1366,17 @@
     const API_BASE = IS_LOCAL ? "http://127.0.0.1:8080" : "/api";
 
     // Each tick is ONE serverless invocation: /api/summary runs the fleet poll
-    // (plus the hourly backfill when due) and returns devices + rankings +
-    // stats + logs + task history together. The old build hit five endpoints
+    // (plus the hourly backfill when due) and returns the live view — devices,
+    // rankings, counters and the log tail. The old build hit five endpoints
     // every 2s, which on Vercel is five billable invocations per tick per tab.
-    // At 20s one permanently open tab is ~4.3k invocations/day against Hobby's
-    // 100k/month, and ~4.3k Upstash commands/day against its 10k/day free tier.
+    //
+    // What that tick costs on the server is the other half of the problem, and
+    // it does not follow from consolidating the requests. Everything expensive
+    // has been moved off the tick: the answer is assembled once per poll rather
+    // than per request, and the large, slow-moving part — task history, past
+    // days, the frame-health seed — is a separate fetch this file makes only
+    // when a version stamp says it has changed. A tick that finds the fleet
+    // already polled now costs one Redis read, sometimes none.
     const TOKEN_KEY = "fleet_dashboard_token";
     let pollTimer = null;
     let pendingToken = null;
@@ -1513,7 +1519,7 @@
         if (!el) return;
         if (!lastUpdatedMs) { el.textContent = ''; el.className = 'updated-stamp'; return; }
         const age = Date.now() - lastUpdatedMs;
-        el.textContent = 'Updated ' + fmtStamp(lastUpdatedMs);
+        el.textContent = 'updated ' + fmtStamp(lastUpdatedMs);
         // Stale means "older than two of whatever cadence is in force", so
         // the warning does not fire simply because the user chose 15m.
         const stale = age > effectivePollMs() * 2 + 20000;
@@ -1747,6 +1753,7 @@
         setSoundUI();
         setPollRateUI();
         syncSortUI();
+        hydrateFromCache();
         // Forced: a tab that just opened has nothing to show, and might not
         // win the poll lease. The server's cadence gate makes this cheap if
         // another device polled moments ago.
@@ -2722,18 +2729,39 @@
             : { bg: 'rgba(16,185,129,0.22)', border: 'rgba(16,185,129,0.55)' });
     }
 
+    // The range totals were re-fetched after every tick, and answering that
+    // request meant walking every session hash in the database. Nothing about
+    // the answer changes unless the selection changes, the hourly history is
+    // rebuilt, or — for a range that includes today — today's running total
+    // moves, so those three things are the cache key.
+    const RANGE_KEY = 'fleet_range_v1';
+    let rangeCache = { key: null, stamp: null, data: null };
+
     async function fetchRangeStats() {
         if (!selectedDays || !selectedDays.size) return;
         const days = [...selectedDays].sort().filter(d => !isWeekend(d)).join(',');
+        if (!days) return;
+        const stamp = String(histCache.v) + '|' + (days.includes(todayISO())
+            ? String(lastStats && lastStats.total_hours_today) : '');
+        if (rangeCache.key === days && rangeCache.stamp === stamp) return;
+
+        const prev = rangeCache;
+        // Claimed before the request goes out, so a tick and a chart click
+        // arriving together cannot both fire it.
+        rangeCache = { key: days, stamp: stamp, data: prev.data };
         try {
             const res = await fetch(API_BASE + '/stats_range?days=' + encodeURIComponent(days), {
                 mode: 'cors',
                 headers: { ...authHeaders(), "ngrok-skip-browser-warning": "true" }
             });
-            if (!res.ok) return;
+            if (!res.ok) { rangeCache = prev; return; }
             const rangeData = await res.json();
+            rangeCache = { key: days, stamp: stamp, data: rangeData };
+            saveCached(RANGE_KEY, rangeCache);
             renderRangeStats(rangeData);
-        } catch (e) { /* keep showing last good range data */ }
+        } catch (e) {
+            rangeCache = prev;         // keep showing the last good range data
+        }
     }
 
     function renderRangeStats(rangeData) {
@@ -3200,24 +3228,129 @@
             // accepting them would flip the status back to LOOP ACTIVE and
             // keep the view updating, which is not what "paused" means.
             if (pollPaused) return;
-            applySummary(ev.data.summary, true);
+            applySummary(ev.data.summary, 'peer');
         };
     }
 
-    function applySummary(d, fromPeer) {
+    // ── The slow-moving half ─────────────────────────────────────────────
+    //
+    // Task history, past-day totals and the frame-health seed are ninety-odd
+    // percent of the bytes and change roughly once an hour, so they no longer
+    // ride along on every tick. /summary carries a version stamp; this is
+    // re-fetched only when that stamp moves, and kept in localStorage so a
+    // reload paints from disk instead of from the network.
+    const HISTORY_KEY = 'fleet_history_v1';
+    const VIEW_KEY = 'fleet_view_v1';
+
+    let histCache = { v: 0, task_history: {}, hours_by_day: [], frame_health_history: [] };
+    let historyInFlight = false;
+    let healthSeries = [];          // seed + everything this tab has watched
+
+    function loadCached(key, fallback) {
+        try {
+            const raw = localStorage.getItem(key);
+            return raw ? JSON.parse(raw) : fallback;
+        } catch (e) { return fallback; }
+    }
+
+    function saveCached(key, value) {
+        // Quota is the only realistic failure and it is not worth surfacing:
+        // the cache is an optimisation, the network is the source of truth.
+        try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) {}
+    }
+
+    async function fetchHistory() {
+        if (historyInFlight) return;
+        historyInFlight = true;
+        try {
+            const res = await fetch(API_BASE + '/history', { headers: { ...authHeaders() } });
+            if (!res.ok) return;
+            const d = await res.json();
+            histCache = d;
+            healthSeries = (d.frame_health_history || []).slice();
+            saveCached(HISTORY_KEY, d);
+            renderTaskHistory(histCache.task_history || {});
+            if (lastStats) renderStats(mergedStats(lastStats));
+        } catch (e) { /* keep showing the copy we have */ }
+        finally { historyInFlight = false; }
+    }
+
+    // Today's bar and the live end of the health line come from the tick;
+    // everything behind them comes from the cached history.
+    let lastStats = null;
+
+    function mergedStats(s) {
+        const days = (histCache.hours_by_day || []).filter(d => d.date !== todayISO());
+        if (s.total_hours_today != null) days.push({ date: todayISO(), hours: s.total_hours_today });
+        days.sort((a, b) => a.date.localeCompare(b.date));
+        return Object.assign({}, s, {
+            hours_by_day: days,
+            frame_health_history: healthSeries,
+        });
+    }
+
+    let lastRev = null;
+
+    // `source` is 'net', 'peer' (another tab's fetch) or 'cache' (this tab's
+    // last good copy, replayed from localStorage before the first request).
+    function applySummary(d, source) {
         if (!d) return;
         if (d.poll && d.poll.error) {
             setLoopStatus("POLL ERROR", "status-off", d.poll.error);
-        } else if (fromPeer) {
+        } else if (source === 'peer') {
             setLoopStatus("LOOP ACTIVE", "status-on", 'Shared from another tab.');
-        } else {
+        } else if (source !== 'cache') {
             setLoopStatus("LOOP ACTIVE", "status-on", '');
         }
+        // 'cache' deliberately leaves the status alone: the data on screen is
+        // real but old, and the updated stamp already says how old.
+
+        // Checked before the guard below: a tab that was closed over an hour
+        // comes back to an unchanged `rev` but a history that has moved on.
+        if (d.history_v && d.history_v !== histCache.v) fetchHistory();
+
+        // `rev` only moves when the fleet was actually re-polled. Between
+        // those — most ticks, once several devices are watching, and every
+        // tick at night — there is nothing new to draw, and redrawing fifty
+        // rig tiles plus four charts for identical data is the bulk of what
+        // this page costs a laptop.
+        if (d.rev && d.rev === lastRev) return;
+        if (d.rev) lastRev = d.rev;
 
         if (Array.isArray(d.logs)) { lastLogs = d.logs; renderTerminal(); }
         if (d.devices) { renderRigs(d.devices); handleAlerts(d.devices.alerts); }
-        if (d.stats)   { renderStats(d.stats); fetchRangeStats(); }
-        if (d.task_history) renderTaskHistory(d.task_history);
+        if (d.stats) {
+            lastStats = d.stats;
+            const pt = d.stats.health_point;
+            if (pt && (!healthSeries.length || healthSeries[healthSeries.length - 1].t !== pt.t)) {
+                healthSeries.push(pt);
+                if (healthSeries.length > 360) healthSeries = healthSeries.slice(-360);
+            }
+            renderStats(mergedStats(d.stats));
+            fetchRangeStats();
+        }
+        if (source === 'net') saveCached(VIEW_KEY, d);
+    }
+
+    // Paint the last good copy from disk before touching the network. A reload
+    // shows the dashboard immediately instead of an empty shell, and costs
+    // nothing to do.
+    function hydrateFromCache() {
+        histCache = loadCached(HISTORY_KEY, histCache) || histCache;
+        healthSeries = (histCache.frame_health_history || []).slice();
+        if (histCache.task_history) renderTaskHistory(histCache.task_history);
+        // Restored before the view is replayed, so the render below finds the
+        // range already satisfied and does not fire a request for numbers we
+        // are holding.
+        const range = loadCached(RANGE_KEY, null);
+        if (range && range.data) rangeCache = range;
+        const view = loadCached(VIEW_KEY, null);
+        if (view) applySummary(view, 'cache');
+        if (rangeCache.data) renderRangeStats(rangeCache.data);
+        // Nothing cached to compare a version against — and the stamp on the
+        // first tick can still be zero, if the sweep that fills the history
+        // ran after the view was assembled. Ask once.
+        if (!histCache.v) fetchHistory();
     }
 
     // `force`      — bypass this tab's visibility/lease gates (local)
@@ -3251,7 +3384,7 @@
             if (!res.ok) throw new Error('summary ' + res.status);
             const d = await res.json();
 
-            applySummary(d, false);
+            applySummary(d, 'net');
             if (pollChannel) {
                 try { pollChannel.postMessage({ from: TAB_ID, summary: d }); }
                 catch (e) { /* payload too large for this browser; harmless */ }

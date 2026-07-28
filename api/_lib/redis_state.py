@@ -89,6 +89,32 @@ def pipeline(commands, timeout: float = 10.0):
     return out
 
 
+# ── In-process cache ──────────────────────────────────────────────────────
+# A warm container serves many requests, and under Fluid compute it serves
+# several at once. Anything on the hot read path is memoised here for a few
+# seconds, so a burst of tabs landing together costs ONE Upstash command
+# between them rather than one each. Purely an optimisation: every entry has
+# a short TTL and losing the whole cache (a cold container) is correct, just
+# slower.
+_memo: dict = {}
+
+
+def memo_get(key, ttl):
+    hit = _memo.get(key)
+    if hit is not None and (time.time() - hit[0]) < ttl:
+        return hit[1]
+    return None
+
+
+def memo_set(key, value):
+    _memo[key] = (time.time(), value)
+    return value
+
+
+def memo_drop(key):
+    _memo.pop(key, None)
+
+
 # ── JSON helpers ──────────────────────────────────────────────────────────
 def jget(key, default=None):
     raw = cmd("GET", P + key)
@@ -139,6 +165,52 @@ def hset_many_json(key, mapping: dict):
     return cmd(*args)
 
 
+# ── Consolidated state ────────────────────────────────────────────────────
+# poll:last, prev_status, service_memory, last_online, active_alerts,
+# observed, locations and one SET-NX per live alert used to be a key each:
+# fifteen-odd billable commands per cycle for a few kilobytes that are always
+# read together and always written together. They are one blob now.
+#
+# The same blob carries the assembled dashboard payload under "view", which is
+# the larger saving. Reassembling that answer per request cost around sixty
+# commands — most of them one HGETALL per rig for the task history — and every
+# open tab paid it on every tick even when the fleet had not been re-polled.
+# Now a tick that finds the poll gated is a single GET, often served from the
+# memo above without touching Upstash at all.
+STATE_KEY = "state"
+STATE_MEMO_TTL = 3.0
+
+# The cold half: task history, past-day totals and the frame-health seed.
+# It is an order of magnitude larger than the view and changes hourly, so it
+# lives in its own key and the client fetches it only when its version moves.
+HISTORY_KEY = "history"
+HISTORY_MEMO_TTL = 20.0
+
+
+def state_load(memo_ttl: float = STATE_MEMO_TTL) -> dict:
+    hit = memo_get(STATE_KEY, memo_ttl)
+    if hit is not None:
+        return hit
+    return memo_set(STATE_KEY, jget(STATE_KEY, {}) or {})
+
+
+def state_save(state: dict):
+    memo_set(STATE_KEY, state)
+    jset(STATE_KEY, state)
+
+
+def history_load(memo_ttl: float = HISTORY_MEMO_TTL) -> dict:
+    hit = memo_get(HISTORY_KEY, memo_ttl)
+    if hit is not None:
+        return hit
+    return memo_set(HISTORY_KEY, jget(HISTORY_KEY, {}) or {})
+
+
+def history_save(history: dict):
+    memo_set(HISTORY_KEY, history)
+    jset(HISTORY_KEY, history)
+
+
 # ── Distributed lock ──────────────────────────────────────────────────────
 # Several browser tabs poll at once. Without this they would each run the
 # transition detection against the same fleet and double-count the result.
@@ -154,13 +226,10 @@ def release_lock(name: str):
         pass
 
 
-# ── Alert debounce ────────────────────────────────────────────────────────
-# The old code kept a dict of last-fired timestamps. A Redis key with a TTL
-# does the same job atomically: if SET NX succeeds the alert had expired, so
-# it is allowed to fire again.
-def should_alert(hostname: str, kind: str, window: int) -> bool:
-    key = f"{P}alert:{hostname}:{kind}"
-    return cmd("SET", key, "1", "NX", "EX", int(window)) == "OK"
+# The alert debounce used to be a SET NX EX per live alert per cycle — a
+# dozen commands every poll to answer "has it been fifteen minutes yet". It is
+# a dict of expiry timestamps inside the state blob now (see logic.poll), which
+# costs nothing: that blob is already being read and written.
 
 
 # ── Terminal log buffer ───────────────────────────────────────────────────
@@ -222,20 +291,36 @@ def health_read(limit: int = 360):
 # ── Dashboard sessions (replaces auth.py's in-memory session dict) ────────
 SESSION_TTL = 60 * 60 * 12
 
+# Every authenticated request validates its token, so this was a guaranteed
+# Redis command per request no matter what else got cached. Memoised for half
+# a minute instead. The cost of that window is a token staying usable on an
+# already-warm container for up to 30s after a logout elsewhere; the session
+# itself is 12 hours, so the exposure is negligible either way.
+SESSION_MEMO_TTL = 30.0
+_SESS = "sess:"
+
 
 def session_create(token: str, email: str):
-    cmd("SET", f"{P}sess:{token}", email, "EX", SESSION_TTL)
+    cmd("SET", f"{P}{_SESS}{token}", email, "EX", SESSION_TTL)
+    memo_set(_SESS + token, email)
 
 
 def session_email(token: str | None) -> str | None:
     if not token:
         return None
-    return cmd("GET", f"{P}sess:{token}")
+    hit = memo_get(_SESS + token, SESSION_MEMO_TTL)
+    if hit is not None:
+        return hit
+    email = cmd("GET", f"{P}{_SESS}{token}")
+    if email:
+        memo_set(_SESS + token, email)
+    return email
 
 
 def session_destroy(token: str | None):
     if token:
-        cmd("DEL", f"{P}sess:{token}")
+        memo_drop(_SESS + token)
+        cmd("DEL", f"{P}{_SESS}{token}")
 
 
 # ── OTP codes (also previously in-memory) ─────────────────────────────────

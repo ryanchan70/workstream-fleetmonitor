@@ -233,6 +233,55 @@ def task_label(rec: dict) -> str:
     return "Untitled task"
 
 
+# ── Completed-task deduplication ──────────────────────────────────────────
+# A completed recording reaches us by two routes that describe the same real
+# session:
+#   poll()     records it the moment a rig stops, with the duration its
+#              counter had reached and a start time inferred from that
+#   backfill() records the fleet API's own session once it appears
+# Neither key can be derived from the other, so they are matched on the
+# interval they occupy instead.
+TASK_HISTORY_MAX = 20             # per rig; the UI lists ten
+
+
+def same_session(a: dict, b: dict) -> bool:
+    """True if two task records describe one recording on one rig."""
+    sa, da = float(a.get("start_time") or 0), float(a.get("duration_s") or 0)
+    sb, db = float(b.get("start_time") or 0), float(b.get("duration_s") or 0)
+    if not sa or not sb:
+        return False
+    shorter = min(da, db)
+    if shorter <= 0:
+        # No duration to compare: fall back to starts within two minutes.
+        return abs(sa - sb) <= 120
+    overlap = min(sa + da, sb + db) - max(sa, sb)
+    return overlap > shorter * 0.5
+
+
+def dedupe_tasks(entries):
+    """Collapse records that describe the same recording.
+
+    A rig cannot record two sessions at once, so any two records on one host
+    that overlap in time are the same session seen twice. That covers the
+    live/backfill pair above and also the occasional duplicate the fleet API
+    itself returns (a session that was split or re-uploaded appears as both a
+    long record and a shorter one nested inside it).
+
+    Ordering decides which copy survives: API records before live ones — their
+    duration is authoritative, where the live one is whatever the counter read
+    at the moment we noticed the stop — then longest first, so a fragment can
+    never displace the full session.
+    """
+    ordered = sorted(entries, key=lambda e: (e.get("src") == "live",
+                                             -float(e.get("duration_s") or 0)))
+    kept = []
+    for e in ordered:
+        if not any(same_session(e, k) for k in kept):
+            kept.append(e)
+    kept.sort(key=lambda e: e.get("start_time") or 0, reverse=True)
+    return kept[:TASK_HISTORY_MAX]
+
+
 # ── Device metric extraction ──────────────────────────────────────────────
 def _pick_number(d: dict, keys):
     for k in keys:

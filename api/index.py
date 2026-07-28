@@ -111,21 +111,26 @@ class handler(BaseHTTPRequestHandler):
         try:
             if route == "summary":
                 return self._json(200, self._summary(qs))
+            # The slow-moving half of the dashboard: task history, past-day
+            # totals and the frame-health seed. Together they are ten times the
+            # size of a live tick and change hourly, so they are fetched only
+            # when the version stamp in /summary moves rather than riding along
+            # on every poll.
+            if route == "history":
+                return self._json(200, self._history())
             if route == "devices":
-                return self._json(200, self._devices())
+                return self._json(200, self._view().get("devices", {}))
             if route == "rankings":
-                lb = R.jget("leaderboard", {}) or {}
-                return self._json(200, {
-                    "pi": lb.get("pi", []), "operator": lb.get("operator", []),
-                    "active": True, "source": lb.get("source", "api")})
+                return self._json(200, self._view().get(
+                    "rankings", {"pi": [], "operator": [], "active": True}))
             if route == "stats":
                 return self._json(200, self._stats())
             if route == "stats_range":
                 return self._json(200, self._stats_range(qs))
             if route == "task_history":
-                return self._json(200, self._task_history())
+                return self._json(200, R.history_load().get("tasks") or {})
             if route == "logs":
-                return self._json(200, self._logs())
+                return self._json(200, self._view().get("logs", []))
             if route == "changelog":
                 return self._json(200, {"markdown": self._changelog()})
             # Submissions are write-only from the page; this is how they get
@@ -135,7 +140,7 @@ class handler(BaseHTTPRequestHandler):
             if route == "locations":
                 return self._json(200, R.hgetall_json("locations"))
             if route == "poll":
-                return self._json(200, logic.poll(force="force" in qs))
+                return self._json(200, logic.poll(force="force" in qs)[0])
             if route == "backfill":
                 force = "force" in qs
                 return self._json(200, logic.backfill(force=force))
@@ -203,6 +208,17 @@ class handler(BaseHTTPRequestHandler):
                 if not host or not loc:
                     return self._json(400, {"ok": False, "error": "missing hostname/location"})
                 R.cmd("HSET", R.P + "locations", host, json.dumps(loc))
+                # The poll reads locations from its own state now and refreshes
+                # them from this hash only every few minutes, so patch the copy
+                # it will use. The hash above stays the durable record: if this
+                # patch loses a race with a concurrent poll, the next refresh
+                # picks it up anyway.
+                try:
+                    st = logic.load_state()
+                    st.setdefault("poll", {}).setdefault("locations", {})[host] = loc
+                    R.state_save(st)
+                except Exception:
+                    pass
                 return self._json(200, {"ok": True})
 
         except R.RedisUnavailable as e:
@@ -261,24 +277,22 @@ class handler(BaseHTTPRequestHandler):
         return self._issue(email)
 
     # ── data assembly ────────────────────────────────────────────────────
-    # Statuses written by an older build that is still deployed against the
-    # same Redis. Preview and idling both mean "up, not recording"; surfacing
-    # them raw made rigs drop out of the Idle group for a few seconds every
-    # time the other deployment won the poll.
-    _LEGACY_STATUS = {"preview": "idle", "idling": "idle"}
+    # There is deliberately very little of it left. Both halves of the answer
+    # are assembled when the data changes — the live view by logic.poll(), the
+    # history by logic.backfill() — so reading is a lookup, not a rebuild.
+    @staticmethod
+    def _view():
+        return logic.load_state().get("view") or {}
 
-    def _devices(self):
-        d = R.jget("rigs", {}) or {}
-        rigs = d.get("rigs", [])
-        for r in rigs:
-            s = r.get("status")
-            if s in self._LEGACY_STATUS:
-                r["status"] = self._LEGACY_STATUS[s]
-        return {"rigs": rigs, "alerts": d.get("alerts", []), "active": True,
-                # Milliseconds since the fleet was last actually polled, so
-                # the UI can say how stale it is rather than implying live.
-                "updated": d.get("updated"),
-                "night": logic.is_night()}
+    @staticmethod
+    def _history():
+        h = R.history_load()
+        return {
+            "v": h.get("v") or 0,
+            "task_history": h.get("tasks") or {},
+            "hours_by_day": h.get("days") or [],
+            "frame_health_history": h.get("health") or [],
+        }
 
     def _changelog(self):
         """changelog.md, served to /changelog.html.
@@ -298,45 +312,33 @@ class handler(BaseHTTPRequestHandler):
             return "# changelog\n\nNo changelog.md found in the deployment."
 
     def _stats(self):
+        """Live counters plus the history arrays, for callers that want both.
+
+        The dashboard no longer uses this — /summary carries the counters and
+        /history the arrays, separately, because one changes every poll and the
+        other once an hour.
+        """
+        stats = dict(self._view().get("stats") or {})
+        hist = self._history()
+        days = list(hist["hours_by_day"])
         today = C.get_date_str()
-        lb = R.jget("leaderboard", {}) or {}
-        by_pi = lb.get("by_pi", {}) or {}
-        total_s = sum(v for k, v in by_pi.items() if not C.is_unnamed_pi(k))
-
-        days = {d: float(v) for d, v in (R.hgetall_json("daily_hours") or {}).items()
-                if not C.is_weekend(d)}
-        days[today] = total_s
-        hours_by_day = [{"date": d, "hours": round(s / 3600, 3)}
-                        for d, s in sorted(days.items())]
-
-        rigs = (R.jget("rigs", {}) or {}).get("rigs", [])
-        live = [r["frame_health_pct"] for r in rigs
-                if r.get("frame_health_pct") is not None and r.get("online")]
-        history = R.health_read(360)
-        if live:
-            avg_fh, min_fh = round(sum(live) / len(live), 2), round(min(live), 2)
-        elif history:
-            avg_fh, min_fh = history[-1]["avg"], history[-1]["min"]
-        else:
-            avg_fh = min_fh = None
-
-        captured = sum(r.get("frames_captured") or 0 for r in rigs)
-        dropped = sum(r.get("frames_dropped") or 0 for r in rigs)
-
-        return {
-            "total_hours_today": round(total_s / 3600, 3),
-            "avg_frame_health_pct": avg_fh,
-            "min_frame_health_pct": min_fh,
-            "frames_captured_total": captured or None,
-            "frames_dropped_total": dropped or None,
-            "active_recording_rigs": sum(1 for r in rigs if r.get("status") == "recording"),
-            "total_rigs": len(rigs),
-            "hours_by_day": hours_by_day,
-            "frame_health_history": history,
-            "last_updated_ms": int(time.time() * 1000),
-        }
+        if stats.get("total_hours_today") is not None:
+            days = [d for d in days if d.get("date") != today]
+            days.append({"date": today, "hours": stats["total_hours_today"]})
+            days.sort(key=lambda d: d["date"])
+        stats["hours_by_day"] = days
+        stats["frame_health_history"] = hist["frame_health_history"]
+        return stats
 
     def _stats_range(self, qs):
+        """Totals for a set of days.
+
+        Past days come from the per-day split the backfill precomputes, today
+        from the running totals in the poll state. This used to walk every
+        session hash in the database on every call — a KEYS plus one HGETALL
+        per rig, fired again after every poll tick because the dashboard
+        refreshed the range alongside the live view.
+        """
         raw = (qs.get("days") or [""])[0]
         days = sorted({d.strip() for d in raw.split(",")
                        if d.strip() and not C.is_weekend(d.strip())})
@@ -346,37 +348,22 @@ class handler(BaseHTTPRequestHandler):
 
         by_pi, by_op = {}, {}
 
+        def _add(target, src):
+            for k, v in (src or {}).items():
+                target[k] = target.get(k, 0.0) + float(v)
+
         if today in days:
-            lb = R.jget("leaderboard", {}) or {}
-            for k, v in (lb.get("by_pi") or {}).items():
-                by_pi[k] = by_pi.get(k, 0.0) + float(v)
-            for k, v in (lb.get("by_op") or {}).items():
-                by_op[k] = by_op.get(k, 0.0) + float(v)
+            p = logic.load_state().get("poll") or {}
+            _add(by_pi, p.get("by_pi"))
+            _add(by_op, p.get("by_op"))
 
         past = [d for d in days if d != today]
         if past:
-            # Hostnames are all rpi5-xxxx-xxxx, which is_unnamed_pi() rejects,
-            # so falling back to the hostname would drop every past session.
-            # Sessions written before the label was stored are resolved against
-            # the live rig list instead.
-            rig_labels = {r.get("hostname"): r.get("label")
-                          for r in (R.jget("rigs", {}) or {}).get("rigs", [])
-                          if r.get("hostname") and r.get("label")}
-            hosts = R.cmd("KEYS", R.P + "sessions:*") or []
-            for key in hosts:
-                host = str(key).split("sessions:", 1)[-1]
-                for sess in R.hgetall_json("sessions:" + host).values():
-                    if not isinstance(sess, dict) or sess.get("date") not in past:
-                        continue
-                    dur = float(sess.get("duration_s") or 0)
-                    if dur <= 0:
-                        continue
-                    label = sess.get("label") or rig_labels.get(host) or host
-                    if C.is_unnamed_pi(label):
-                        continue
-                    by_pi[label] = by_pi.get(label, 0.0) + dur
-                    by_op[sess.get("operator") or "Unknown"] = \
-                        by_op.get(sess.get("operator") or "Unknown", 0.0) + dur
+            breakdown = R.history_load().get("breakdown") or {}
+            for d in past:
+                day = breakdown.get(d) or {}
+                _add(by_pi, day.get("pi"))
+                _add(by_op, day.get("op"))
 
         return {
             "days": days,
@@ -385,110 +372,38 @@ class handler(BaseHTTPRequestHandler):
             "hours_by_operator": C.ranked(by_op),
         }
 
-    # Completed tasks reach Redis by two routes that describe the same real
-    # recording:
-    #   poll()     writes "live|<host>|<start>|<dur>" the moment a rig stops
-    #   backfill() writes the fleet API's own session id once it shows up
-    # Both land in tasks:<host>, so every session was listed twice — once the
-    # backfill caught up. Neither key can be derived from the other (the live
-    # start time is estimated from the running duration), so they are matched
-    # on the interval they occupy instead.
-    _LIVE_PREFIX = "live|"
-
-    @staticmethod
-    def _same_session(a, b):
-        """True if two task records describe one recording on one rig."""
-        sa, da = float(a.get("start_time") or 0), float(a.get("duration_s") or 0)
-        sb, db = float(b.get("start_time") or 0), float(b.get("duration_s") or 0)
-        if not sa or not sb:
-            return False
-        shorter = min(da, db)
-        if shorter <= 0:
-            # No duration to compare: fall back to starts within two minutes.
-            return abs(sa - sb) <= 120
-        overlap = min(sa + da, sb + db) - max(sa, sb)
-        return overlap > shorter * 0.5
-
-    def _dedupe_tasks(self, pairs):
-        """Collapse records that describe the same recording.
-
-        A rig cannot record two sessions at once, so any two records on one
-        host that overlap in time are the same session seen twice. That covers
-        the live/backfill pair above and also the occasional duplicate the
-        fleet API itself returns (a session that was split or re-uploaded
-        appears as both a long record and a shorter one inside it).
-
-        Ordering decides which copy survives: API records before live ones —
-        their duration is authoritative, where the live one is whatever the
-        counter read at the moment we noticed the stop — then longest first,
-        so a fragment never displaces the full session.
-        """
-        ordered = sorted(
-            pairs,
-            key=lambda p: (p[0].startswith(self._LIVE_PREFIX),
-                           -float(p[1].get("duration_s") or 0)),
-        )
-        kept = []
-        for _sid, e in ordered:
-            if not any(self._same_session(e, k) for k in kept):
-                kept.append(e)
-        return kept
-
-    # RESOLVED and stop-CRITICAL lines are no longer written, but the log is a
-    # capped ring buffer that still holds hours of them. Filtering on read
-    # clears the backlog immediately instead of waiting for it to scroll out.
-    def _logs(self, limit=500):
-        out = []
-        for line in (R.log_read(limit) or []):
-            s = str(line)
-            if " RESOLVED " in s:
-                continue
-            if " CRITICAL " in s and "stopped recording" in s:
-                continue
-            out.append(line)
-        return out
-
-    def _task_history(self):
-        out = {}
-        for key in (R.cmd("KEYS", R.P + "tasks:*") or []):
-            host = str(key).split("tasks:", 1)[-1]
-            pairs = [(str(k), v) for k, v in R.hgetall_json("tasks:" + host).items()
-                     if isinstance(v, dict)]
-            items = self._dedupe_tasks(pairs)
-            if items:
-                items.sort(key=lambda t: t.get("start_time") or 0, reverse=True)
-                out[host] = items[:50]
-        return out
-
     def _summary(self, qs):
-        """Everything the dashboard needs, in ONE invocation.
+        """Everything a live tick needs, in ONE invocation and ONE Redis read.
 
         The old UI hit five endpoints every 2 seconds. On serverless that is
-        five billable invocations per tick per open tab, so it is consolidated
-        here and the client polls this alone.
+        five billable invocations per tick per open tab, so it was consolidated
+        into this one — but consolidating the requests did nothing about the
+        work behind them: each call still rebuilt the answer from a dozen keys
+        and a per-rig fan-out, whether or not the fleet had been re-polled
+        since the last one. Now the answer is assembled once per poll and this
+        reads it, so a tick costs a single GET (often none, off the in-process
+        memo) instead of roughly sixty commands.
+
+        The heavy, slow-moving half is not here at all: the client fetches
+        /history when the `history_v` stamp below changes, which is hourly.
         """
+        state = logic.load_state()
         result = {}
         if "nopoll" not in qs:
             try:
                 # ?force=1 is the manual refresh button: one invocation that
                 # both forces the sweep and returns the fresh payload, rather
                 # than a separate /poll call followed by a /summary.
-                result["poll"] = logic.poll(force="force" in qs)
+                result["poll"], state = logic.poll(force="force" in qs, state=state)
             except Exception as e:
                 result["poll"] = {"error": f"{type(e).__name__}: {e}"}
             try:
                 if logic.backfill_due():
                     result["backfill"] = logic.backfill()
+                    # A sweep appends its own log line to the view.
+                    state = logic.load_state()
             except Exception as e:
                 result["backfill"] = {"error": f"{type(e).__name__}: {e}"}
 
-        lb = R.jget("leaderboard", {}) or {}
-        result.update({
-            "devices": self._devices(),
-            "rankings": {"pi": lb.get("pi", []), "operator": lb.get("operator", []),
-                         "active": True, "source": lb.get("source", "api")},
-            "stats": self._stats(),
-            "task_history": self._task_history(),
-            "logs": self._logs(300),
-        })
+        result.update(state.get("view") or {})
         return result
