@@ -101,20 +101,33 @@ def _log(*lines):
         pass
 
 
-def _view_log(*lines, history_v=None):
-    """Same, but also into the view, so a backfill's line and the history
-    version it just produced both land without waiting for the next poll."""
+def _view_log(*lines, history_v=None, last_at=None):
+    """Same, but also into the view, so a backfill's line, the history version
+    it produced and its completion stamp all land in the one write."""
     stamped = [_stamp(l) for l in lines]
     try:
-        R.log_push(stamped)
         st = load_state(fresh=True)
         view = st.get("view")
         if isinstance(view, dict):
             view["logs"] = (list(view.get("logs") or []) + stamped)[-LOG_VIEW_MAX:]
             if history_v:
                 view["history_v"] = history_v
+        p = st.setdefault("poll", {})
         if history_v:
-            st.setdefault("poll", {})["history_v"] = history_v
+            p["history_v"] = history_v
+        if last_at:
+            p["backfill_last"] = last_at
+        R.state_save(st)
+        R.log_push(stamped)
+    except R.RedisUnavailable:
+        pass
+
+
+def _stamp_backfill(try_at):
+    """Record that a sweep was attempted, so a failing one backs off."""
+    try:
+        st = load_state(fresh=True)
+        st.setdefault("poll", {})["backfill_try"] = try_at
         R.state_save(st)
     except R.RedisUnavailable:
         pass
@@ -216,6 +229,8 @@ def _migrate_state(st: dict) -> dict:
         "locations_at": time.time(),
         "debounce": {},
         "health_at": 0.0,
+        "backfill_last": float(R.jget("backfill:last", 0) or 0),
+        "backfill_try": float(R.jget("backfill:try", 0) or 0),
     }
     st.setdefault("view", {})
     return st
@@ -755,17 +770,25 @@ def _history_bootstrap(history: dict) -> bool:
 BACKFILL_RETRY_SEC = 300.0
 
 
-def backfill_due() -> bool:
-    # An empty history blob is due now, whatever the hourly clock says: that
-    # stamp is shared with whatever ran before, so a fresh deploy or a lost
-    # blob would otherwise show no task history and no day chart until the top
-    # of the next hour. Gated on the last ATTEMPT rather than the last success,
-    # so a sweep that keeps failing retries every few minutes instead of on
-    # every request.
+def backfill_due(state=None) -> bool:
+    """Is an hourly sweep due? Answered from the state blob, at no cost.
+
+    This runs on every request that is allowed to poll, so reading a timestamp
+    key here was one billable command per tick on the otherwise-free path —
+    the single largest remaining cost once the poll itself was gated.
+
+    An empty history is due now whatever the hourly clock says: the stamp is
+    shared with whatever ran before, so a fresh deploy or a lost blob would
+    otherwise show no task history and no day chart until the top of the next
+    hour. That case is gated on the last ATTEMPT rather than the last success,
+    so a sweep that keeps failing retries every few minutes instead of on
+    every request.
+    """
+    p = ((state if state is not None else load_state()).get("poll") or {})
     now = time.time()
-    if not R.history_load().get("v"):
-        return (now - float(R.jget("backfill:try", 0) or 0)) >= BACKFILL_RETRY_SEC
-    return (now - float(R.jget("backfill:last", 0) or 0)) >= C.BACKFILL_INTERVAL_SEC
+    if not p.get("history_v"):
+        return (now - float(p.get("backfill_try") or 0)) >= BACKFILL_RETRY_SEC
+    return (now - float(p.get("backfill_last") or 0)) >= C.BACKFILL_INTERVAL_SEC
 
 
 def backfill(force: bool = False) -> dict:
@@ -781,7 +804,7 @@ def backfill(force: bool = False) -> dict:
         return {"skipped": "locked"}
 
     try:
-        R.jset("backfill:try", time.time())
+        _stamp_backfill(try_at=time.time())
         devices = fleet.fleet_status()
         if not devices:
             return {"skipped": "no devices"}
@@ -897,7 +920,6 @@ def backfill(force: bool = False) -> dict:
         # hour's worth of "done".
         if not fetched:
             return {"skipped": "no sessions fetched"}
-        R.jset("backfill:last", time.time())
 
         history = R.history_load(0)
         _history_bootstrap(history)
@@ -910,7 +932,7 @@ def backfill(force: bool = False) -> dict:
         R.history_save(history)
 
         _view_log(f"INFO   Backfill — {len(fetched)} device(s), {len(by_day)} past day(s).",
-                  history_v=history.get("v"))
+                  history_v=history.get("v"), last_at=time.time())
         return {"devices": len(fetched), "rigs": len(fetched),
                 "sessions": session_count, "days": len(by_day)}
     finally:

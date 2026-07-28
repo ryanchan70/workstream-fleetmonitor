@@ -442,7 +442,7 @@ class handler(BaseHTTPRequestHandler):
             except Exception as e:
                 result["poll"] = {"error": f"{type(e).__name__}: {e}"}
             try:
-                if logic.backfill_due():
+                if logic.backfill_due(state):
                     result["backfill"] = logic.backfill()
                     # A sweep appends its own log line to the view.
                     state = logic.load_state()
