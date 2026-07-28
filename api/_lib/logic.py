@@ -101,16 +101,21 @@ def _log(*lines):
         pass
 
 
-def _view_log(*lines):
-    """Same, but also into the view so it shows up without waiting for a poll."""
+def _view_log(*lines, history_v=None):
+    """Same, but also into the view, so a backfill's line and the history
+    version it just produced both land without waiting for the next poll."""
     stamped = [_stamp(l) for l in lines]
     try:
         R.log_push(stamped)
-        st = R.state_load()
+        st = load_state(fresh=True)
         view = st.get("view")
         if isinstance(view, dict):
             view["logs"] = (list(view.get("logs") or []) + stamped)[-LOG_VIEW_MAX:]
-            R.state_save(st)
+            if history_v:
+                view["history_v"] = history_v
+        if history_v:
+            st.setdefault("poll", {})["history_v"] = history_v
+        R.state_save(st)
     except R.RedisUnavailable:
         pass
 
@@ -171,8 +176,21 @@ def _gather(fn, keys, budget):
 
 
 # ── State ─────────────────────────────────────────────────────────────────
-def load_state() -> dict:
-    st = R.state_load()
+def load_state(fresh: bool = False) -> dict:
+    """The state blob, usually from the container's own memo.
+
+    How long that memo is allowed to stand follows from how often the data can
+    possibly change: nothing writes the view except a poll, and a poll cannot
+    run more than once per interval, so holding a copy for one interval adds at
+    most one interval of staleness to a dashboard that refreshes on the same
+    cadence. At night, when the fleet is polled hourly, it is capped at a
+    minute rather than an hour — the point is to collapse a burst of ticks from
+    several devices into one read, not to serve genuinely old data.
+
+    Callers that are about to WRITE pass fresh=True.
+    """
+    ttl = 0.0 if fresh else min(poll_min_interval(), 60.0)
+    st = R.state_load(ttl)
     if "poll" not in st:
         st = _migrate_state(st)
     return st
@@ -236,18 +254,35 @@ def poll(force: bool = False, state=None, agent=None):
 
     interval = poll_min_interval()
     age = time.time() - float(p.get("last") or 0)
-    # Gate first, lock second. The gate reads the state the caller already
-    # loaded to serve the view, so a tick that finds the poll recent — the
-    # common case the moment more than one device is watching — costs no
-    # Redis command at all.
+    # Two gates, and the cheap one runs first. This reads the state the caller
+    # already loaded to serve the view, so a tick that finds the poll recent —
+    # the common case the moment more than one device is watching — costs no
+    # Redis command at all. It can be up to one memo-TTL stale, which is why
+    # the authoritative gate below still runs.
     if not force and age < interval:
         return {"skipped": "recent", "age_s": round(age, 1),
                 "interval_s": interval, "night": is_night()}, st
 
-    if not R.acquire_lock("poll", ttl=45):
+    # Cadence and mutual exclusion in one command, and never released: the key
+    # expiring is the next cycle falling due. Capped so that crossing into
+    # daytime does not leave an hour-long night key blocking the fleet.
+    #
+    # Manual refresh has to stand the gate down before taking it, or pressing
+    # the button inside the cadence window would answer "locked" and do
+    # nothing. It still has to take it afterwards, so two people pressing at
+    # once cannot stack two sweeps.
+    if force:
+        R.release_lock("poll")
+    if not R.acquire_lock("poll", ttl=int(min(interval, 300))):
         return {"skipped": "locked"}, st
 
     try:
+        # Whoever wins the gate reads fresh. Reads elsewhere tolerate a stale
+        # memo because nothing changes between polls, but a poll writing back
+        # a copy it took twenty seconds ago would drop another container's
+        # banked time and re-fire alerts it had already reported.
+        st = load_state(fresh=True)
+        p = st.setdefault("poll", {})
         p["last"] = time.time()
 
         devices = fleet.fleet_status()
@@ -438,12 +473,14 @@ def poll(force: bool = False, state=None, agent=None):
         p["prev_status"] = new_status
 
         if finished:
-            _record_finished(finished)
+            p["history_v"] = _record_finished(finished)
             for f in finished:
                 lines.append(f"CHANGE {f['label']}  STOPPED | Op: {f['operator']} | "
                              f"{C.format_time(f['duration_s'])}")
 
-        by_pi, by_op = _rebuild_leaderboard(devices, today, observed)
+        if "today" not in p:
+            p["today"] = _migrate_today(today)
+        by_pi, by_op = _rebuild_leaderboard(devices, today, observed, p["today"])
         p["by_pi"], p["by_op"] = by_pi, by_op
 
         # Rides along in the blob that is being written anyway, so claiming the
@@ -464,8 +501,12 @@ def poll(force: bool = False, state=None, agent=None):
 
         return {"rigs": len(rigs), "alerts": len(alerts),
                 "finished": len(finished)}, st
-    finally:
+    except Exception:
+        # The gate key is the cadence, so it is deliberately NOT released on
+        # the happy path. It is released here: a sweep that died should be
+        # retried on the next tick, not waited out.
         R.release_lock("poll")
+        raise
 
 
 def _build_view(st, rigs, alerts, by_pi, by_op, health_point, new_lines):
@@ -480,9 +521,11 @@ def _build_view(st, rigs, alerts, by_pi, by_op, health_point, new_lines):
     prev = st.get("view") or {}
 
     logs = list(prev.get("logs") or [])
-    if not logs:
-        # Cold start: seed from the durable ring buffer, minus the lines that
-        # are no longer written but are still sitting in it.
+    # Seeded from the durable ring buffer once, minus the lines that are no
+    # longer written but are still sitting in it. Flagged rather than inferred
+    # from an empty list, so a genuinely empty log is not re-read every cycle.
+    if not st.get("poll", {}).get("logs_seeded"):
+        st.setdefault("poll", {})["logs_seeded"] = True
         logs = [l for l in (R.log_read(LOG_VIEW_MAX) or [])
                 if " RESOLVED " not in str(l)
                 and not (" CRITICAL " in str(l) and "stopped recording" in str(l))]
@@ -529,65 +572,96 @@ def _build_view(st, rigs, alerts, by_pi, by_op, health_point, new_lines):
             "health_point": health_point,
         },
         "logs": logs,
-        "history_v": (R.history_load().get("v") or 0),
+        # Mirrored in the poll state by whoever last rebuilt the history, so
+        # assembling a view never has to open the history key to find out.
+        "history_v": (st.get("poll") or {}).get("history_v") or 0,
     }
 
 
-def _rebuild_leaderboard(devices, today, observed):
+def _migrate_today(today):
+    """Fold the old today_sessions hash into the compact aggregate.
+
+    One HGETALL, once. Skipping it would leave the totals rebuilding from a
+    twelve-rig slice per cycle, so today's hours would visibly drop and climb
+    back over the following minute — which is exactly the collapse the max()
+    merge above exists to prevent.
+    """
+    out = {}
+    try:
+        for h, groups in (R.hgetall_json("today_sessions") or {}).items():
+            if isinstance(groups, list):
+                out[h] = _aggregate_sessions(groups, today)
+    except R.RedisUnavailable:
+        pass
+    return out
+
+
+def _aggregate_sessions(groups, today):
+    """Today's sessions for one rig, reduced to the two numbers that matter.
+
+    Only the totals are ever read back, so only the totals are kept: storing
+    the session lists themselves meant a hash big enough to need its own read
+    and write every cycle, and it held several hundred records to answer a
+    question about fifty sums.
+    """
+    seen = set()
+    total = 0.0
+    by_op = {}
+    for rec in groups or []:
+        if not C.session_is_today(rec, today):
+            continue
+        sid = rec.get("id") or rec.get("session_uuid") or rec.get("name")
+        if sid in seen:
+            continue
+        seen.add(sid)
+        dur = float(rec.get("duration_s") or 0)
+        if dur <= 0:
+            continue
+        total += dur
+        op = C.clean_str(rec.get("operator"))
+        by_op[op] = by_op.get(op, 0.0) + dur
+    return {"d": today, "s": round(total, 2), "op": by_op}
+
+
+def _rebuild_leaderboard(devices, today, observed, cache):
     """Today's per-Pi / per-operator totals from the API session lists, topped
-    up by our own observed time where the API has not caught up yet."""
+    up by our own observed time where the API has not caught up yet.
+
+    `cache` is the per-rig aggregate carried in the state blob; it is updated
+    in place and the caller writes it back with everything else.
+    """
     by_pi, by_op = {}, {}
     status = {d.get("hostname"): C.get_status(d) for d in devices if d.get("hostname")}
     labels = {d.get("hostname"): C.device_label(d) for d in devices if d.get("hostname")}
 
-    # Cached sessions are re-filtered against today, so the fallbacks below
-    # cannot drag yesterday's work into today's totals after a rollover.
-    cached = {h: [g for g in (v or []) if C.session_is_today(g, today)]
-              for h, v in (R.hgetall_json("today_sessions") or {}).items()
-              if isinstance(v, list)}
-    results = {}
-
-    def _hours(groups):
-        return sum(float(g.get("duration_s") or 0) for g in (groups or []))
+    # Re-filtered against today, so the fallbacks below cannot drag yesterday's
+    # work into today's totals after a rollover.
+    for h in [h for h, v in cache.items() if (v or {}).get("d") != today]:
+        cache.pop(h)
 
     # Only this cycle's slice is fetched. Everything else keeps its cached
-    # sessions via the fallback below, so the numbers stay complete while the
-    # per-poll cost stops scaling with fleet size.
+    # aggregate, so the numbers stay complete while the per-poll cost stops
+    # scaling with fleet size.
     targets = _time_shard([h for h, s in status.items() if s != "offline"],
                           RIG_SHARD_TARGET)
     for h, groups in _gather(fleet.device_sessions, targets,
                              SESSION_FETCH_BUDGET).items():
-        todays = [g for g in (groups or []) if C.session_is_today(g, today)]
+        fresh = _aggregate_sessions(groups, today)
         # A device that answers with nothing is almost always a failed or
         # truncated fetch, not a rig that un-recorded its morning. Taking the
         # larger of the two keeps the total monotonic through the day, which
         # is what it should be: today's recorded hours only ever grow.
         #
         # Without this the total visibly collapsed — 70.4h to 41.7h between
-        # two consecutive polls — because an empty result overwrote the cache
-        # and the "not in results" fallback below could no longer save it.
-        results[h] = todays if _hours(todays) >= _hours(cached.get(h)) else cached[h]
+        # two consecutive polls — because an empty result overwrote the cache.
+        if fresh["s"] >= float((cache.get(h) or {}).get("s") or 0):
+            cache[h] = fresh
 
-    # Devices outside this cycle's slice keep their last known sessions rather
-    # than dropping to zero and collapsing the operator totals.
-    for h in status:
-        if h not in results and h in cached:
-            results[h] = cached[h]
-    if results:
-        R.hset_many_json("today_sessions", results)
-
-    seen = set()
-    for h, groups in results.items():
+    for h, agg in cache.items():
         label = labels.get(h, h)
-        for rec in groups:
-            sid = rec.get("id") or rec.get("session_uuid") or f"{label}|{rec.get('name')}"
-            if sid in seen:
-                continue
-            seen.add(sid)
-            dur = float(rec.get("duration_s") or 0)
-            op = C.clean_str(rec.get("operator"))
-            by_pi[label] = by_pi.get(label, 0.0) + dur
-            by_op[op] = by_op.get(op, 0.0) + dur
+        by_pi[label] = by_pi.get(label, 0.0) + float(agg.get("s") or 0)
+        for op, dur in (agg.get("op") or {}).items():
+            by_op[op] = by_op.get(op, 0.0) + float(dur)
 
     # Fold in self-tracked time using max(), never addition, so a host can
     # never be counted from both its API total and its observed total.
@@ -649,6 +723,7 @@ def _record_finished(finished):
     history = R.history_load()
     _history_touch(history, entries)
     R.history_save(history)
+    return history["v"]
 
 
 def _history_bootstrap(history: dict) -> bool:
@@ -834,7 +909,8 @@ def backfill(force: bool = False) -> dict:
         history["health"] = R.health_read(360)
         R.history_save(history)
 
-        _view_log(f"INFO   Backfill — {len(fetched)} device(s), {len(by_day)} past day(s).")
+        _view_log(f"INFO   Backfill — {len(fetched)} device(s), {len(by_day)} past day(s).",
+                  history_v=history.get("v"))
         return {"devices": len(fetched), "rigs": len(fetched),
                 "sessions": session_count, "days": len(by_day)}
     finally:

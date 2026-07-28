@@ -61,8 +61,17 @@ def _post(path: str, payload, timeout: float = 8.0):
         raise RedisUnavailable(f"Upstash request failed: {e}")
 
 
+# Billable commands issued by this container since it started. Upstash charges
+# per command, not per round trip, so this counts what the invoice counts —
+# a pipeline of five is five. /api/health reports it, which is the only way to
+# see the real per-request cost from outside.
+CMD_COUNT = 0
+
+
 def cmd(*args, timeout: float = 8.0):
     """Runs a single Redis command and returns its result."""
+    global CMD_COUNT
+    CMD_COUNT += 1
     res = _post("", [str(a) for a in args], timeout=timeout)
     if isinstance(res, dict):
         if "error" in res:
@@ -77,8 +86,10 @@ def pipeline(commands, timeout: float = 10.0):
     Serverless latency is dominated by network hops, so batching matters a lot
     more here than it did in the long-running process.
     """
+    global CMD_COUNT
     if not commands:
         return []
+    CMD_COUNT += len(commands)
     res = _post("/pipeline", [[str(a) for a in c] for c in commands], timeout=timeout)
     out = []
     for item in res:
@@ -217,6 +228,11 @@ def history_save(history: dict):
 # ── Distributed lock ──────────────────────────────────────────────────────
 # Several browser tabs poll at once. Without this they would each run the
 # transition detection against the same fleet and double-count the result.
+#
+# The poll's lock is not released: its TTL is set to the poll interval, so the
+# key expiring IS the next cycle falling due. One SET NX EX per cycle does the
+# job three commands used to (read the last-poll time, take the lock, release
+# it), and it is atomic where the read-then-lock pair was not.
 def acquire_lock(name: str, ttl: int = 30) -> bool:
     token = str(time.time())
     return cmd("SET", P + "lock:" + name, token, "NX", "EX", int(ttl)) == "OK"

@@ -98,9 +98,13 @@ def cycle(agent_id, interval):
     from _lib import logic
 
     t0 = time.time()
-    # force=True: this process IS the cadence now, so the server-side gate —
-    # which exists to stop several tabs stacking sweeps — must not also apply.
-    res, _ = logic.poll(force=True, agent=(agent_id, interval))
+    # Deliberately NOT forced. Forcing would stand the shared cadence gate down
+    # and retake it — an extra command every cycle — to no purpose: this sleeps
+    # for longer than that gate holds, so it wins it on merit. The floor is
+    # logic.POLL_MIN_INTERVAL_SEC; asking for less than that just means some
+    # cycles answer "locked", and a cycle that does not poll does not stamp the
+    # heartbeat either, which is the honest signal.
+    res, _ = logic.poll(agent=(agent_id, interval))
     out = f"poll {time.time() - t0:.1f}s {res}"
 
     if logic.backfill_due():

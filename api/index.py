@@ -23,6 +23,16 @@ from _lib import redis_state as R    # noqa: E402
 from _lib import fleet               # noqa: E402
 
 
+# Per-container counters. There is no way to see the real per-request Redis
+# cost from outside — Upstash bills commands but does not attribute them — so
+# the container reports its own running total and /api/health hands it back.
+# Both reset when the container recycles, which is why the instance id is
+# reported alongside: two samples are only comparable within one instance.
+_INSTANCE = secrets.token_hex(4)
+_BOOTED = time.time()
+_REQUESTS = 0
+
+
 def _norm(path: str) -> str:
     """/api/foo and /foo both resolve to 'foo'."""
     p = urlparse(path).path.strip("/")
@@ -81,6 +91,8 @@ class handler(BaseHTTPRequestHandler):
 
     # ── GET ──────────────────────────────────────────────────────────────
     def do_GET(self):
+        global _REQUESTS
+        _REQUESTS += 1
         route = _norm(self.path)
         qs = parse_qs(urlparse(self.path).query)
 
@@ -112,6 +124,12 @@ class handler(BaseHTTPRequestHandler):
                 "today": C.get_date_str(),
                 "now": C.ts(),
                 "night": logic.is_night(),
+                # Sample twice against the same instance id and the difference
+                # is exactly what the requests in between cost.
+                "instance": _INSTANCE,
+                "uptime_s": round(time.time() - _BOOTED, 1),
+                "requests": _REQUESTS,
+                "commands": R.CMD_COUNT,
             })
 
         if route == "auth/status":
