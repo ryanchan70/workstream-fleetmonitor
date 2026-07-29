@@ -20,6 +20,11 @@
 !*.py
 !*.html
 !favicon.ico
+# Static assets served from public/. Without these the allowlist silently
+# drops them and a GitHub-sourced build ships without the PWA/service worker.
+!public/*.js
+!public/*.png
+!public/*.webmanifest
 !*.md
 
 # ── Config / manifests ───────────────────────────────────────────────────

@@ -8,6 +8,7 @@ system is spread across serverless invocations.
 
 import datetime
 import re
+import time
 
 # ── Thresholds ────────────────────────────────────────────────────────────
 FRAME_HEALTH_MIN_PCT = 95.0
@@ -21,17 +22,71 @@ SSD_TEMP_CRIT_C = 70.0
 ALERT_DEBOUNCE_SEC = 900          # 15 minutes
 BACKFILL_INTERVAL_SEC = 3600      # hourly, per the brief
 
+# How long a rig keeps its servicing state after the fleet API stops
+# reporting service_mode. Long enough to ride out the API's intermittent
+# dropouts, short enough that a rig genuinely put back into service shows up
+# as available within a couple of poll cycles.
+SERVICE_STICKY_SEC = 180
+
 _UNNAMED_PI_RE = re.compile(r"^rpi\d*-[0-9a-f]{4}-[0-9a-f]{4}$", re.IGNORECASE)
 _SESSION_NAME_RE = re.compile(r"^(\d{8})_(\d{6})")
 
 
+# ── Time zone ─────────────────────────────────────────────────────────────
+# Every "today", "this weekend" and log timestamp in this system is a claim
+# about the shift floor in California, not about the server.
+#
+# Serverless containers run in UTC, so datetime.now() rolled the date over at
+# 17:00 PDT: from 5pm the whole fleet's totals reset to zero mid-shift, and
+# is_weekend() started reporting Saturday, which silently dropped every
+# Friday-evening hour from the daily chart.
+#
+# America/Los_Angeles rather than a fixed -8: "Pacific" is PDT for two thirds
+# of the year, and pinning UTC-8 would put every summer timestamp an hour out.
+try:
+    from zoneinfo import ZoneInfo
+    PACIFIC = ZoneInfo("America/Los_Angeles")
+except Exception:              # tzdata missing from the runtime image
+    PACIFIC = None
+
+
+def _dst_bounds(year: int):
+    """US DST window: 02:00 on the 2nd Sunday of March -> 1st Sunday of Nov."""
+    mar = datetime.datetime(year, 3, 8)                   # 2nd Sunday is Mar 8-14
+    start = mar + datetime.timedelta(days=(6 - mar.weekday()) % 7)
+    nov = datetime.datetime(year, 11, 1)                  # 1st Sunday is Nov 1-7
+    end = nov + datetime.timedelta(days=(6 - nov.weekday()) % 7)
+    return start.replace(hour=2), end.replace(hour=2)
+
+
+def _pacific_offset(utc_dt: datetime.datetime) -> datetime.timedelta:
+    """Fallback for when zoneinfo has no tz database to read."""
+    approx = utc_dt - datetime.timedelta(hours=8)
+    start, end = _dst_bounds(approx.year)
+    return datetime.timedelta(hours=-7 if start <= approx < end else -8)
+
+
+def pacific_now() -> datetime.datetime:
+    if PACIFIC is not None:
+        return datetime.datetime.now(PACIFIC)
+    utc = datetime.datetime.utcnow()
+    return utc + _pacific_offset(utc)
+
+
+def pacific_from_unix(epoch) -> datetime.datetime:
+    if PACIFIC is not None:
+        return datetime.datetime.fromtimestamp(float(epoch), PACIFIC)
+    utc = datetime.datetime.utcfromtimestamp(float(epoch))
+    return utc + _pacific_offset(utc)
+
+
 # ── Small helpers ─────────────────────────────────────────────────────────
 def ts():
-    return datetime.datetime.now().strftime("%H:%M:%S")
+    return pacific_now().strftime("%H:%M:%S")
 
 
 def get_date_str():
-    return datetime.datetime.now().strftime("%Y-%m-%d")
+    return pacific_now().strftime("%Y-%m-%d")
 
 
 def format_time(seconds: float) -> str:
@@ -61,7 +116,25 @@ def device_label(device: dict) -> str:
     return device.get("display_name") or device.get("hostname", "?")
 
 
+def service_info(device: dict):
+    """The fleet API's own service-mode record, or None.
+
+    `service_mode` carries who flagged it, the issue, free-text detail and a
+    `flagged_at` unix timestamp. It is set on exactly the same devices the
+    API reports as card_state == "servicing", so either field identifies the
+    state; this one is used because it also carries the metadata.
+    """
+    m = device.get("service_mode")
+    return m if isinstance(m, dict) and m else None
+
+
 def get_status(device: dict) -> str:
+    # Servicing outranks everything, including offline: a rig pulled for
+    # repair is frequently offline, and reporting it as merely "offline"
+    # loses the reason it is down. The API agrees — it reports card_state
+    # "servicing" for those devices rather than "offline".
+    if service_info(device) or device.get("card_state") == "servicing":
+        return "servicing"
     if not device.get("online"):
         return "offline"
     cs = device.get("capture_state", "unknown")
@@ -69,7 +142,12 @@ def get_status(device: dict) -> str:
         return "recording"
     if (device.get("upload_queue") or 0) > 0:
         return "uploading"
-    return cs or "idle"
+    # The API's "preview" and "idle" are the same thing to an operator: the
+    # rig is up and not recording. They are reported as one state, "idle",
+    # rather than two that need explaining.
+    if cs in ("preview", "idle", "", None):
+        return "idle"
+    return cs
 
 
 def parse_duration_from_log(duration_str: str) -> float:
@@ -109,8 +187,15 @@ def session_start_unix(rec: dict):
     m = _SESSION_NAME_RE.match(str(rec.get("name", "")))
     if m:
         try:
-            return int(datetime.datetime.strptime(
-                m.group(1) + m.group(2), "%Y%m%d%H%M%S").timestamp())
+            # The Pi names its folders in local wall time. .timestamp() on a
+            # naive datetime reads it in the *server's* zone, which on Vercel
+            # is UTC — putting every name-derived session 7-8 hours out.
+            naive = datetime.datetime.strptime(
+                m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+            if PACIFIC is not None:
+                return int(naive.replace(tzinfo=PACIFIC).timestamp())
+            utc = naive - _pacific_offset(naive)
+            return int(utc.replace(tzinfo=datetime.timezone.utc).timestamp())
         except Exception:
             pass
     return None
@@ -124,7 +209,7 @@ def session_date(rec: dict):
     su = session_start_unix(rec)
     if su:
         try:
-            return datetime.datetime.fromtimestamp(su).strftime("%Y-%m-%d")
+            return pacific_from_unix(su).strftime("%Y-%m-%d")
         except Exception:
             pass
     return None
@@ -135,7 +220,7 @@ def session_is_today(rec: dict, today_str: str) -> bool:
     if not su:
         return False
     try:
-        return datetime.datetime.fromtimestamp(su).strftime("%Y-%m-%d") == today_str
+        return pacific_from_unix(su).strftime("%Y-%m-%d") == today_str
     except Exception:
         return False
 
@@ -146,6 +231,55 @@ def task_label(rec: dict) -> str:
     if t and not _SESSION_NAME_RE.match(t):
         return t[:20]
     return "Untitled task"
+
+
+# ── Completed-task deduplication ──────────────────────────────────────────
+# A completed recording reaches us by two routes that describe the same real
+# session:
+#   poll()     records it the moment a rig stops, with the duration its
+#              counter had reached and a start time inferred from that
+#   backfill() records the fleet API's own session once it appears
+# Neither key can be derived from the other, so they are matched on the
+# interval they occupy instead.
+TASK_HISTORY_MAX = 20             # per rig; the UI lists ten
+
+
+def same_session(a: dict, b: dict) -> bool:
+    """True if two task records describe one recording on one rig."""
+    sa, da = float(a.get("start_time") or 0), float(a.get("duration_s") or 0)
+    sb, db = float(b.get("start_time") or 0), float(b.get("duration_s") or 0)
+    if not sa or not sb:
+        return False
+    shorter = min(da, db)
+    if shorter <= 0:
+        # No duration to compare: fall back to starts within two minutes.
+        return abs(sa - sb) <= 120
+    overlap = min(sa + da, sb + db) - max(sa, sb)
+    return overlap > shorter * 0.5
+
+
+def dedupe_tasks(entries):
+    """Collapse records that describe the same recording.
+
+    A rig cannot record two sessions at once, so any two records on one host
+    that overlap in time are the same session seen twice. That covers the
+    live/backfill pair above and also the occasional duplicate the fleet API
+    itself returns (a session that was split or re-uploaded appears as both a
+    long record and a shorter one nested inside it).
+
+    Ordering decides which copy survives: API records before live ones — their
+    duration is authoritative, where the live one is whatever the counter read
+    at the moment we noticed the stop — then longest first, so a fragment can
+    never displace the full session.
+    """
+    ordered = sorted(entries, key=lambda e: (e.get("src") == "live",
+                                             -float(e.get("duration_s") or 0)))
+    kept = []
+    for e in ordered:
+        if not any(same_session(e, k) for k in kept):
+            kept.append(e)
+    kept.sort(key=lambda e: e.get("start_time") or 0, reverse=True)
+    return kept[:TASK_HISTORY_MAX]
 
 
 # ── Device metric extraction ──────────────────────────────────────────────
@@ -294,15 +428,31 @@ def format_speed(bps):
 
 
 # ── Rig evaluation ────────────────────────────────────────────────────────
-def evaluate_rigs(devices, locations=None, should_alert=None, prev_status=None):
+def evaluate_rigs(devices, locations=None, should_alert=None, prev_status=None,
+                  service_memory=None, now=None):
     """Normalises fleet-status devices into rig cards plus critical alerts.
 
     `should_alert(hostname, kind) -> bool` is injected so the debounce can be
     backed by Redis instead of a process-local dict. When omitted every
     condition reports, which is what the tests want.
+
+    Rigs the API has flagged into service mode report status "servicing" and
+    raise no alerts — they are known-bad and already being worked on, so
+    paging about the fault they were pulled for is pure noise.
+
+    `service_memory` is {hostname: {"ts": epoch, "svc": {...}}} of the last
+    time the API actually reported service mode. The fleet API intermittently
+    drops `service_mode` for a poll or two and the rig briefly reports as
+    preview/idle instead, which made a dozen rigs vanish out of Servicing and
+    back every few seconds. Within SERVICE_STICKY_SEC of the last real report
+    the previous service state is kept, and the rig is marked service_sticky
+    so the caller knows not to refresh the timestamp from its own output —
+    otherwise a rig genuinely returned to duty would stay servicing forever.
     """
     locations = locations or {}
     prev_status = prev_status or {}
+    service_memory = service_memory or {}
+    now = time.time() if now is None else now
     if should_alert is None:
         def should_alert(_h, _k):
             return True
@@ -312,7 +462,21 @@ def evaluate_rigs(devices, locations=None, should_alert=None, prev_status=None):
         hostname = d.get("hostname", "")
         label = device_label(d)
         status = get_status(d)
-        online = status != "offline"
+        svc = service_info(d)
+
+        service_sticky = False
+        if not svc:
+            mem = service_memory.get(hostname)
+            if isinstance(mem, dict) and (now - float(mem.get("ts") or 0)) <= SERVICE_STICKY_SEC:
+                svc = mem.get("svc") or {}
+                status = "servicing"
+                service_sticky = True
+
+        is_servicing = status == "servicing"
+        # Read from the raw field, not from the status: a servicing rig is
+        # very often offline, and treating it as online would surface stale
+        # zeroed metrics as if they were live.
+        online = bool(d.get("online"))
 
         # Offline rigs report stale/zeroed metrics — never read or alert on them.
         health = extract_frame_health(d) if online else None
@@ -326,6 +490,8 @@ def evaluate_rigs(devices, locations=None, should_alert=None, prev_status=None):
         critical = []
 
         def fire(kind, message):
+            if is_servicing:
+                return      # under maintenance: known-bad, must not page
             critical.append(kind)
             alerts.append({"hostname": hostname, "rig": label,
                            "kind": kind, "message": message})
@@ -359,11 +525,16 @@ def evaluate_rigs(devices, locations=None, should_alert=None, prev_status=None):
                 fire("ssd_temp", f"SSD temp critical: {ssd_c:.1f}°C")
 
         # Recording stopped: previous poll saw it recording, this one does not.
-        if prev_status.get(hostname) == "recording" and status in ("idle", "uploading"):
-            if should_alert(hostname, "recording_stopped"):
-                alerts.append({"hostname": hostname, "rig": label,
-                               "kind": "recording_stopped",
-                               "message": "Pi stopped recording"})
+        # Taking a rig out of service stops its recording by definition, so
+        # this transition must not fire either — hence is_servicing here as
+        # well as inside fire().
+        if (not is_servicing
+                and prev_status.get(hostname) == "recording"
+                and status in ("idle", "uploading")
+                and should_alert(hostname, "recording_stopped")):
+            alerts.append({"hostname": hostname, "rig": label,
+                           "kind": "recording_stopped",
+                           "message": "Pi stopped recording"})
 
         rigs.append({
             "hostname": hostname,
@@ -373,6 +544,15 @@ def evaluate_rigs(devices, locations=None, should_alert=None, prev_status=None):
             "operator": clean_str(d.get("operator")),
             "task": clean_str(d.get("task")),
             "location": locations.get(hostname, ""),
+            # Why the rig is out of service, and since when, so the tile can
+            # say "left wrist missing, flagged Jul 16" instead of just a badge.
+            # True when this poll is holding the rig in servicing through a
+            # gap in the API's reporting rather than being told to.
+            "service_sticky": service_sticky,
+            "service_issue": (svc or {}).get("issue") or "",
+            "service_detail": (svc or {}).get("detail") or "",
+            "service_by": (svc or {}).get("by") or "",
+            "service_since": (svc or {}).get("flagged_at") or None,
             "recording_duration_s": dur,
             "duration_label": format_time(dur),
             "frame_health_pct": health,

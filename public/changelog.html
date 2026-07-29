@@ -41,29 +41,107 @@
             background: var(--card-bg);
         }
         .back-link:hover { color: var(--text-color); border-color: #374151; }
+        /* Darker than the page so it reads as an inset note rather than a
+           card competing with the changelog entries below it. */
+        .feedback-note {
+            margin: 14px 0 22px 0;
+            padding: 12px 14px;
+            background: #080c14;
+            border: 1px solid #1b2434;
+            border-radius: 8px;
+            font-size: 0.8rem;
+            color: var(--text-muted);
+        }
+        .fb-title { margin: 0 0 9px 0; }
+        .feedback-note textarea {
+            width: 100%;
+            box-sizing: border-box;
+            resize: vertical;
+            min-height: 58px;
+            font-family: inherit;
+            font-size: 0.8rem;
+            line-height: 1.5;
+            padding: 8px 10px;
+            border-radius: 6px;
+            border: 1px solid #1f2937;
+            background: var(--bg-color);
+            color: var(--text-color);
+        }
+        .feedback-note textarea::placeholder { color: #4b5563; }
+        .feedback-note textarea:focus {
+            outline: none;
+            border-color: var(--accent-blue);
+        }
+        .fb-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-top: 9px;
+        }
+        .feedback-note button {
+            font-family: inherit;
+            font-size: 0.75rem;
+            font-weight: 600;
+            padding: 6px 14px;
+            border-radius: 6px;
+            border: 1px solid #283245;
+            background: transparent;
+            color: var(--text-muted);
+            cursor: pointer;
+        }
+        .feedback-note button:hover:not(:disabled) {
+            border-color: var(--accent-blue);
+            color: #93c5fd;
+        }
+        .feedback-note button:disabled { opacity: 0.45; cursor: default; }
+        .fb-status { font-size: 0.75rem; }
+        .fb-status.ok { color: var(--accent-green); }
+        .fb-status.err { color: #f87171; }
+        .sr-only {
+            position: absolute; width: 1px; height: 1px;
+            padding: 0; margin: -1px; overflow: hidden;
+            clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+        }
         .back-link:focus-visible { outline: 2px solid var(--accent-blue); outline-offset: 2px; }
 
-        .doc { margin-top: 22px; }
+        .doc { margin-top: 26px; }
+        /* A real type scale. The previous sizes (1.3 / 1.0 / 0.86rem against
+           0.9rem body text) were close enough that every level read as the
+           same size, so the document had no visible hierarchy. */
         .doc h1 {
-            font-size: 1.3rem;
-            margin: 0 0 4px;
+            font-size: 2rem;
+            line-height: 1.2;
+            margin: 0 0 6px;
             text-transform: capitalize;
+            letter-spacing: -0.02em;
         }
         .doc h2 {
-            font-size: 1rem;
-            margin: 30px 0 10px;
-            padding-bottom: 6px;
+            font-size: 1.4rem;
+            line-height: 1.25;
+            margin: 38px 0 12px;
+            padding-bottom: 7px;
             border-bottom: 1px solid var(--border);
             color: var(--accent-blue);
             font-family: 'Geist Mono', monospace;
+            letter-spacing: -0.01em;
         }
         .doc h3 {
-            font-size: 0.86rem;
-            margin: 18px 0 8px;
+            font-size: 1.08rem;
+            line-height: 1.3;
+            margin: 22px 0 9px;
             color: var(--accent-green);
-            letter-spacing: 0.01em;
         }
-        .doc ul { margin: 8px 0; padding-left: 20px; }
+        .doc h4 { font-size: 0.95rem; margin: 18px 0 7px; color: var(--text-color); }
+        .doc h5 { font-size: 0.88rem; margin: 16px 0 6px; color: var(--text-muted); }
+        .doc h6 {
+            font-size: 0.78rem;
+            font-weight: 400;
+            font-style: italic;
+            margin: 26px 0 0;
+            color: var(--text-muted);
+        }
+        .doc p { margin: 9px 0; }
+        .doc ul { margin: 9px 0; padding-left: 22px; }
         .doc li { margin: 5px 0; }
         .doc li > ul { margin: 4px 0 6px; }
         .doc strong { color: #fff; font-weight: 600; }
@@ -78,6 +156,22 @@
         .doc a { color: var(--accent-blue); }
         .doc hr { border: none; border-top: 1px solid var(--border); margin: 26px 0; }
         .status { color: var(--text-muted); font-size: 0.82rem; margin-top: 22px; }
+
+        /* Long issue text, URLs and deep bullet nesting all overflow a phone
+           viewport otherwise. Nested lists also indent cumulatively, so the
+           padding is reduced rather than kept at the desktop value. */
+        .doc, .doc li, .doc p { overflow-wrap: anywhere; }
+        .doc pre { overflow-x: auto; }
+
+        @media (max-width: 600px) {
+            body { padding: 14px 13px 44px; font-size: 0.86rem; }
+            .doc h1 { font-size: 1.55rem; }
+            .doc h2 { font-size: 1.15rem; margin-top: 28px; }
+            .doc h3 { font-size: 0.98rem; }
+            .doc h4 { font-size: 0.9rem; }
+            .doc ul { padding-left: 18px; }
+            .doc li > ul { padding-left: 15px; }
+        }
     </style>
 </head>
 <body>
@@ -89,6 +183,17 @@
         </svg>
         Back to monitor
     </a>
+
+    <div class="feedback-note">
+        <p class="fb-title">Want a feature? Got a bug? We're working on it&trade;</p>
+        <label for="fb-text" class="sr-only">Your feedback</label>
+        <textarea id="fb-text" rows="3" maxlength="2000"
+                  placeholder="What would make this more useful?"></textarea>
+        <div class="fb-row">
+            <button type="button" id="fb-send" onclick="sendFeedback()">Submit</button>
+            <span id="fb-status" class="fb-status"></span>
+        </div>
+    </div>
 
     <div id="doc" class="doc"><p class="status">Loading changelog…</p></div>
 </div>
@@ -172,6 +277,41 @@
         }
         closeAll();
         return out.join('\n');
+    }
+
+    async function sendFeedback() {
+        const box = document.getElementById('fb-text');
+        const btn = document.getElementById('fb-send');
+        const out = document.getElementById('fb-status');
+        const text = box.value.trim();
+
+        const say = (msg, cls) => { out.textContent = msg; out.className = 'fb-status ' + (cls || ''); };
+
+        if (!text) return say('Write something first.', 'err');
+
+        const token = localStorage.getItem(TOKEN_KEY);
+        if (!token) return say('Sign in on the monitor first.', 'err');
+
+        btn.disabled = true;
+        say('Sending…');
+        try {
+            const res = await fetch('/api/feedback', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
+                body: JSON.stringify({ text: text }),
+            });
+            const data = await res.json().catch(() => ({}));
+            if (res.status === 401) return say('Session expired — sign in again.', 'err');
+            if (!res.ok || !data.ok) return say(data.error || 'Could not send that.', 'err');
+            // Clearing only on success means a failed send never loses what
+            // the user typed.
+            box.value = '';
+            say('Thanks — got it.', 'ok');
+        } catch (e) {
+            say('Could not reach the server.', 'err');
+        } finally {
+            btn.disabled = false;
+        }
     }
 
     (async function load() {

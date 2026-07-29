@@ -32,6 +32,36 @@ except Exception:  # pragma: no cover - surfaced at request time instead
 _AUTH_KEY = "fleetauth"
 _AUTH_TTL = 60 * 30
 
+# The cached cookie was re-read from Redis for every single fleet call, and a
+# poll makes thirteen of them — one fleet sweep plus a session fetch per rig in
+# the shard. That was thirteen billable commands a cycle to answer "am I still
+# logged in", dwarfing the three the poll spends on its own state.
+#
+# Held here for five minutes instead, well inside the half-hour the snapshot is
+# stored for. Only the snapshot is memoised, not the client: a poll fans its
+# session fetches across twelve threads, and requests.Session does not promise
+# to be safe shared between them.
+_AUTH_MEMO_TTL = 300.0
+_auth_memo = None
+_auth_memo_at = 0.0
+
+
+def _cached_auth():
+    global _auth_memo, _auth_memo_at
+    if _auth_memo is not None and (time.time() - _auth_memo_at) < _AUTH_MEMO_TTL:
+        return _auth_memo
+    try:
+        data = R.jget(_AUTH_KEY)
+    except R.RedisUnavailable:
+        return None
+    _auth_memo, _auth_memo_at = data, time.time()
+    return data
+
+
+def _remember_auth(data):
+    global _auth_memo, _auth_memo_at
+    _auth_memo, _auth_memo_at = data, time.time()
+
 
 def _snapshot_auth(client):
     """Extracts whatever represents 'logged in' from the client."""
@@ -81,11 +111,12 @@ def get_client(force_login: bool = False):
     client = FleetAPIClient()
 
     if not force_login:
-        try:
-            if _restore_auth(client, R.jget(_AUTH_KEY)):
-                return client
-        except R.RedisUnavailable:
-            pass
+        if _restore_auth(client, _cached_auth()):
+            return client
+    else:
+        # The cached cookie is what just failed; forget it here as well or
+        # every thread in the sweep retries with the same dead one.
+        _remember_auth(None)
 
     email = os.environ.get("FLEET_EMAIL")
     password = os.environ.get("FLEET_PASSWORD")
@@ -96,12 +127,13 @@ def get_client(force_login: bool = False):
     if not ok:
         raise FleetAPIError(f"Fleet login failed: {err}")
 
-    try:
-        snap = _snapshot_auth(client)
-        if snap:
+    snap = _snapshot_auth(client)
+    if snap:
+        _remember_auth(snap)
+        try:
             R.jset(_AUTH_KEY, snap, ttl=_AUTH_TTL)
-    except R.RedisUnavailable:
-        pass
+        except R.RedisUnavailable:
+            pass
     return client
 
 
