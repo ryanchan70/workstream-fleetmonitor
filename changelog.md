@@ -1,47 +1,56 @@
 # changelog
 
+## 07/28
+
+- **backend optimizations**
+
+  - reduced requests to redis database by ***90-95%***
+
+  - runs agent.py locally, which does polling and backfilling without relying on serverless
+
+- terminal dump cleanup
+
+- removed task duplication in the completed tasks
+
 ## 07/27
 
 ### **MAJOR FEATURE: OPERATIONAL VERCEL DEPLOYMENT!!**
 
-- **fixed the UTC bug** — all dates, totals and log timestamps are now Pacific,
-  so the day no longer rolls over at 5pm and Friday evenings stop counting as weekend
+- **working completed tasks section**
 
-- **fixed idle/servicing flickering to 0** — servicing survives the API dropping
-  it for a poll or two, and preview never surfaces as a status
+- **notification center**
 
 - selectable polling frequency (15s to 1h), manual refresh, and manual backfill
 
-- automatic hourly polling from 7pm to 9am Pacific
+- multi-toggle buttons to fast-select recording/idle/etc.
+
+- automatic throttling of hourly polling from 7pm to 9am PDT
 
 - "last updated" on live rig status, "last seen online" on offline rigs
 
-- notification center
+- added servicing rigs
 
 - resolved alerts stay listed, just no longer red
 
-- "email me a code" button 
+- "email me a code" button now always displays
 
-- **status buttons moved up beside the sort control**, colour-coded, and no longer
-  disappear when a status happens to be empty
+- added "updated [timestamp]" messages
 
 - renamed idling to idle (green)
 
 - stat boxes now match the card behind them
 
-- **working completed tasks section**
+- fixed UTC time zone bug counting recordings after 5pm towards the next day
 
-- updated aggregate colors/opacity
+- fixed idle/servicing flickering to 0 when API drops
+
+- updated aggregate colors/opacity for better UX
 
 - github cleanup
 
-- added servicing rigs
-
 - changelog
 
-- multi-toggle buttons
-
-- wrote description for release 1.0.0
+- **wrote description for release 1.0.0**
 
 ## 07/26
 
