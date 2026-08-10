@@ -882,7 +882,16 @@ def _history_touch(history: dict, tasks_by_host: dict):
     for host, entries in tasks_by_host.items():
         if not entries:
             continue
-        tasks[host] = C.dedupe_tasks(list(tasks.get(host) or []) + list(entries))
+        # This sweep just re-read these sessions from the API, so where a
+        # stored API row describes the same recording, the fresh verdict
+        # replaces it outright instead of competing with it in dedupe_tasks —
+        # which keeps whichever copy is LONGER and would otherwise preserve a
+        # stale duration forever. Live rows are left for dedupe_tasks to
+        # resolve as before; it already prefers an API record over them.
+        stored = [e for e in (tasks.get(host) or [])
+                  if e.get("src") == "live"
+                  or not any(C.same_session(e, f) for f in entries)]
+        tasks[host] = C.dedupe_tasks(stored + list(entries))
     history["v"] = int(time.time())
 
 
@@ -1074,14 +1083,12 @@ def _past_day_totals(named, all_sessions, labels, today, rates):
     """Per-day hours and the per-day rig/operator split, from stored sessions.
 
     Excludes today (handled live) and weekends (excluded by request). Counts
-    the byte-implied duration wherever it disagrees with the API's wall clock,
-    and reports which days that happened on, since those are the days whose
-    stored totals are allowed to fall.
+    the byte-implied duration wherever the session's size contradicts the API's
+    wall clock.
 
-    Returns (by_day, breakdown, corrected_days).
+    Returns (by_day, breakdown).
     """
     by_day, breakdown = {}, {}
-    corrected_days = set()
     for host, _ in named:
         stored = all_sessions.get(host)
         if stored is None:
@@ -1092,9 +1099,7 @@ def _past_day_totals(named, all_sessions, labels, today, rates):
             ds = sess.get("date")
             if not ds or ds == today or C.is_weekend(ds):
                 continue
-            dur, api_dur = C.session_durations(host, sess, rates)
-            if api_dur is not None:
-                corrected_days.add(ds)
+            dur, _api_dur = C.session_durations(host, sess, rates)
             if dur <= 0:
                 continue
             by_day[ds] = by_day.get(ds, 0.0) + dur
@@ -1103,7 +1108,7 @@ def _past_day_totals(named, all_sessions, labels, today, rates):
             day["pi"][label] = day["pi"].get(label, 0.0) + dur
             op = sess.get("operator") or "Unknown"
             day["op"][op] = day["op"].get(op, 0.0) + dur
-    return by_day, breakdown, corrected_days
+    return by_day, breakdown
 
 
 def backfill(force: bool = False) -> dict:
@@ -1246,30 +1251,31 @@ def backfill(force: bool = False) -> dict:
         # weekends (excluded by request). The same pass builds the per-day
         # rig/operator split, so /stats_range no longer has to re-read every
         # session hash on every request.
-        by_day, breakdown, corrected_days = _past_day_totals(
+        by_day, breakdown = _past_day_totals(
             named, all_sessions, labels, today, rates)
 
         if by_day:
             existing_days = R.hgetall_json("daily_hours")
-            # A day normally only ever climbs, so a rig the sweep could not
-            # reach cannot erase hours it already reported. A day whose
-            # sessions the byte estimate corrected is the one case where the
-            # recomputed total is allowed to come DOWN — the whole point is to
-            # strike a hung session's phantom hours off the record.
-            merged = {d: v for d, v in by_day.items()
-                      if v > float(existing_days.get(d, 0) or 0)
-                      or (d in corrected_days and v < float(existing_days.get(d, 0) or 0))}
-            if merged:
-                R.hset_many_json("daily_hours", merged)
+            # Written whenever the recomputed figure differs, in either
+            # direction. This hash used to climb only, so an unreachable rig
+            # could not erase hours it had already reported — but history["days"]
+            # below, which is what the dashboard actually charts, is rebuilt
+            # wholesale from this same by_day every sweep. So the guard only
+            # ever protected a copy nobody reads, at the cost of a second,
+            # divergent truth that a corrected duration could never fix.
+            changed = {d: v for d, v in by_day.items()
+                       if abs(v - float(existing_days.get(d, 0) or 0)) > 1.0}
+            if changed:
+                R.hset_many_json("daily_hours", changed)
 
             # /day_tasks answers past days out of a per-date cache built once
-            # and kept forever. A corrected day whose total actually moved has
-            # to lose that cache, or the drill-down keeps listing the
-            # uncorrected durations. Keyed off merged rather than
-            # corrected_days so a settled day is not re-fetched every sweep.
-            for d in merged:
-                if d in corrected_days:
-                    R.cmd("DEL", R.P + "daytasks:" + d)
+            # and kept forever. Any day whose total moved has to lose that
+            # cache, or the drill-down keeps listing the durations it was built
+            # with — including a session this sweep has since stopped
+            # correcting. Keyed off the days that moved, so settled days are
+            # not re-fetched every sweep.
+            for d in changed:
+                R.cmd("DEL", R.P + "daytasks:" + d)
 
         # Stamped only once the sweep has actually succeeded. Stamping up front
         # meant any failure — an unreachable fleet API, missing credentials —

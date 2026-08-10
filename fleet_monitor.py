@@ -590,7 +590,6 @@ def backfill_daily_hours(client: "FleetAPIClient"):
     # are currently offline and weren't in `results` this cycle at all).
     today = get_date_str()
     all_by_day: dict[str, float] = {}
-    corrected_days: set[str] = set()   # days holding a byte-corrected session
     n_estimated = 0
     with _pi_session_cache_lock:
         cache_snapshot = {h: dict(v) for h, v in _pi_session_cache.items()}
@@ -607,7 +606,6 @@ def backfill_daily_hours(client: "FleetAPIClient"):
             dur, api_dur = session_durations(hostname, sess)
             if api_dur is not None:
                 n_estimated += 1
-                corrected_days.add(date_str)
             if dur > 0:
                 all_by_day[date_str] = all_by_day.get(date_str, 0.0) + dur
 
@@ -615,12 +613,14 @@ def backfill_daily_hours(client: "FleetAPIClient"):
     with _daily_hours_lock:
         for day, total_s in all_by_day.items():
             prev = _daily_hours_cache.get(day, 0)
-            # Normally the cache only ever climbs, so a Pi that goes offline
-            # can't erase hours it already reported. A day whose sessions the
-            # byte estimate corrected is the one case where the recomputed
-            # total is allowed to come DOWN — the whole point is to strike a
-            # hung session's phantom hours off the record.
-            if total_s > prev or (day in corrected_days and total_s < prev):
+            # This total is recomputed from the FULL persistent session cache,
+            # including Pis that have since gone offline, so it is authoritative
+            # for any day that cache covers — it replaces the stored figure
+            # rather than only raising it. Without that, a day left inflated by
+            # an earlier run could never settle back down. Live-log totals that
+            # the cache never saw are still folded in by
+            # _flush_past_days_to_cache(), which does only raise.
+            if abs(total_s - prev) > 1.0:
                 _daily_hours_cache[day] = total_s
                 updated = True
 
