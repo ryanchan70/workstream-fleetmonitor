@@ -413,12 +413,19 @@ def _session_date(rec: dict) -> str | None:
 # longer than what actually got recorded — while the bytes on disk still
 # reflect the real thing. Bytes are much harder to fake, so each rig's own
 # median bytes/second gives an independent estimate of how long it recorded.
-# The API's figure is kept only when it lands within BYTE_DURATION_MARGIN of
-# that estimate; outside it, the estimate is what counts and the API number is
+#
+# These are categorize_tasks.py's constants and its rule, deliberately: the
+# correction only ever runs ONE WAY. A byte estimate above the wall clock means
+# the rig recorded denser than its median — more cameras, a higher bitrate —
+# not that it ran longer than the folder was open, so an estimate that comes in
+# high is ignored. Only an estimate that falls to DURATION_MISMATCH_RATIO of
+# the wall clock or below is treated as evidence the span is inflated, and only
+# then does the estimate become the counted duration, with the API's number
 # carried alongside so the dashboard can show what it replaced.
-BYTE_DURATION_MARGIN = 0.10      # 10% margin of error around the estimate
 MIN_BASELINE_DURATION_S = 120.0  # sessions shorter than this make noisy rates
 MIN_BASELINE_SESSIONS = 5        # per-rig samples needed to trust its own rate
+DURATION_MISMATCH_RATIO = 0.75   # how far below wall clock the estimate must
+                                 # fall before the wall clock is distrusted
 
 # Session-level total, whatever the rig's firmware calls it.
 _SIZE_KEYS = ("size_bytes", "total_bytes", "bytes_total", "total_size_bytes",
@@ -495,12 +502,13 @@ def _rebuild_byte_rate_baselines():
 
 
 def session_durations(hostname: str, sess: dict) -> tuple[float, float | None]:
-    """(duration to count, API duration when the two disagree).
+    """(duration to count, API duration when the bytes contradict it).
 
-    Returns the byte-implied estimate whenever the rig's byte rate puts the
-    API's span further than BYTE_DURATION_MARGIN away from it. The second
-    element is None when they agree — or when there is no size or no baseline
-    to judge with, in which case the API duration stands unchallenged."""
+    Returns the byte-implied estimate only when it falls to
+    DURATION_MISMATCH_RATIO of the API's span or below — the signature of an
+    inflated wall clock. The second element is None every other time: an
+    estimate that agrees, an estimate that comes in high, or no size and no
+    baseline to judge with. In all of those the API duration stands."""
     api_dur = float(sess.get("duration_s") or 0)
     try:
         nbytes = float(sess.get("size_bytes") or 0)
@@ -515,9 +523,9 @@ def session_durations(hostname: str, sess: dict) -> tuple[float, float | None]:
         return api_dur, None
 
     implied = nbytes / rate
-    if abs(implied - api_dur) <= api_dur * BYTE_DURATION_MARGIN:
-        return api_dur, None
-    return implied, api_dur
+    if implied < api_dur * DURATION_MISMATCH_RATIO:
+        return implied, api_dur
+    return api_dur, None
 
 
 def backfill_daily_hours(client: "FleetAPIClient"):
