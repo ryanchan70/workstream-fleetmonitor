@@ -5,7 +5,7 @@
     "api/index.py": {
       "memory": 1024,
       "maxDuration": 60,
-      "includeFiles": "{api/_lib/**,api_client.py,auth.py,changelog.md}"
+      "includeFiles": "{api/_lib/**,api_client.py,auth.py,changelog.md,new_changes.md,feedback.txt}"
     }
   },
 
@@ -14,7 +14,7 @@
   ],
 
   "rewrites": [
-    { "source": "/api/(.*)", "destination": "/api/index" }
+    { "source": "/api/(.*)", "destination": "/api/index?__route=$1" }
   ],
 
   "headers": [

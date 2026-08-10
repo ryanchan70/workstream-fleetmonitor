@@ -1,5 +1,35 @@
 # changelog
 
+## 07/30
+
+- filtered, sorted, and optimized data dump python script 
+
+- operational feedback form
+
+- **fixed aggregate hours time discrepancy**
+
+- "new changes" popup on startup, backed by `new_changes.md`
+
+- notifications no longer disappear from the notification center
+
+- better recording-stopped notifications
+
+- notification bell moves to the left side of the top bar on small screens
+
+- task name added back to the terminal dump on a recording stop
+
+## 07/29 
+
+- previous task/operator/time displayed on non-recording pis
+
+- fixed bug where completed tasks reverse button would collapse the section
+
+- wrote python script to do data dump into csv and filter for special tasks
+
+- ranking dropdowns
+
+- **wrote release 1.1.0 notes** 
+
 ## 07/28
 
 - **backend optimizations**
@@ -11,6 +41,8 @@
 - terminal dump cleanup
 
 - removed task duplication in the completed tasks
+
+- feedback form
 
 ## 07/27
 
@@ -85,22 +117,26 @@
 
 ## QUEUED FEATURES
 
+- **migrate to web socket**
+
+- fix disappearing alerts issue
+
+- fix rankings (why is there an Unknown operator?)
+
+- add back task name to terminal dump
+
+- hours of tasks per type
+  - break it down into by day
+  - x`rig operator & an actual task name
+
 - add location to pis, save presets to selected pis
 
 - selectable color themes
 
 - export completed tasks to csv/txt
 
-- button to turn off polling
+- option to have AM/PM displayed in terminal dump
 
-- 2 stat boxes side by side for mobile
+- custom sound effects 
 
-- mobile notifications (no service worker?)
-
-- show email button by default
-
-- mute sounds
-
-- saved passwords
-
-###### last updated 07/27 11:35AM
+###### last updated 07/29 10:22AM

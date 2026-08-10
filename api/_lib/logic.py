@@ -15,6 +15,8 @@ and the function's active CPU proportional to how often the FLEET changes
 instead of how often somebody is looking at it.
 """
 
+import csv
+import os
 import random
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -73,6 +75,16 @@ HEALTH_PUSH_SEC = 120.0
 # that patch loses a race with a concurrent poll.
 LOCATIONS_REFRESH_SEC = 300.0
 
+# A rig that drops offline mid-recording used to freeze forever: nothing ever
+# banked its in-progress duration unless it came back and cleanly reported
+# idle, so a Pi that never reconnects (dead SD card, someone unplugs it at
+# the end of a shift) silently lost the task it was in the middle of. This is
+# how long to wait for it to come back with the SAME session still running
+# before giving up and finalizing what was captured — long enough that a
+# rig rebooting or a wifi blip does not split one recording into two, short
+# enough that a task is not stuck in limbo for hours.
+OFFLINE_FINALIZE_SEC = 900.0
+
 
 def is_night(now_pacific=None) -> bool:
     h = (now_pacific or C.pacific_now()).hour
@@ -111,6 +123,9 @@ RIG_SHARD_TARGET = 12
 # Redis key prefixes for the per-rig hashes the blobs are rebuilt from.
 _TASKS = "tasks:"
 _SESSIONS = "sessions:"
+# Per-rig median bytes/second, rebuilt by each backfill. Small enough to read
+# on a request that needs to judge a session's duration against its size.
+_BYTE_RATES = "byte_rates"
 
 
 def _stamp(line: str) -> str:
@@ -281,6 +296,20 @@ def agent_alive(state) -> dict | None:
     return a if age <= max(3 * float(a.get("every") or 30), 90) else None
 
 
+def _bank_observed(stt: dict):
+    """Move the in-progress self-tracked segment into its operator's bank.
+
+    Keyed by operator rather than a single running total, so a rig that
+    changes hands during the day keeps each operator's share distinguishable
+    later — see the proportional split in _rebuild_leaderboard, which used to
+    credit 100% of a rig's self-tracked overflow to whichever operator
+    happened to be on it last.
+    """
+    op = stt.get("cur_op") or "Unknown"
+    by_op = stt.setdefault("banked_by_op", {})
+    by_op[op] = by_op.get(op, 0.0) + stt["cur_dur"]
+
+
 def poll(force: bool = False, state=None, agent=None, requested=None):
     """One iteration of the fleet loop.
 
@@ -418,6 +447,13 @@ def poll(force: bool = False, state=None, agent=None, requested=None):
         active = p.get("active_alerts") or {}
         current = {f"{a['hostname']}|{a['kind']}": a for a in alerts}
 
+        # When the condition first became true, carried across cycles for as
+        # long as it stays true. The notification centre shows it, and "since
+        # 09:14" is a different piece of information from "reported now" — a
+        # fault nobody has looked at for three hours should read that way.
+        for k, a in current.items():
+            a["since"] = float((active.get(k) or {}).get("since") or now)
+
         # Transitions fire exactly once per incident.
         #
         # Two things deliberately do NOT reach the terminal:
@@ -448,15 +484,22 @@ def poll(force: bool = False, state=None, agent=None, requested=None):
         # Expired entries would otherwise accumulate in the blob forever.
         p["debounce"] = {k: v for k, v in debounce.items() if float(v) > now}
 
-        # Frame health snapshot.
+        # Frame health snapshot. "avg"/"min" treat every rig equally
+        # regardless of how many frames it actually recorded; "overall" is
+        # the fleet's real capture rate — total frames captured over total
+        # frames expected, so one rig with a bad session cannot look the same
+        # as ten rigs each dropping the same fraction of a much bigger take.
         readings = [r["frame_health_pct"] for r in rigs
                     if r.get("frame_health_pct") is not None and r.get("online")]
+        cap_total = sum(r.get("frames_captured") or 0 for r in rigs if r.get("online"))
+        exp_total = sum(r.get("frames_expected") or 0 for r in rigs if r.get("online"))
         health_point = None
         if readings:
             health_point = {
                 "t": int(now * 1000),
                 "avg": round(sum(readings) / len(readings), 2),
                 "min": round(min(readings), 2),
+                "overall": round(cap_total / exp_total * 100, 2) if exp_total else None,
             }
             if now - float(p.get("health_at") or 0) >= HEALTH_PUSH_SEC:
                 p["health"] = (list(p.get("health") or []) + [health_point])[-HEALTH_SEED_MAX:]
@@ -479,36 +522,68 @@ def poll(force: bool = False, state=None, agent=None, requested=None):
 
             stt = observed.get(host)
             if not isinstance(stt, dict) or stt.get("date") != today:
-                stt = {"date": today, "banked_s": 0.0, "cur_dur": 0.0,
-                       "cur_op": "", "label": label}
+                stt = {"date": today, "banked_by_op": {}, "cur_dur": 0.0,
+                       "cur_op": "", "cur_task": "", "label": label,
+                       "offline_since": 0.0}
+            stt.setdefault("cur_task", "")
+            stt.setdefault("offline_since", 0.0)
+            stt.setdefault("banked_by_op", {})
             stt["label"] = label
 
             if status == "recording":
+                stt["offline_since"] = 0.0     # back, or never left
                 op = C.clean_str(d.get("operator"))
+                task = C.clean_str(d.get("task"))
                 dur = float(d.get("recording_duration_s") or 0)
                 if stt["cur_op"] and (op != stt["cur_op"] or dur < stt["cur_dur"] - 30):
-                    stt["banked_s"] += stt["cur_dur"]
+                    _bank_observed(stt)
                     stt["cur_dur"] = dur
                     stt["cur_op"] = op
+                    stt["cur_task"] = task
                 else:
                     stt["cur_op"] = op
+                    stt["cur_task"] = task
                     stt["cur_dur"] = max(stt["cur_dur"], dur)
             elif status == "offline":
-                pass    # freeze; reconnecting mid-recording just raises cur_dur
+                # Freeze while there is nothing in progress. While something
+                # IS in progress, give it OFFLINE_FINALIZE_SEC to reconnect
+                # before assuming it is not coming back and banking what was
+                # captured — otherwise a rig that never reconnects loses the
+                # task it was in the middle of, forever.
+                if stt["cur_dur"] > 0:
+                    if not stt["offline_since"]:
+                        stt["offline_since"] = now
+                    elif now - float(stt["offline_since"]) >= OFFLINE_FINALIZE_SEC:
+                        finished.append({
+                            "hostname": host,
+                            "label": label,
+                            "operator": stt.get("cur_op") or "Unknown",
+                            "task": stt.get("cur_task") or "Unknown",
+                            "duration_s": stt["cur_dur"],
+                            "start_time": int(time.time() - stt["cur_dur"]),
+                            "offline": True,
+                        })
+                        _bank_observed(stt)
+                        stt["cur_dur"] = 0.0
+                        stt["cur_op"] = ""
+                        stt["cur_task"] = ""
+                        stt["offline_since"] = 0.0
             else:
+                stt["offline_since"] = 0.0
                 if stt["cur_dur"] > 0:
                     # Clean stop -> bank it and record the completed task.
                     finished.append({
                         "hostname": host,
                         "label": label,
                         "operator": stt.get("cur_op") or "Unknown",
-                        "task": C.clean_str(d.get("task")),
+                        "task": stt.get("cur_task") or C.clean_str(d.get("task")),
                         "duration_s": stt["cur_dur"],
                         "start_time": int(time.time() - stt["cur_dur"]),
                     })
-                    stt["banked_s"] += stt["cur_dur"]
+                    _bank_observed(stt)
                     stt["cur_dur"] = 0.0
                     stt["cur_op"] = ""
+                    stt["cur_task"] = ""
             observed[host] = stt
 
         p["observed"] = observed
@@ -516,9 +591,40 @@ def poll(force: bool = False, state=None, agent=None, requested=None):
 
         if finished:
             p["history_v"] = _record_finished(finished)
+            _append_task_report(finished)
             for f in finished:
+                tag = " | reconnect timed out" if f.get("offline") else ""
                 lines.append(f"CHANGE {f['label']}  STOPPED | Op: {f['operator']} | "
-                             f"{C.format_time(f['duration_s'])}")
+                             f"Task: {f['task']} | {C.format_time(f['duration_s'])}{tag}")
+
+            # The recording_stopped alert (fired earlier this same cycle, from
+            # the same prev-status transition) carries only hostname/kind/
+            # message. `finished` has the operator and task that were actually
+            # attached to the session that just ended, so stitch them on here
+            # rather than re-deriving them from the device's current state,
+            # which may already have moved on.
+            finished_by_host = {f["hostname"]: f for f in finished}
+            alerted_hosts = set()
+            for a in alerts:
+                if a.get("kind") != "recording_stopped":
+                    continue
+                alerted_hosts.add(a.get("hostname"))
+                f = finished_by_host.get(a.get("hostname"))
+                if f:
+                    a["operator"] = f["operator"]
+                    a["task"] = f["task"]
+
+            # A task finalized because the rig went offline mid-recording (see
+            # OFFLINE_FINALIZE_SEC) never passes through the idle/uploading
+            # transition core.evaluate_rigs() alerts on, so without this it
+            # would be recorded in history but never reach the notification
+            # centre at all.
+            for host, f in finished_by_host.items():
+                if not f.get("offline") or host in alerted_hosts:
+                    continue
+                alerts.append({"hostname": host, "rig": f["label"], "kind": "recording_stopped",
+                               "message": "Pi stopped recording", "since": now,
+                               "operator": f["operator"], "task": f["task"]})
 
         if "today" not in p:
             p["today"] = _migrate_today(today)
@@ -529,6 +635,16 @@ def poll(force: bool = False, state=None, agent=None, requested=None):
         # loop costs the agent nothing.
         if agent:
             p["agent"] = {"at": time.time(), "id": agent[0], "every": agent[1]}
+
+        # Running total of billable Redis commands, for the dev console.
+        # Counted here because this is the one place a container is already
+        # writing; a container that only ever serves reads never gets to add
+        # its own handful, so the total is a floor rather than an exact figure.
+        cmds = p.get("cmds") if isinstance(p.get("cmds"), dict) else {}
+        p["cmds"] = {
+            "n": float(cmds.get("n") or 0) + R.take_command_delta(),
+            "since": float(cmds.get("since") or now),
+        }
 
         st["view"] = _build_view(st, rigs, alerts, by_pi, by_op,
                                  health_point, [_stamp(l) for l in lines])
@@ -566,7 +682,12 @@ def _build_view(st, rigs, alerts, by_pi, by_op, health_point, new_lines):
                 and not (" CRITICAL " in str(l) and "stopped recording" in str(l))]
     logs = (logs + list(new_lines))[-LOG_VIEW_MAX:]
 
-    total_s = sum(v for k, v in by_pi.items() if not C.is_unnamed_pi(k))
+    # Every rig's hours count toward the total, named or not — hiding
+    # unnamed rigs is a display concern for the rig leaderboard (below), not
+    # a reason to drop their recorded time from the headline number. This
+    # used to filter them out here, which made the tile disagree with both
+    # /stats_range's total (already unfiltered) and the operator leaderboard.
+    total_s = sum(by_pi.values())
     online = [r for r in rigs if r.get("online")]
     live = [r["frame_health_pct"] for r in online if r.get("frame_health_pct") is not None]
     prev_stats = prev.get("stats") or {}
@@ -578,7 +699,17 @@ def _build_view(st, rigs, alerts, by_pi, by_op, health_point, new_lines):
         avg_fh, min_fh = prev_stats.get("avg_frame_health_pct"), prev_stats.get("min_frame_health_pct")
 
     captured = sum(r.get("frames_captured") or 0 for r in rigs)
+    expected = sum(r.get("frames_expected") or 0 for r in rigs)
     dropped = sum(r.get("frames_dropped") or 0 for r in rigs)
+    # The fleet's real capture rate — total frames actually captured over
+    # total frames expected — as opposed to avg_fh, which weighs a rig that
+    # recorded ten minutes the same as one that recorded ten hours.
+    online_captured = sum(r.get("frames_captured") or 0 for r in online)
+    online_expected = sum(r.get("frames_expected") or 0 for r in online)
+    if online_expected:
+        overall_fh = round(online_captured / online_expected * 100, 2)
+    else:
+        overall_fh = prev_stats.get("overall_frame_health_pct")
     now_ms = int(time.time() * 1000)
 
     return {
@@ -596,7 +727,9 @@ def _build_view(st, rigs, alerts, by_pi, by_op, health_point, new_lines):
             "total_hours_today": round(total_s / 3600, 3),
             "avg_frame_health_pct": avg_fh,
             "min_frame_health_pct": min_fh,
+            "overall_frame_health_pct": overall_fh,
             "frames_captured_total": captured or None,
+            "frames_expected_total": expected or None,
             "frames_dropped_total": dropped or None,
             "active_recording_rigs": sum(1 for r in rigs if r.get("status") == "recording"),
             "total_rigs": len(rigs),
@@ -705,14 +838,25 @@ def _rebuild_leaderboard(devices, today, observed, cache):
             continue
         label = labels.get(host, stt.get("label", host))
         live_now = status.get(host) == "recording"
-        obs = stt.get("banked_s", 0.0) + (0.0 if live_now else stt.get("cur_dur", 0.0))
+        by_op_secs = dict(stt.get("banked_by_op") or {})
+        if not live_now and stt.get("cur_dur"):
+            cur_op = stt.get("cur_op") or "Unknown"
+            by_op_secs[cur_op] = by_op_secs.get(cur_op, 0.0) + float(stt["cur_dur"])
+        obs = sum(by_op_secs.values())
         if obs <= 0:
             continue
         api = by_pi.get(label, 0.0)
         if obs > api:
             by_pi[label] = obs
-            op = stt.get("cur_op") or "Unknown"
-            by_op[op] = by_op.get(op, 0.0) + (obs - api)
+            # Split the overflow across the operators who actually banked
+            # it, proportional to each one's share — crediting all of it to
+            # whichever operator is currently on the rig (the old behaviour)
+            # moved hours to the wrong operator on any rig that changed
+            # hands during the day, which is why individual operator totals
+            # would not add up to this same total.
+            extra = obs - api
+            for op, secs in by_op_secs.items():
+                by_op[op] = by_op.get(op, 0.0) + extra * (secs / obs)
 
     # In-progress recordings are not in the session API yet.
     for d in devices:
@@ -764,6 +908,75 @@ def _record_finished(finished):
     return history["v"]
 
 
+# Same column order as categorize_tasks.py's FIELDS — appended rows have to
+# line up under that header, or opening the file in Excel puts a session's
+# operator under the "category" column. That script owns the bool is_<code>
+# columns (they depend on --rules and are not known here), so a row from
+# this module is simply shorter; csv readers treat the missing trailing
+# cells as blank, and categorize_tasks.py re-derives them from task_name on
+# its next run (see LIVE_SESSION_PREFIX handling there).
+_TASK_REPORT_FIELDS = [
+    "row_type", "date", "duration_hhmmss", "pi_name", "operator", "task_name",
+    "category", "link", "start_time", "end_time", "duration_hours",
+    "duration_seconds", "pi_id", "is_categorized", "session_id",
+    "total_bytes", "size_label", "upload_status",
+]
+
+# categorize_tasks.py pulls the authoritative record for a session straight
+# from the fleet API and will drop this placeholder once it sees a real
+# session_id land near the same rig/time (see its LIVE_SESSION_PREFIX merge)
+# — but a recording that never gets a clean stop (see OFFLINE_FINALIZE_SEC)
+# never gets a real session_id at all, so this stays the only record of it.
+LIVE_SESSION_PREFIX = "live|"
+
+_TASK_REPORT_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "task_report.csv")
+
+
+def _append_task_report(finished):
+    """Append-only, filesystem-local record of every completed task.
+
+    This is the durability backstop Redis is not: a row written here is
+    never edited or rewritten by this module, so it survives a lost or
+    flushed Redis blob and does not depend on the network being up. Shares
+    task_report.csv with categorize_tasks.py (see that script's docstring)
+    rather than a separate file, so both feed the same report instead of one
+    silently missing what the other captured.
+
+    Silently does nothing where the filesystem is read-only (Vercel
+    serverless) — it only actually persists when this runs inside agent.py on
+    hardware whoever runs the poller controls.
+    """
+    try:
+        is_new = not os.path.exists(_TASK_REPORT_PATH)
+        # utf-8-sig only on creation: the BOM belongs at the very start of
+        # the file, and this may be appending to one categorize_tasks.py
+        # already wrote.
+        with open(_TASK_REPORT_PATH, "a", newline="",
+                  encoding="utf-8-sig" if is_new else "utf-8") as fh:
+            w = csv.writer(fh)
+            if is_new:
+                w.writerow(_TASK_REPORT_FIELDS)
+            for f in finished:
+                dur = float(f["duration_s"])
+                start = C.pacific_from_unix(f["start_time"])
+                end = C.pacific_from_unix(f["start_time"] + dur)
+                w.writerow([
+                    "SESSION", start.strftime("%Y-%m-%d"), C.format_time(dur),
+                    f["label"], f["operator"], f["task"],
+                    # Not this module's call to make — categorize_tasks.py
+                    # applies its own rules to task_name on the next run.
+                    "none", "",
+                    start.strftime("%H:%M:%S"), end.strftime("%H:%M:%S"),
+                    round(dur / 3600, 4), round(dur, 2), f["hostname"], "no",
+                    f"{LIVE_SESSION_PREFIX}{f['hostname']}|{int(f['start_time'])}",
+                    "", "", "offline-reconnect-timeout" if f.get("offline") else "live",
+                ])
+    except OSError:
+        pass
+
+
 def _history_bootstrap(history: dict) -> bool:
     """Populate the blob from the per-rig hashes it replaced.
 
@@ -788,6 +1001,48 @@ def _history_bootstrap(history: dict) -> bool:
             tasks[host] = C.dedupe_tasks(entries)
     history["tasks"] = tasks
     return True
+
+
+def _reconcile_unknown(entries, fresh):
+    """Patch a self-tracked "Unknown" placeholder once the fleet API's own
+    record of that session shows up in a backfill sweep.
+
+    A rig that stops offline (see OFFLINE_FINALIZE_SEC) or mid-task without a
+    clean operator/task on the device is banked with "Unknown" fields — the
+    only information available at the moment it happened, and the reason it
+    shows up as Unknown on the dashboard when the official site, reading only
+    the API's finished session, does not. `entries` (this host's existing
+    history rows) has no session id to look up — a live placeholder never had
+    one — so the match is by time overlap against `fresh` (this sweep's
+    freshly parsed API sessions for the same host), same as dedupe_tasks
+    uses to tell two records apart. Once matched, the API's operator/task/
+    duration are authoritative and are copied on in place, which keeps this
+    row's identity stable instead of leaving it to be silently dropped as a
+    duplicate the next time dedupe_tasks runs.
+    """
+    if not entries or not fresh:
+        return
+    for e in entries:
+        if e.get("src") != "live":
+            continue
+        if e.get("operator") != "Unknown" and e.get("task") != "Unknown":
+            continue
+        for f in fresh:
+            if not C.same_session(e, f):
+                continue
+            e["operator"] = f["operator"]
+            e["task"] = f["task"]
+            e["duration_s"] = f["duration_s"]
+            e["start_time"] = f["start_time"]
+            e["src"] = "api"
+            # f's duration may be the byte estimate rather than the API's own
+            # span; carry the rejected figure across too, or this row would
+            # show a corrected duration with nothing to explain it.
+            if f.get("duration_api_s") is None:
+                e.pop("duration_api_s", None)
+            else:
+                e["duration_api_s"] = f["duration_api_s"]
+            break
 
 
 # ── Backfill ──────────────────────────────────────────────────────────────
@@ -815,6 +1070,42 @@ def backfill_due(state=None) -> bool:
     return (now - float(p.get("backfill_last") or 0)) >= C.BACKFILL_INTERVAL_SEC
 
 
+def _past_day_totals(named, all_sessions, labels, today, rates):
+    """Per-day hours and the per-day rig/operator split, from stored sessions.
+
+    Excludes today (handled live) and weekends (excluded by request). Counts
+    the byte-implied duration wherever it disagrees with the API's wall clock,
+    and reports which days that happened on, since those are the days whose
+    stored totals are allowed to fall.
+
+    Returns (by_day, breakdown, corrected_days).
+    """
+    by_day, breakdown = {}, {}
+    corrected_days = set()
+    for host, _ in named:
+        stored = all_sessions.get(host)
+        if stored is None:
+            stored = R.hgetall_json(_SESSIONS + host)
+        for sess in stored.values():
+            if not isinstance(sess, dict):
+                continue
+            ds = sess.get("date")
+            if not ds or ds == today or C.is_weekend(ds):
+                continue
+            dur, api_dur = C.session_durations(host, sess, rates)
+            if api_dur is not None:
+                corrected_days.add(ds)
+            if dur <= 0:
+                continue
+            by_day[ds] = by_day.get(ds, 0.0) + dur
+            day = breakdown.setdefault(ds, {"pi": {}, "op": {}})
+            label = sess.get("label") or labels.get(host) or host
+            day["pi"][label] = day["pi"].get(label, 0.0) + dur
+            op = sess.get("operator") or "Unknown"
+            day["op"][op] = day["op"].get(op, 0.0) + dur
+    return by_day, breakdown, corrected_days
+
+
 def backfill(force: bool = False) -> dict:
     """Full session-history sweep: on first boot, then hourly.
 
@@ -833,8 +1124,12 @@ def backfill(force: bool = False) -> dict:
         if not devices:
             return {"skipped": "no devices"}
 
+        # Unnamed rigs are still real rigs with real hours — hiding them from
+        # the leaderboard is a display concern (C.ranked(hide_unnamed=True)),
+        # not a reason to skip fetching their sessions and leave their time
+        # out of the day totals.
         named = [(d.get("hostname"), C.device_label(d)) for d in devices
-                 if d.get("hostname") and not C.is_unnamed_pi(C.device_label(d))]
+                 if d.get("hostname")]
 
         # The budget means a sweep usually reaches only some of the fleet.
         # In a fixed order the same devices would win every hour and the tail
@@ -851,14 +1146,25 @@ def backfill(force: bool = False) -> dict:
         sessions_by_host = {}
         session_count = 0
 
+        # Loaded now rather than after the sweep, so the per-host loop below
+        # can reconcile "Unknown" placeholders against this sweep's freshly
+        # fetched sessions before they are written back.
+        history = R.history_load(0)
+        _history_bootstrap(history)
+        history_tasks = history["tasks"]
+
         # Every rig's stored sessions, so the per-day pass below does not
         # re-read the hashes this loop has just read and written.
         all_sessions = {}
 
+        # Sessions first, task records second. The task list needs the byte
+        # rates to know which durations to trust, and the rates are only
+        # correct once every session this sweep fetched has been merged in.
+        fetched_entries = {}
         for host, (label, groups) in fetched.items():
             existing = R.hgetall_json(_SESSIONS + host)
             all_sessions[host] = existing
-            new_sessions, new_tasks = {}, []
+            new_sessions, entries = {}, []
             for rec in groups:
                 dur = float(rec.get("duration_s") or 0)
                 if dur <= 0:
@@ -877,25 +1183,60 @@ def backfill(force: bool = False) -> dict:
                     "name": rec.get("name"),
                     "task": C.task_label(rec),
                     "start_unix": C.session_start_unix(rec),
+                    # What the recording actually weighs, and so how long it
+                    # really ran — see C.session_durations(). Sessions stored
+                    # before this field existed differ from the entry built
+                    # here and are rewritten with it on the next sweep. A
+                    # session still uploading reports no size yet; keep the
+                    # stored one rather than writing that gap back.
+                    "size_bytes": (C.extract_size_bytes(rec)
+                                   or (existing.get(sid) or {}).get("size_bytes")),
                 }
                 if existing.get(sid) != entry:
                     new_sessions[sid] = entry
-                new_tasks.append({
-                    "label": label,
+                entries.append(entry)
+            if new_sessions:
+                sessions_by_host[host] = new_sessions
+                existing.update(new_sessions)
+            if entries:
+                fetched_entries[host] = entries
+
+        for host, m in sessions_by_host.items():
+            R.hset_many_json(_SESSIONS + host, m)
+
+        # The rigs this sweep did not reach still have stored sessions, and the
+        # per-day pass below needs them regardless. Reading them here instead
+        # costs the same one HGETALL per rig in a single round trip, and lets
+        # the baselines below be built from the whole fleet rather than just
+        # the shard this sweep happened to fetch.
+        missing = [h for h, _ in named if h not in all_sessions]
+        for h, stored in zip(missing, R.hgetall_many_json(_SESSIONS + h for h in missing)):
+            all_sessions[h] = stored
+
+        # Rebuilt every sweep, then kept in Redis so a request can correct a
+        # session's duration without re-reading the fleet's history itself.
+        rates = C.byte_rate_baselines(all_sessions)
+        R.jset(_BYTE_RATES, rates)
+
+        for host, entries in fetched_entries.items():
+            new_tasks = []
+            for entry in entries:
+                # dur is what the history counts; api_dur is only carried so
+                # the dashboard can show, in red, the number it replaced.
+                dur, api_dur = C.session_durations(host, entry, rates)
+                task = {
+                    "label": entry["label"],
                     "operator": entry["operator"],
                     "task": entry["task"],
                     "duration_s": dur,
                     "start_time": entry["start_unix"],
                     "src": "api",
-                })
-            if new_sessions:
-                sessions_by_host[host] = new_sessions
-                existing.update(new_sessions)
-            if new_tasks:
-                tasks_by_host[host] = new_tasks
-
-        for host, m in sessions_by_host.items():
-            R.hset_many_json(_SESSIONS + host, m)
+                }
+                if api_dur is not None:
+                    task["duration_api_s"] = api_dur
+                new_tasks.append(task)
+            tasks_by_host[host] = new_tasks
+            _reconcile_unknown(history_tasks.get(host), new_tasks)
         # The task records go straight into the history blob below. The
         # per-rig session hashes above stay: they accumulate across sweeps that
         # each only reach part of the fleet, and the past-day totals are
@@ -905,35 +1246,30 @@ def backfill(force: bool = False) -> dict:
         # weekends (excluded by request). The same pass builds the per-day
         # rig/operator split, so /stats_range no longer has to re-read every
         # session hash on every request.
-        by_day = {}
-        breakdown = {}
-        for host, _ in named:
-            stored = all_sessions.get(host)
-            if stored is None:
-                stored = R.hgetall_json(_SESSIONS + host)
-            for sess in stored.values():
-                if not isinstance(sess, dict):
-                    continue
-                ds = sess.get("date")
-                if not ds or ds == today or C.is_weekend(ds):
-                    continue
-                dur = float(sess.get("duration_s") or 0)
-                if dur <= 0:
-                    continue
-                by_day[ds] = by_day.get(ds, 0.0) + dur
-                day = breakdown.setdefault(ds, {"pi": {}, "op": {}})
-                label = sess.get("label") or labels.get(host) or host
-                if not C.is_unnamed_pi(label):
-                    day["pi"][label] = day["pi"].get(label, 0.0) + dur
-                    op = sess.get("operator") or "Unknown"
-                    day["op"][op] = day["op"].get(op, 0.0) + dur
+        by_day, breakdown, corrected_days = _past_day_totals(
+            named, all_sessions, labels, today, rates)
 
         if by_day:
             existing_days = R.hgetall_json("daily_hours")
+            # A day normally only ever climbs, so a rig the sweep could not
+            # reach cannot erase hours it already reported. A day whose
+            # sessions the byte estimate corrected is the one case where the
+            # recomputed total is allowed to come DOWN — the whole point is to
+            # strike a hung session's phantom hours off the record.
             merged = {d: v for d, v in by_day.items()
-                      if v > float(existing_days.get(d, 0) or 0)}
+                      if v > float(existing_days.get(d, 0) or 0)
+                      or (d in corrected_days and v < float(existing_days.get(d, 0) or 0))}
             if merged:
                 R.hset_many_json("daily_hours", merged)
+
+            # /day_tasks answers past days out of a per-date cache built once
+            # and kept forever. A corrected day whose total actually moved has
+            # to lose that cache, or the drill-down keeps listing the
+            # uncorrected durations. Keyed off merged rather than
+            # corrected_days so a settled day is not re-fetched every sweep.
+            for d in merged:
+                if d in corrected_days:
+                    R.cmd("DEL", R.P + "daytasks:" + d)
 
         # Stamped only once the sweep has actually succeeded. Stamping up front
         # meant any failure — an unreachable fleet API, missing credentials —
@@ -943,8 +1279,6 @@ def backfill(force: bool = False) -> dict:
         if not fetched:
             return {"skipped": "no sessions fetched"}
 
-        history = R.history_load(0)
-        _history_bootstrap(history)
         _history_touch(history, tasks_by_host)
         if by_day:
             history["days"] = [{"date": d, "hours": round(s / 3600, 3)}

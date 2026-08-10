@@ -98,7 +98,7 @@ class FleetAPIClient:
         params = {"limit": limit}
         if light:
             params["light"] = 1
-        timeout = timeout if timeout is not None else max(self.timeout, 15.0)
+        timeout = timeout if timeout is not None else max(self.timeout, 30.0)
 
         r = None
         last_exc = None

@@ -8,6 +8,7 @@ system is spread across serverless invocations.
 
 import datetime
 import re
+import statistics
 import time
 
 # ── Thresholds ────────────────────────────────────────────────────────────
@@ -233,6 +234,23 @@ def task_label(rec: dict) -> str:
     return "Untitled task"
 
 
+def feedback_id(entry: dict) -> str:
+    """Stable id for a feedback submission.
+
+    Submissions made before ids existed have none, and without one they can
+    never be given a status — feedback.txt keys on it. Deriving one from the
+    submission time is stable across reads and cannot collide with the random
+    hex ids, which never start with a letter t.
+    """
+    fid = str((entry or {}).get("id") or "").strip()
+    if fid:
+        return fid
+    try:
+        return "t" + str(int(float(entry.get("at") or 0)))[-6:]
+    except (TypeError, ValueError):
+        return ""
+
+
 # ── Completed-task deduplication ──────────────────────────────────────────
 # A completed recording reaches us by two routes that describe the same real
 # session:
@@ -291,6 +309,24 @@ def _pick_number(d: dict, keys):
     return None
 
 
+def _dig(d, *path):
+    cur = d
+    for key in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(key)
+    return cur
+
+
+def _first_frame_stats(device: dict, paths):
+    """The first of `paths` that resolves to a dict carrying frame totals."""
+    for path in paths:
+        blob = _dig(device, *path)
+        if isinstance(blob, dict) and blob.get("actual_total_frames") is not None:
+            return blob
+    return None
+
+
 def extract_frame_health(device: dict):
     v = _pick_number(device, (
         "frame_health", "frame_health_percent", "frame_health_pct",
@@ -299,7 +335,16 @@ def extract_frame_health(device: dict):
         return v
     fs = device.get("frame_summary")
     if isinstance(fs, dict):
-        return _pick_number(fs, ("completion_percent", "worst_camera_percent"))
+        v = _pick_number(fs, ("completion_percent", "worst_camera_percent"))
+        if v is not None:
+            return v
+    # No rig reports a direct percentage field — fall back to the raw
+    # actual/expected totals under recording_info / recording_frame_stats
+    # (see extract_frame_counts) and derive one.
+    counts = extract_frame_counts(device)
+    captured, expected = counts["captured"], counts["expected"]
+    if captured is not None and expected:
+        return max(0.0, min(100.0, captured / expected * 100.0))
     return None
 
 
@@ -327,6 +372,28 @@ def extract_frame_counts(device: dict):
             fs, ("expected", "frames_expected", "total"))
         dropped = dropped if dropped is not None else _pick_number(
             fs, ("dropped", "frames_dropped", "missed"))
+
+    # The fleet API's actual shape (confirmed from a live /api/status dump):
+    # the whole-session totals sit at cameras.recording_info.recording_frame_
+    # stats.{actual,expected}_total_frames, duplicated one level deeper under
+    # ...recording_info.runner.recording_frame_stats. Per-camera role stats
+    # (cameras.roles.<role>.recording_frame_stats) use "frames"/"expected_
+    # frames" instead and are a different, narrower number — only the
+    # whole-session totals belong here. Every plausible nesting is tried,
+    # oldest/shallowest first, since which one a given rig build populates
+    # has moved around.
+    fstats = _first_frame_stats(device, (
+        ("recording_frame_stats",),
+        ("recording_info", "recording_frame_stats"),
+        ("cameras", "recording_frame_stats"),
+        ("cameras", "recording_info", "recording_frame_stats"),
+        ("cameras", "recording_info", "runner", "recording_frame_stats"),
+    ))
+    if fstats:
+        captured = captured if captured is not None else _pick_number(
+            fstats, ("actual_total_frames",))
+        expected = expected if expected is not None else _pick_number(
+            fstats, ("expected_total_frames",))
 
     if expected is None and captured is not None and dropped is not None:
         expected = captured + dropped
@@ -570,6 +637,115 @@ def evaluate_rigs(devices, locations=None, should_alert=None, prev_status=None,
             "critical": critical,
         })
     return rigs, alerts
+
+
+# ── Byte-implied session duration ─────────────────────────────────────────
+# A session's duration_s is wall clock: the span between the recording folder
+# opening and closing. Usually that IS the recording, but a rig that hangs, or
+# finalizes/uploads long after capture really stopped, leaves the span far
+# longer than what actually got recorded — while the bytes on disk still
+# reflect the real thing. Bytes are much harder to fake, so each rig's own
+# median bytes/second gives an independent estimate of how long it recorded.
+# The API's figure is kept only when it lands within BYTE_DURATION_MARGIN of
+# that estimate; outside it, the estimate is what counts and the API number is
+# carried alongside so the dashboard can show what it replaced.
+#
+# The rates live in Redis under "byte_rates", rebuilt by each backfill, so a
+# request can correct a session without re-reading the whole fleet's history.
+BYTE_DURATION_MARGIN = 0.10      # 10% margin of error around the estimate
+MIN_BASELINE_DURATION_S = 120.0  # sessions shorter than this make noisy rates
+MIN_BASELINE_SESSIONS = 5        # per-rig samples needed to trust its own rate
+
+# Session-level total, whatever the rig's firmware calls it.
+_SIZE_KEYS = ("size_bytes", "total_bytes", "bytes_total", "total_size_bytes",
+              "session_bytes", "bytes")
+_SIZE_LIST_KEYS = ("mcap_files", "session_files", "files", "recordings")
+
+
+def _positive_number(value):
+    """The value as a positive float, or None. Booleans are not numbers here."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
+def extract_size_bytes(rec: dict):
+    """Total bytes for one session record, or None if the API didn't say.
+
+    Falls back to summing the per-file lists, because the light=1 payload the
+    session fetch uses does not always carry a session-level total."""
+    for k in _SIZE_KEYS:
+        n = _positive_number(rec.get(k))
+        if n is not None:
+            return int(n)
+
+    total = 0.0
+    for sub in _SIZE_LIST_KEYS:
+        for it in rec.get(sub) or []:
+            if isinstance(it, dict):
+                total += _positive_number(it.get("size_bytes")) or 0.0
+    return int(total) if total > 0 else None
+
+
+def _host_byte_rates(stored: dict) -> list:
+    """Every usable bytes/second sample from one rig's stored sessions."""
+    rates = []
+    for sess in (stored or {}).values():
+        if not isinstance(sess, dict):
+            continue
+        dur = _positive_number(sess.get("duration_s"))
+        nbytes = _positive_number(sess.get("size_bytes"))
+        if dur is None or nbytes is None or dur < MIN_BASELINE_DURATION_S:
+            continue
+        rates.append(nbytes / dur)
+    return rates
+
+
+def byte_rate_baselines(sessions_by_host: dict) -> dict:
+    """Each rig's median bytes/second, plus a fleet-wide fallback median.
+
+    Medians, not means, so the very hangs this is meant to catch cannot drag a
+    rig's own baseline along with them. Rigs with fewer than
+    MIN_BASELINE_SESSIONS usable sessions get no rate of their own and fall
+    back to the fleet's."""
+    hosts = {}
+    all_rates = []
+    for host, stored in (sessions_by_host or {}).items():
+        rates = _host_byte_rates(stored)
+        all_rates.extend(rates)
+        if len(rates) >= MIN_BASELINE_SESSIONS:
+            hosts[host] = statistics.median(rates)
+    return {"hosts": hosts,
+            "fleet": statistics.median(all_rates) if all_rates else None}
+
+
+def session_durations(host: str, sess: dict, rates: dict):
+    """(duration to count, API duration when the two disagree).
+
+    Returns the byte-implied estimate whenever the rig's byte rate puts the
+    API's span further than BYTE_DURATION_MARGIN away from it. The second
+    element is None when they agree — or when there is no size or no baseline
+    to judge with, in which case the API duration stands unchallenged."""
+    api_dur = _positive_number(sess.get("duration_s"))
+    if api_dur is None:
+        return 0.0, None
+    nbytes = _positive_number(sess.get("size_bytes"))
+    if nbytes is None:
+        return api_dur, None
+
+    rates = rates or {}
+    rate = (rates.get("hosts") or {}).get(host) or rates.get("fleet")
+    if not rate:
+        return api_dur, None
+
+    implied = nbytes / rate
+    if abs(implied - api_dur) <= api_dur * BYTE_DURATION_MARGIN:
+        return api_dur, None
+    return implied, api_dur
 
 
 def ranked(source: dict, hide_unnamed: bool = False):

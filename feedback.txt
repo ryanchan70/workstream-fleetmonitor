@@ -1,0 +1,32 @@
+# Feedback from the dashboard.
+#
+# Submissions arrive in Redis — the deployed function runs on a read-only
+# filesystem and cannot append to this file. Pull them down with:
+#
+#     python3 agent.py --feedback
+#
+# which appends any it has not already seen, leaving everything below it
+# alone. Then set a status by editing the header line of a block. That is the
+# only part of this file the dashboard reads.
+#
+#   submitted     gray    — arrived, nobody has looked yet
+#   seen          orange  — read, not started
+#   in progress   green   — being worked on
+#   implemented   blue    — shipped
+#
+# Format, one block per submission — the id links it back to the submission,
+# so leave it alone:
+#
+#   [a3f2c1] 2026-07-28 14:22  someone@example.com  status: seen
+#   The text of the suggestion, over as many lines as it takes.
+#
+# ---------------------------------------------------------------------------
+
+[t199137] 2026-07-27 17:38:57  ryiechanski@gmail.com  status: submitted
+verification ping 1785199137
+
+[t202730] 2026-07-27 18:38:50  ryiechanski@gmail.com  status: submitted
+production smoke test
+
+[t289671] 2026-07-28 18:47:51  ryiechanski@gmail.com  status: submitted
+test

@@ -27,6 +27,10 @@
 !public/*.webmanifest
 !*.md
 
+# Dashboard suggestions and the status set against each by hand. Not generated
+# — it is edited and deployed, and the API reads its statuses back out.
+!feedback.txt
+
 # ── Config / manifests ───────────────────────────────────────────────────
 !pyproject.toml
 !requirements.txt
@@ -76,6 +80,7 @@ venv/
 .pi_session_cache.json
 .task_history.json
 .device_locations.json
+task_report_raw.json
 *.tmp
 
 # ── Generated logs ───────────────────────────────────────────────────────
@@ -84,6 +89,8 @@ recording_logs/
 daily_recording_log_*.txt
 operator_sessions_*.txt
 *.log
+task_report.raw.json
+categorize_config.txt
 
 # ── OS noise ─────────────────────────────────────────────────────────────
 .DS_Store

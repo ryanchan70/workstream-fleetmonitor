@@ -97,6 +97,41 @@
         .fb-status { font-size: 0.75rem; }
         .fb-status.ok { color: var(--accent-green); }
         .fb-status.err { color: #f87171; }
+        /* Status is set by hand in feedback.txt and only displayed here, so
+           this is a badge rather than a control — it must not look pressable. */
+        .fb-list { margin-top: 16px; }
+        .fb-list h2 {
+            font-size: 0.82rem;
+            font-weight: 600;
+            color: var(--text-muted);
+            margin: 0 0 8px;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+        }
+        .fb-entry {
+            display: flex;
+            gap: 10px;
+            align-items: flex-start;
+            padding: 9px 0;
+            border-top: 1px solid #141c29;
+        }
+        .fb-entry-body { flex: 1; min-width: 0; }
+        .fb-entry-text { color: var(--text-color); overflow-wrap: anywhere; }
+        .fb-entry-meta { font-size: 0.72rem; color: #4b5563; margin-top: 3px; }
+        .fb-badge {
+            flex-shrink: 0;
+            font-size: 0.68rem;
+            font-weight: 600;
+            padding: 3px 9px;
+            border-radius: 999px;
+            border: 1px solid;
+            white-space: nowrap;
+            text-transform: capitalize;
+        }
+        .fb-badge.submitted   { color: #9ca3af; border-color: #374151; background: #11161f; }
+        .fb-badge.seen        { color: #fbbf24; border-color: #78350f; background: #1a1408; }
+        .fb-badge.in-progress { color: #34d399; border-color: #065f46; background: #08170f; }
+        .fb-badge.implemented { color: #60a5fa; border-color: #1e40af; background: #0a1120; }
         .sr-only {
             position: absolute; width: 1px; height: 1px;
             padding: 0; margin: -1px; overflow: hidden;
@@ -194,6 +229,8 @@
             <span id="fb-status" class="fb-status"></span>
         </div>
     </div>
+
+    <div id="fb-list" class="fb-list"></div>
 
     <div id="doc" class="doc"><p class="status">Loading changelog…</p></div>
 </div>
@@ -307,11 +344,40 @@
             // the user typed.
             box.value = '';
             say('Thanks — got it.', 'ok');
+            loadFeedback();
         } catch (e) {
             say('Could not reach the server.', 'err');
         } finally {
             btn.disabled = false;
         }
+    }
+
+    async function loadFeedback() {
+        const wrap = document.getElementById('fb-list');
+        const token = localStorage.getItem(TOKEN_KEY);
+        if (!wrap || !token) return;
+        let items = [];
+        try {
+            const res = await fetch('/api/feedback', {
+                headers: { 'Authorization': 'Bearer ' + token }
+            });
+            if (!res.ok) return;
+            items = (await res.json()).feedback || [];
+        } catch (e) { return; }
+        if (!items.length) return;
+
+        wrap.innerHTML = '<h2>Suggestions</h2>' + items.map(f => {
+            const status = String(f.status || 'submitted');
+            return '<div class="fb-entry">' +
+                '<span class="fb-badge ' + esc(status.replace(/\s+/g, '-')) + '">' +
+                    esc(status) + '</span>' +
+                '<span class="fb-entry-body">' +
+                    '<span class="fb-entry-text">' + esc(f.text || '') + '</span>' +
+                    '<span class="fb-entry-meta">' + esc(f.who || 'anonymous') +
+                        ' &middot; ' + esc(f.when || '') + '</span>' +
+                '</span>' +
+            '</div>';
+        }).join('');
     }
 
     (async function load() {
@@ -334,6 +400,7 @@
             if (!res.ok) throw new Error('changelog ' + res.status);
             const data = await res.json();
             doc.innerHTML = renderMarkdown(data.markdown || '');
+            loadFeedback();
         } catch (e) {
             doc.innerHTML = '<p class="status">Could not load the changelog: ' +
                             esc(e.message || e) + '</p>';

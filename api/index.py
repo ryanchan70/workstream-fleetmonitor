@@ -33,6 +33,11 @@ _BOOTED = time.time()
 _REQUESTS = 0
 
 
+# vercel.json rewrites every /api/* request to this one function, and carries
+# the route it was actually for in this parameter. See _route_of().
+_ROUTE_PARAM = "__route"
+
+
 def _norm(path: str) -> str:
     """/api/foo and /foo both resolve to 'foo'."""
     p = urlparse(path).path.strip("/")
@@ -41,6 +46,29 @@ def _norm(path: str) -> str:
     elif p == "api":
         p = ""
     return p
+
+
+def _route_of(path: str) -> str:
+    """Which route this request is for.
+
+    Everything under /api/* is rewritten to the single api/index.py function.
+    WHICH path the function then sees depends on the Python builder Vercel
+    picks: the one that produces a function named `index` passes the request's
+    original path, and the one that produces `python` passes the rewrite's
+    destination — under which every route arrives as "index", matches nothing,
+    falls through to the auth gate, and the entire API answers 401. That is
+    not a config error to be found by reading vercel.json; the same commit
+    works or does not depending on which builder built it.
+
+    So the destination states the route explicitly, in a query parameter both
+    builders preserve. The path is still honoured when it carries a real route,
+    so calling the function directly — agent.py --serve, or /api/health typed
+    into a browser — keeps working with no rewrite in front of it.
+    """
+    q = parse_qs(urlparse(path).query).get(_ROUTE_PARAM)
+    if q and q[0].strip("/"):
+        return _norm("/" + q[0].lstrip("/"))
+    return _norm(path)
 
 
 class handler(BaseHTTPRequestHandler):
@@ -93,8 +121,9 @@ class handler(BaseHTTPRequestHandler):
     def do_GET(self):
         global _REQUESTS
         _REQUESTS += 1
-        route = _norm(self.path)
+        route = _route_of(self.path)
         qs = parse_qs(urlparse(self.path).query)
+        qs.pop(_ROUTE_PARAM, None)
 
         if route == "agent":
             # Who is driving the fleet loop, and how long ago. Unauthenticated
@@ -130,6 +159,11 @@ class handler(BaseHTTPRequestHandler):
                 "uptime_s": round(time.time() - _BOOTED, 1),
                 "requests": _REQUESTS,
                 "commands": R.CMD_COUNT,
+                # Across every container, accumulated by whichever one is
+                # polling. A floor rather than an exact figure: a container
+                # that only ever serves reads never writes, so its handful of
+                # commands is not in here.
+                "fleet_commands": self._fleet_commands(),
             })
 
         if route == "auth/status":
@@ -161,16 +195,20 @@ class handler(BaseHTTPRequestHandler):
                 return self._json(200, self._stats())
             if route == "stats_range":
                 return self._json(200, self._stats_range(qs))
+            if route == "day_tasks":
+                return self._json(200, self._day_tasks(qs))
             if route == "task_history":
                 return self._json(200, R.history_load().get("tasks") or {})
             if route == "logs":
                 return self._json(200, self._view().get("logs", []))
             if route == "changelog":
                 return self._json(200, {"markdown": self._changelog()})
+            if route == "new_changes":
+                return self._json(200, {"markdown": self._new_changes()})
             # Submissions are write-only from the page; this is how they get
             # read back out. Authenticated, like everything else here.
             if route == "feedback":
-                return self._json(200, {"feedback": R.feedback_read(100)})
+                return self._json(200, {"feedback": self._feedback()})
             if route == "locations":
                 return self._json(200, R.hgetall_json("locations"))
             if route == "poll":
@@ -202,7 +240,7 @@ class handler(BaseHTTPRequestHandler):
 
     # ── POST ─────────────────────────────────────────────────────────────
     def do_POST(self):
-        route = _norm(self.path)
+        route = _route_of(self.path)
         body = self._body()
 
         try:
@@ -230,6 +268,9 @@ class handler(BaseHTTPRequestHandler):
                 # request body — otherwise anyone could file feedback as
                 # someone else.
                 R.feedback_push({
+                    # Short and stable: it is what feedback.txt keys a status
+                    # off, so it has to survive being typed next to by hand.
+                    "id": secrets.token_hex(3),
                     "text": text,
                     "email": R.session_email(self._token()) or "",
                     "at": time.time(),
@@ -328,6 +369,77 @@ class handler(BaseHTTPRequestHandler):
             "frame_health_history": h.get("health") or [],
         }
 
+    @staticmethod
+    def _fleet_commands():
+        """Running Redis command total and the rate it implies."""
+        try:
+            c = (logic.load_state().get("poll") or {}).get("cmds") or {}
+        except Exception:
+            return None
+        total, since = float(c.get("n") or 0), float(c.get("since") or 0)
+        if not since:
+            return None
+        minutes = max((time.time() - since) / 60.0, 1 / 60.0)
+        return {"total": int(total), "since": since,
+                "per_min": round(total / minutes, 2),
+                "minutes": round(minutes, 1)}
+
+    # Statuses recognised in feedback.txt, in the order they progress.
+    FEEDBACK_STATUSES = ("submitted", "seen", "in progress", "implemented")
+
+    @staticmethod
+    def _feedback_statuses():
+        """Status per submission id, read from feedback.txt.
+
+        The submissions themselves live in Redis — a serverless filesystem is
+        read-only, so the page cannot append to a file. The file is the other
+        direction: it is edited by hand and deployed, and this is what it says
+        about each id. Anything it does not mention is still "submitted".
+
+        Format, one block per submission:
+
+            [a3f2c1] 2026-07-28 14:22  someone@example.com  status: seen
+            The text of the suggestion, over as many lines as it takes.
+        """
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "feedback.txt")
+        out = {}
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line.startswith("["):
+                        continue
+                    fid, _, rest = line[1:].partition("]")
+                    fid = fid.strip()
+                    if not fid or "status:" not in rest:
+                        continue
+                    status = rest.split("status:", 1)[1].strip().lower()
+                    # An unrecognised status would colour as nothing at all;
+                    # falling back keeps the badge meaningful.
+                    out[fid] = status if status in handler.FEEDBACK_STATUSES else "submitted"
+        except OSError:
+            pass
+        return out
+
+    def _feedback(self):
+        statuses = self._feedback_statuses()
+        out = []
+        for f in (R.feedback_read(100) or []):
+            if not isinstance(f, dict):
+                continue
+            e = dict(f)
+            e["id"] = C.feedback_id(e)
+            # Only enough of the address to tell two submitters apart. The
+            # page is behind the auth gate, but it is read by everyone who
+            # gets through it, not only by whoever wrote the entry.
+            addr = str(e.pop("email", "") or "")
+            e["who"] = (addr.split("@", 1)[0][:3] + "…") if addr else "anonymous"
+            e["status"] = statuses.get(e.get("id"), "submitted")
+            out.append(e)
+        return out
+
     def _changelog(self):
         """changelog.md, served to /changelog.html.
 
@@ -344,6 +456,24 @@ class handler(BaseHTTPRequestHandler):
                 return f.read()
         except OSError:
             return "# changelog\n\nNo changelog.md found in the deployment."
+
+    def _new_changes(self):
+        """new_changes.md, served to the dashboard's startup popup.
+
+        Same repo-root-plus-includeFiles setup as changelog.md, but this is
+        the short "what's new" blurb rather than the full history — the
+        client shows it once per distinct version of this text, not once per
+        deploy, so an empty/unchanged file means no popup rather than a blank
+        one.
+        """
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "new_changes.md")
+        try:
+            with open(path, encoding="utf-8") as f:
+                return f.read()
+        except OSError:
+            return ""
 
     def _stats(self):
         """Live counters plus the history arrays, for callers that want both.
@@ -405,6 +535,60 @@ class handler(BaseHTTPRequestHandler):
             "hours_by_pi": C.ranked(by_pi, hide_unnamed=True),
             "hours_by_operator": C.ranked(by_op),
         }
+
+    def _day_tasks(self, qs):
+        """Every completed task on a given day, for the ranking drill-downs.
+
+        Today is not served from here — the dashboard already holds today's
+        tasks in the history it fetches, and they change as the shift runs.
+        Past days are assembled from the per-rig session hashes, which is the
+        one remaining place that fans out across the fleet, so the result is
+        cached under its date. A past day cannot change, so that is a single
+        build ever, and every later request for it is one read.
+        """
+        date = (qs.get("date") or [""])[0].strip()
+        if not date or C.is_weekend(date):
+            return {"date": date, "tasks": []}
+
+        key = "daytasks:" + date
+        cached = R.jget(key)
+        if isinstance(cached, list):
+            return {"date": date, "tasks": cached, "cached": True}
+
+        hosts = [r.get("hostname")
+                 for r in ((self._view().get("devices") or {}).get("rigs") or [])
+                 if r.get("hostname")]
+        # The rates the backfill learned, so a session whose bytes contradict
+        # its wall clock is listed at the duration it actually recorded. One
+        # read, and only on the build — the cache below holds the result.
+        rates = R.jget("byte_rates") or {}
+        out = []
+        # One round trip for the fan-out. It is still one command per rig on
+        # the bill, which is why the answer is kept.
+        for host, stored in zip(hosts, R.hgetall_many_json("sessions:" + h for h in hosts)):
+            for sess in stored.values():
+                if not isinstance(sess, dict) or sess.get("date") != date:
+                    continue
+                dur, api_dur = C.session_durations(host, sess, rates)
+                if dur <= 0:
+                    continue
+                task = {
+                    "label": sess.get("label") or "",
+                    "operator": sess.get("operator") or "Unknown",
+                    "task": sess.get("task") or "Untitled task",
+                    "duration_s": dur,
+                    "start_time": sess.get("start_unix"),
+                }
+                # Only present when the two disagree; the dashboard shows it in
+                # red next to the duration above.
+                if api_dur is not None:
+                    task["duration_api_s"] = api_dur
+                out.append(task)
+
+        out.sort(key=lambda t: t.get("start_time") or 0, reverse=True)
+        if date != C.get_date_str():
+            R.jset(key, out)
+        return {"date": date, "tasks": out}
 
     def _summary(self, qs):
         """Everything a live tick needs, in ONE invocation and ONE Redis read.

@@ -888,6 +888,85 @@
         /* Who was on the rig and what they were doing when it fired — without
            this the panel says "storage low" and you still have to go find the
            tile to know whether anyone is affected. */
+        .rank-row { cursor: pointer; }
+        .rank-row:hover td { background: #131b28; }
+        .rank-caret {
+            display: inline-block;
+            width: 13px;
+            color: var(--text-muted);
+            font-size: 0.7rem;
+        }
+        .rank-detail td { padding: 0 !important; background: #0a0f18; }
+        .rank-detail-body {
+            padding: 7px 10px 9px 30px;
+            font-size: 0.78rem;
+            display: flex;
+            flex-direction: column;
+            gap: 3px;
+        }
+        .rank-task {
+            display: grid;
+            grid-template-columns: 108px 1fr auto auto;
+            gap: 10px;
+            align-items: baseline;
+            color: var(--text-color);
+        }
+        .rank-task-when { color: var(--text-muted); font-family: 'Geist Mono', monospace; font-size: 0.72rem; }
+        .rank-task-name { overflow-wrap: anywhere; }
+        .rank-task-who { color: #7c8798; }
+        .rank-task-dur { font-family: 'Geist Mono', monospace; color: #93c5fd; }
+        .rank-empty { color: var(--text-muted); }
+        @media (max-width: 600px) {
+            .rank-task { grid-template-columns: 1fr auto; }
+            .rank-task-when, .rank-task-who { font-size: 0.7rem; }
+        }
+        .dev-btn {
+            font-family: 'Geist Mono', monospace;
+            cursor: pointer;
+            background: transparent;
+        }
+        .dev-panel {
+            position: fixed;
+            right: 14px;
+            bottom: 14px;
+            z-index: 60;
+            width: min(340px, calc(100vw - 28px));
+            background: #070b12;
+            border: 1px solid #1f2937;
+            border-radius: 10px;
+            box-shadow: 0 12px 32px rgba(0,0,0,.55);
+            font-family: 'Geist Mono', monospace;
+            font-size: 0.74rem;
+        }
+        .dev-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 10px;
+            border-bottom: 1px solid #1f2937;
+            color: var(--text-muted);
+        }
+        .dev-close {
+            background: none; border: none; color: var(--text-muted);
+            font-size: 1rem; cursor: pointer; line-height: 1; padding: 0 2px;
+        }
+        .dev-body { padding: 9px 10px; }
+        .dev-row {
+            display: flex; justify-content: space-between; gap: 12px;
+            padding: 3px 0; color: var(--text-color);
+        }
+        .dev-row span:first-child { color: var(--text-muted); }
+        .dev-note { color: #4b5563; margin-top: 7px; line-height: 1.45; }
+        .dev-ok { color: var(--accent-green); }
+        .dev-off { color: #f59e0b; }
+        .rig-last { color: #7c8798; }
+        .alert-item-since {
+            float: right;
+            font-weight: 400;
+            font-size: 0.72rem;
+            color: #6b7280;
+            margin-left: 8px;
+        }
         .alert-item-who {
             display: block;
             margin-top: 3px;
@@ -942,12 +1021,15 @@
                 gap: 10px;
             }
             #logout-link { max-width: 100%; min-width: 0; }
-            /* The bell is pushed to the far right, matching where it sits on
-               desktop. `.bell-wrap` deliberately keeps position: relative —
-               making it static anchored the absolutely-positioned badge to
-               the page header instead of to the bell, which is why the count
-               appeared on the opposite side of the screen from the icon. */
-            .bell-wrap { order: 3; margin-left: auto; flex-shrink: 0; }
+            /* Pinned to the far left here — the opposite side from desktop,
+               where it sits at the end of the cluster — so it lands next to
+               the page edge instead of getting buried behind the sign-out
+               link on a narrow screen. `.bell-wrap` deliberately keeps
+               position: relative — making it static anchored the
+               absolutely-positioned badge to the page header instead of to
+               the bell, which is why the count appeared on the opposite side
+               of the screen from the icon. */
+            .bell-wrap { order: -1; margin-right: auto; flex-shrink: 0; }
             .alert-panel {
                 position: fixed;
                 top: 62px;
@@ -1055,6 +1137,65 @@
             to   { opacity: 1; transform: translateY(0); }
         }
 
+        /* ── "New changes" startup popup ──────────────────────────────────
+           Bottom-anchored rather than a top toast: it is not urgent like an
+           alert, and pinning it to the bottom keeps it out of the way of the
+           bell/alert panel that already lives up top. */
+        .new-changes-popup {
+            position: fixed;
+            left: 12px;
+            right: 12px;
+            bottom: 12px;
+            z-index: 70;
+            margin: 0 auto;
+            max-width: 460px;
+            background: var(--card-bg);
+            border: 1px solid #1f2937;
+            border-left: 4px solid var(--accent-blue);
+            border-radius: 10px;
+            box-shadow: 0 12px 32px rgba(0,0,0,0.5);
+            animation: ncp-in 0.2s ease-out;
+        }
+        @keyframes ncp-in {
+            from { opacity: 0; transform: translateY(10px); }
+            to   { opacity: 1; transform: translateY(0); }
+        }
+        .ncp-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            padding: 10px 8px 10px 14px;
+            border-bottom: 1px solid #1f2937;
+            font-size: 0.82rem;
+            font-weight: 700;
+        }
+        .ncp-close {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            font-size: 1.1rem;
+            line-height: 1;
+            cursor: pointer;
+            padding: 4px 8px;
+            border-radius: 6px;
+        }
+        .ncp-close:hover { color: var(--text-main); }
+        .ncp-close:focus-visible { outline: 2px solid var(--accent-blue); outline-offset: 2px; }
+        .ncp-body {
+            padding: 10px 14px 14px;
+            max-height: 40vh;
+            overflow-y: auto;
+            font-size: 0.8rem;
+            line-height: 1.55;
+            color: var(--text-main);
+        }
+        .ncp-body ul { margin: 6px 0; padding-left: 20px; }
+        .ncp-body li { margin: 4px 0; }
+        .ncp-body p { margin: 8px 0; }
+        .ncp-body strong { color: #fff; }
+        .ncp-body, .ncp-body li, .ncp-body p { overflow-wrap: anywhere; }
+
         /* ── Task history section ────────────────────────────────────────– */
         .task-history-container {
             max-height: 300px;
@@ -1081,11 +1222,23 @@
             .task-entry { font-size: 0.8rem; }
         }
         .task-pi-group { min-width: 0; }
+        /* The fleet API's own duration, shown only when the session's bytes
+           imply a different recording length. The figure in front of it is the
+           byte estimate — this red one is what it replaced. */
+        .dur-api { color: var(--accent-red); }
     </style>
 </head>
 <body>
 
 <div id="toast-host"></div>
+
+<div id="new-changes-popup" class="new-changes-popup hidden" aria-label="New changes">
+    <div class="ncp-head">
+        <span>New changes</span>
+        <button type="button" class="ncp-close" onclick="dismissNewChanges()" aria-label="Close">&times;</button>
+    </div>
+    <div id="new-changes-body" class="ncp-body"></div>
+</div>
 
 <div id="auth-gate" class="card">
     <h1 style="margin: 0 0 5px 0; font-size: 1.4rem;">ShiftIQ Fleet Monitor</h1>
@@ -1125,6 +1278,11 @@
 </div>
 
 <div id="dashboard" class="container hidden">
+    <div id="dev-panel" class="dev-panel hidden" aria-label="Dev console">
+        <div class="dev-head"><span>Dev console</span>
+            <button type="button" class="dev-close" onclick="toggleDevConsole(event)">&times;</button></div>
+        <div id="dev-body" class="dev-body">Loading…</div>
+    </div>
     <div class="full-width" style="position: relative;">
         <div class="top-right-bar">
             <div class="bell-wrap">
@@ -1146,6 +1304,8 @@
                     <div id="alert-panel-body"></div>
                 </div>
             </div>
+            <button type="button" id="dev-btn" class="top-bar-link dev-btn"
+                    onclick="toggleDevConsole(event)" title="Dev console">&lt;/&gt;</button>
             <a class="top-bar-link" href="/changelog.html">Changelog</a>
             <span id="logout-link" onclick="logout()">Sign out (<span id="session-email"></span>)</span>
         </div>
@@ -1236,7 +1396,7 @@
         <div class="stat-row" style="margin-bottom:0;">
             <div class="stat-box">
                 <div class="stat-value" id="stat-hours">—</div>
-                <div class="stat-label">Total Hours</div>
+                <div class="stat-label">Total Time</div>
             </div>
             <div class="stat-box">
                 <div class="stat-value" id="stat-fh-avg">—</div>
@@ -1247,6 +1407,10 @@
                 <div class="stat-label">Min Frame Health</div>
             </div>
             <div class="stat-box">
+                <div class="stat-value" id="stat-fh-overall">—</div>
+                <div class="stat-label">Overall Frame Health</div>
+            </div>
+            <div class="stat-box">
                 <div class="stat-value" id="stat-active">—</div>
                 <div class="stat-label">Recording Now</div>
             </div>
@@ -1255,6 +1419,7 @@
                 <div class="stat-label">Total Rigs</div>
             </div>
         </div>
+        <div id="stat-fh-counts" style="font-size:0.72rem;color:var(--text-muted);margin-top:6px;"></div>
 
         <div class="card-body" id="stats-charts-body" style="margin-top:16px;">
             <!-- Row 1: full-width daily hours bar (scrollable) -->
@@ -1348,7 +1513,15 @@
             <div class="card-header" onclick="toggleCard('task-history-body','task-chev','task-collapsed')">
                 <div style="display: flex; gap: 12px; align-items: center;">
                     <h2 style="margin: 0;">Completed Task History</h2>
-                    <button class="sort-reverse-btn" id="task-reverse-btn" onclick="toggleTaskReverse()" title="Reverse sort order" style="margin-top: 0;">⇅</button>
+                    <!-- The header collapses the card on click, so a control
+                         living inside it has to stop the event travelling —
+                         otherwise reversing the order also minimised the
+                         section. Same guard the rig card's controls use. -->
+                    <span onclick="event.stopPropagation()" style="display: inline-flex;">
+                        <button type="button" class="sort-reverse-btn" id="task-reverse-btn"
+                                onclick="toggleTaskReverse(event)" title="Reverse sort order"
+                                style="margin-top: 0;">⇅</button>
+                    </span>
                 </div>
                 <span class="chevron" id="task-chev">▾</span>
             </div>
@@ -1633,7 +1806,7 @@
             const data = await res.json().catch(() => ({}));
             if (res.ok && data.ok) {
                 localStorage.setItem(TOKEN_KEY, data.token);
-                enterDashboard(email);
+                enterDashboard(email, true);
                 return;
             }
 
@@ -1710,7 +1883,7 @@
                 return;
             }
             localStorage.setItem(TOKEN_KEY, data.token);
-            enterDashboard(email);
+            enterDashboard(email, true);
         } catch (e) {
             errEl.textContent = 'Could not reach the local dashboard server at ' + API_BASE + '.';
         } finally {
@@ -1733,7 +1906,11 @@
         resetAuth();
     }
 
-    function enterDashboard(email) {
+    // `fromLogin` is true only when the user has just pressed Sign in or
+    // Verify. That press is the user gesture the Notifications API requires,
+    // and it is the one moment where being asked makes sense — restoring a
+    // stored session later is not a gesture and must not prompt.
+    function enterDashboard(email, fromLogin) {
         document.getElementById('auth-gate').classList.add('hidden');
         document.getElementById('dashboard').classList.remove('hidden');
         document.getElementById('session-email').textContent = email;
@@ -1752,12 +1929,26 @@
         if (!SECURE_OK || !NOTIF_SUPPORTED) {
             notifHelp(notifBlockedReason());
         }
+        // Asked once, on the way in. Chrome permanently blocks a site that
+        // requests outside a gesture, and only 'default' is worth asking about
+        // — 'denied' cannot be re-prompted and 'granted' has nothing to ask.
+        if (fromLogin && NOTIF_SUPPORTED && SECURE_OK &&
+            Notification.permission === 'default') {
+            Notification.requestPermission().then(p => {
+                if (p !== 'granted') return;
+                notifEnabled = true;
+                try { localStorage.setItem('fleet_notif_enabled', '1'); } catch (e) {}
+                setNotifUI();
+            }).catch(() => {});
+        }
         setNotifUI();
         setPollUI();
         setSoundUI();
         setPollRateUI();
         syncSortUI();
         hydrateFromCache();
+        reportAgent();
+        loadNewChanges();
         // Forced: a tab that just opened has nothing to show, and might not
         // win the poll lease. The server's cadence gate makes this cheap if
         // another device polled moments ago.
@@ -2173,6 +2364,7 @@
                 else stats.push('Not currently online');
             } else {
                 if (r.status === 'recording') stats.push('&#9201; ' + esc(r.duration_label));
+                else stats.push(lastTaskLine(r.hostname));
                 if (r.frame_health_pct != null) stats.push('&#127902; ' + r.frame_health_pct.toFixed(1) + '%');
                 if (r.upload_speed_label) stats.push('&#11014; ' + esc(r.upload_speed_label));
                 if (r.storage_free_gb != null && r.storage_free_pct != null) stats.push('&#128190; ' + r.storage_free_gb.toFixed(0) + ' GB (' + r.storage_free_pct.toFixed(0) + '%) free');
@@ -2187,12 +2379,39 @@
             return `<div class="rig-tile${crit ? ' critical' : ''}${servicing ? ' servicing' : ''}">
                 <div class="rig-name"><span class="rig-badge ${badgeClass(r.status)}">${esc(r.status)}</span>${esc(r.label)}</div>
                 <div class="rig-meta">${meta.join('<br>') || '<span style="opacity:.5">—</span>'}</div>
-                <div class="rig-stats">${stats.join(' &middot; ') || ''}</div>
+                <div class="rig-stats">${stats.filter(Boolean).join(' &middot; ')}</div>
                 ${thermalBadges(r)}
                 ${alertLines}
                 ${serviceNote(r)}
             </div>`;
         }).join('');
+    }
+
+    // What a rig that is not recording was last doing. Read from the task
+    // history the page already holds — the server bumps its version the moment
+    // a recording stops, so this is current without costing a request.
+    function lastTaskLine(hostname) {
+        const items = (histCache.task_history || {})[hostname];
+        if (!items || !items.length) return '';
+        // Newest first from the server, but a live record and a backfilled one
+        // can arrive out of order; take the latest end, not the latest start.
+        let best = null;
+        for (const t of items) {
+            const end = (Number(t.start_time) || 0) + (Number(t.duration_s) || 0);
+            if (end && (!best || end > best.end)) best = { end, t };
+        }
+        if (!best) return '';
+        const d = new Date(best.end * 1000);
+        if (Number.isNaN(d.getTime())) return '';
+        const p = n => String(n).padStart(2, '0');
+        const when = p(d.getHours()) + ':' + p(d.getMinutes()) +
+                     ' ' + p(d.getMonth() + 1) + '/' + p(d.getDate());
+        const bits = [taskLabel(best.t)];
+        const op = String(best.t.operator || '').trim();
+        if (op && !/^(unknown|none|n\/a|-)$/i.test(op)) bits.push(op);
+        return '<span class="rig-last" title="End of the last completed task">' +
+               '&#8617; ' + esc(bits.join(' / ')) + ' &mdash; ended ' + esc(when) +
+               '</span>';
     }
 
     // ── Notifications (W3C Notifications API) ────────────────────────────
@@ -2334,6 +2553,69 @@
         setTimeout(() => el.remove(), 6000);
     }
 
+    // ── "New changes" popup ────────────────────────────────────────────
+    // Content lives in new_changes.md at the repo root (same place as
+    // changelog.md) and is served the same way, behind the auth gate. The
+    // popup is keyed off the file's own content rather than a version number
+    // someone has to remember to bump — editing the file is what makes it
+    // reappear, and reappear exactly once, for everyone who hasn't already
+    // seen that text.
+    const NEW_CHANGES_SEEN_KEY = 'fleet_new_changes_seen';
+
+    // Same small inline-Markdown subset changelog.html renders, minus
+    // headings/rules — this is a short "what's new" blurb, not a document.
+    function renderNewChangesInline(text) {
+        let s = esc(text);
+        s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
+        s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+        s = s.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+        return s;
+    }
+
+    function renderNewChangesMarkdown(md) {
+        const out = [];
+        let inList = false;
+        const closeList = () => { if (inList) { out.push('</ul>'); inList = false; } };
+        for (const raw of md.replace(/\r\n/g, '\n').split('\n')) {
+            const line = raw.trim();
+            if (!line || /^#{1,6}\s/.test(line)) { continue; }
+            const bullet = line.match(/^[-*+]\s+(.*)$/);
+            if (bullet) {
+                if (!inList) { out.push('<ul>'); inList = true; }
+                out.push('<li>' + renderNewChangesInline(bullet[1]) + '</li>');
+                continue;
+            }
+            closeList();
+            out.push('<p>' + renderNewChangesInline(line) + '</p>');
+        }
+        closeList();
+        return out.join('\n');
+    }
+
+    function dismissNewChanges(markdown) {
+        document.getElementById('new-changes-popup').classList.add('hidden');
+        if (markdown != null) {
+            try { localStorage.setItem(NEW_CHANGES_SEEN_KEY, markdown); } catch (e) {}
+        }
+    }
+
+    async function loadNewChanges() {
+        try {
+            const res = await fetch(API_BASE + '/new_changes', { headers: { ...authHeaders() } });
+            if (!res.ok) return;
+            const data = await res.json();
+            const md = String(data.markdown || '').trim();
+            if (!md) return;
+            let seen = '';
+            try { seen = localStorage.getItem(NEW_CHANGES_SEEN_KEY) || ''; } catch (e) {}
+            if (md === seen) return;
+            document.getElementById('new-changes-body').innerHTML = renderNewChangesMarkdown(md);
+            const popup = document.getElementById('new-changes-popup');
+            popup.classList.remove('hidden');
+            popup.querySelector('.ncp-close').onclick = () => dismissNewChanges(md);
+        } catch (e) { /* best-effort — no popup if the API is unreachable */ }
+    }
+
     async function showNotification(title, body, kind) {
         // Always show the in-page toast.
         toast(title, body, kind);
@@ -2390,34 +2672,83 @@
             if (!notifiedAlerts.has(key)) {
                 notifiedAlerts.add(key);
                 playNotificationSound();
+                const { header, message } = alertHeaderMessage(a);
                 const resolved = /resolved|cleared/i.test(a.kind) || /resolved/i.test(a.message || '');
-                showNotification((resolved ? '✅ ' : '\u{1F534} ') + a.rig,
-                                 a.message,
-                                 resolved ? 'ok' : 'crit');
+                const icon = a.kind === 'recording_stopped' ? '' : (resolved ? '✅ ' : '\u{1F534} ');
+                showNotification(icon + header, message, resolved ? 'ok' : 'crit');
             }
         });
         [...notifiedAlerts].forEach(k => { if (!current.has(k)) notifiedAlerts.delete(k); });
-        renderAlertBell(alerts);
+        mergeNotifStore(alerts);
+        renderAlertBell();
     }
 
     // ── Notification bell ────────────────────────────────────────────────
-    // "Unresolved" is every monitored alert the server is still reporting,
-    // minus the resolved/cleared ones. notify=false is deliberately NOT a
-    // filter here: that flag only suppresses re-notifying during the quiet
-    // period, and a rig that has been low on disk all afternoon is exactly
-    // what the bell should keep showing.
+    // The bell is a notification CENTRE, not a live status board: every alert
+    // the server has ever reported is kept (see notifStore below) until a
+    // person acknowledges it, so "unresolved" here just means "not yet acked"
+    // rather than "still present in the latest poll".
     function isResolvedAlert(a) {
         return /resolved|cleared/i.test(a.kind || '') || /resolved/i.test(a.message || '');
+    }
+
+    // ── Notification history ─────────────────────────────────────────────
+    // The live payload from the server only ever contains conditions that are
+    // true THIS poll. That's correct for the server (it debounces re-alerting,
+    // not visibility), but a one-shot event like "stopped recording" is only
+    // ever in that payload for the single poll it fired on — the next poll it
+    // is simply gone, so the bell dropped it almost as soon as it appeared.
+    // This store is the fix: every alert seen is kept, across polls and across
+    // page loads, until it is acknowledged.
+    //
+    // Keyed hostname|kind|since rather than hostname|kind: `since` stays fixed
+    // for as long as one continuous condition is true (see the server's
+    // active_alerts tracking), so re-observing the same fault updates one
+    // entry in place — but a *new* incident (or a fresh one-shot event like
+    // another recording stopping) gets a new `since` and so a new entry,
+    // exactly like a fresh notification should.
+    const NOTIF_STORE_KEY = 'fleet_notif_store';
+    const NOTIF_STORE_MAX = 300;
+    let notifStore = new Map();
+    try {
+        const raw = JSON.parse(localStorage.getItem(NOTIF_STORE_KEY) || '[]');
+        if (Array.isArray(raw)) raw.forEach(a => notifStore.set(alertKey(a), a));
+    } catch (e) {}
+
+    function alertKey(a) { return (a.hostname || '') + '|' + (a.kind || '') + '|' + (a.since || ''); }
+
+    function saveNotifStore() {
+        try {
+            // Bounded so months of one-shot events cannot grow this forever.
+            // Newest-first, so a cap only ever drops the oldest history.
+            const arr = [...notifStore.values()]
+                .sort((a, b) => (Number(b.since) || 0) - (Number(a.since) || 0))
+                .slice(0, NOTIF_STORE_MAX);
+            notifStore = new Map(arr.map(a => [alertKey(a), a]));
+            localStorage.setItem(NOTIF_STORE_KEY, JSON.stringify(arr));
+        } catch (e) {}
+    }
+
+    // Nothing is ever removed here — only acknowledging (resolveAlert) or the
+    // size cap in saveNotifStore drops an entry.
+    function mergeNotifStore(alerts) {
+        let changed = false;
+        (alerts || []).forEach(a => {
+            const key = alertKey(a);
+            const prev = notifStore.get(key);
+            if (!prev || prev.message !== a.message || prev.operator !== a.operator ||
+                prev.task !== a.task || prev.notify !== a.notify) {
+                changed = true;
+            }
+            notifStore.set(key, a);
+        });
+        if (changed) saveNotifStore();
     }
 
     // ── Acknowledged alerts ──────────────────────────────────────────────
     // "Resolve" here means acknowledged by a person, and is local to this
     // browser — the fleet API has no ack endpoint, and inventing one would
     // let one operator silence a real fault for everybody.
-    //
-    // Keyed hostname|kind, not by message: the storage message carries the
-    // live GB figure, so a message key would un-acknowledge itself on the
-    // next poll as the number drifted.
     const ACK_KEY = 'fleet_acked_alerts';
     let ackedAlerts = new Set();
     try {
@@ -2429,36 +2760,34 @@
         try { localStorage.setItem(ACK_KEY, JSON.stringify([...ackedAlerts])); } catch (e) {}
     }
 
-    function alertKey(a) { return (a.hostname || '') + '|' + (a.kind || ''); }
-
     function resolveAlert(evt, key) {
         if (evt) evt.stopPropagation();
         ackedAlerts.add(key);
         saveAcked();
-        if (lastDevData) renderAlertBell(lastDevData.alerts);
+        renderAlertBell();
     }
 
     function unresolveAlert(evt, key) {
         if (evt) evt.stopPropagation();
         ackedAlerts.delete(key);
         saveAcked();
-        if (lastDevData) renderAlertBell(lastDevData.alerts);
+        renderAlertBell();
     }
 
     function resolveAllAlerts(evt) {
         if (evt) evt.stopPropagation();
-        unresolvedAlerts(lastDevData && lastDevData.alerts).forEach(a => ackedAlerts.add(alertKey(a)));
+        unresolvedAlerts().forEach(a => ackedAlerts.add(alertKey(a)));
         saveAcked();
-        if (lastDevData) renderAlertBell(lastDevData.alerts);
+        renderAlertBell();
     }
 
-    // Acknowledgement lasts only as long as the condition does. Once the
-    // server stops reporting an alert, its key is dropped so the same fault
-    // recurring next week raises the bell again instead of staying silenced
-    // forever.
-    function pruneAcked(alerts) {
+    // An acked key is dropped once its entry falls out of notifStore entirely
+    // (evicted by the size cap) — otherwise acks would accumulate forever.
+    // A fault recurring later gets a fresh `since` and so a fresh key, which
+    // is what actually makes the bell ring again for it; this is just cleanup.
+    function pruneAcked() {
         if (!ackedAlerts.size) return;
-        const live = new Set((alerts || []).map(alertKey));
+        const live = new Set(notifStore.keys());
         let changed = false;
         [...ackedAlerts].forEach(k => {
             if (!live.has(k)) { ackedAlerts.delete(k); changed = true; }
@@ -2466,24 +2795,49 @@
         if (changed) saveAcked();
     }
 
-    function unresolvedAlerts(alerts) {
-        return (alerts || []).filter(a =>
+    function unresolvedAlerts() {
+        return [...notifStore.values()].filter(a =>
             isMonitored(a.hostname) && !isResolvedAlert(a) && !ackedAlerts.has(alertKey(a)));
     }
 
-    // Alerts carry only hostname/kind/message, so the operator and task come
-    // from the matching rig in the same payload.
-    function alertWho(a) {
-        const rig = (knownRigs || []).find(r => r.hostname === a.hostname);
-        // clean_str() on the server fills missing fields with "Unknown", which
-        // as a subtitle reads like a fact ("Unknown · Unknown") rather than
-        // an absence. Blank is better.
+    // A recording-stopped notification is a point-in-time event, not an
+    // ongoing condition — its "message" is who was on the rig and what they
+    // were doing, not a generic "Pi stopped recording" line, and its header
+    // names the rig directly rather than relying on the subtitle for that.
+    function alertHeaderMessage(a) {
         const known = v => {
             const s = String(v ?? '').trim();
             return (!s || /^(unknown|none|n\/a|—|-)$/i.test(s)) ? '' : s;
         };
-        const op = known(rig && rig.operator) || known(a.operator);
-        const task = known(rig && rig.task) || known(a.task);
+        if (a.kind === 'recording_stopped') {
+            // The alert's own snapshot is authoritative (it's who was on the
+            // rig at the moment it stopped), but fall back to the rig's
+            // current state if that snapshot is missing for any reason —
+            // otherwise this reads "No operator or task recorded" even while
+            // the stat boxes, fed from the same rig, show both.
+            const rig = (knownRigs || []).find(r => r.hostname === a.hostname);
+            const op = known(a.operator) || known(rig && rig.operator);
+            const task = known(a.task) || known(rig && rig.task);
+            const message = [op, task].filter(Boolean).join(', ') || 'No operator or task recorded';
+            return { header: (a.rig || a.hostname || '') + ' stopped recording', message, skipWho: true };
+        }
+        return { header: a.rig || a.hostname || '', message: a.message || '', skipWho: false };
+    }
+
+    // Who was on the rig and what they were doing, for alert kinds that don't
+    // already fold that into their message (see alertHeaderMessage above).
+    function alertWho(a) {
+        const known = v => {
+            const s = String(v ?? '').trim();
+            return (!s || /^(unknown|none|n\/a|—|-)$/i.test(s)) ? '' : s;
+        };
+        // A snapshot alert carries the operator/task that were actually on the
+        // rig when it fired; prefer that over the rig's current state, which
+        // may already have moved on. Live conditions (storage, frame health,
+        // ...) don't carry their own operator/task and fall through to it.
+        const rig = (knownRigs || []).find(r => r.hostname === a.hostname);
+        const op = known(a.operator) || known(rig && rig.operator);
+        const task = known(a.task) || known(rig && rig.task);
         if (!op && !task) return '';
         const parts = [];
         if (op) parts.push('<span class="aw-op">' + esc(op) + '</span>');
@@ -2491,17 +2845,36 @@
         return '<span class="alert-item-who">' + parts.join(' &middot; ') + '</span>';
     }
 
+    // How long the condition has been true. The server stamps it when the
+    // alert first appears and carries it while it lasts, so this is the age of
+    // the fault and not of the poll that last reported it.
+    function alertSince(a) {
+        const ms = Number(a.since) * 1000;
+        if (!ms || Number.isNaN(ms)) return '';
+        const mins = Math.max(0, Math.round((Date.now() - ms) / 60000));
+        const ago = mins < 1 ? 'just now'
+            : mins < 60 ? mins + 'm'
+            : mins < 1440 ? Math.floor(mins / 60) + 'h ' + (mins % 60) + 'm'
+            : Math.floor(mins / 1440) + 'd';
+        const p = n => String(n).padStart(2, '0');
+        const d = new Date(ms);
+        return '<span class="alert-item-since" title="Since ' +
+               esc(p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds()) +
+                   ' ' + p(d.getMonth() + 1) + '/' + p(d.getDate())) + '">' +
+               esc(ago) + '</span>';
+    }
+
     // Acknowledged but still true on the fleet. Kept visible so the panel
     // shows the whole picture, not just what is still shouting.
-    function acknowledgedAlerts(alerts) {
-        return (alerts || []).filter(a =>
+    function acknowledgedAlerts() {
+        return [...notifStore.values()].filter(a =>
             isMonitored(a.hostname) && !isResolvedAlert(a) && ackedAlerts.has(alertKey(a)));
     }
 
-    function renderAlertBell(alerts) {
-        pruneAcked(alerts);
-        const list  = unresolvedAlerts(alerts);
-        const done  = acknowledgedAlerts(alerts);
+    function renderAlertBell() {
+        pruneAcked();
+        const list  = unresolvedAlerts();
+        const done  = acknowledgedAlerts();
         const bell  = document.getElementById('alert-bell');
         const badge = document.getElementById('bell-badge');
         const body  = document.getElementById('alert-panel-body');
@@ -2514,14 +2887,16 @@
             ? list.length + ' unresolved alert' + (list.length === 1 ? '' : 's')
             : 'No unresolved alerts';
 
-        const item = (a, done) =>
-            '<div class="alert-item' + (done ? ' resolved' : '') + '">' +
+        const item = (a, done) => {
+            const { header, message, skipWho } = alertHeaderMessage(a);
+            return '<div class="alert-item' + (done ? ' resolved' : '') + '">' +
                 '<span class="alert-dot' +
                     (done ? ' done' : (/warn/i.test(a.kind || '') ? ' warn' : '')) + '"></span>' +
                 '<span class="alert-item-body">' +
-                    '<span class="alert-item-rig">' + esc(a.rig || a.hostname || '') + '</span>' +
-                    '<span class="alert-item-msg">' + esc(a.message || '') + '</span>' +
-                    alertWho(a) +
+                    '<span class="alert-item-rig">' + esc(header) +
+                        alertSince(a) + '</span>' +
+                    '<span class="alert-item-msg">' + esc(message) + '</span>' +
+                    (skipWho ? '' : alertWho(a)) +
                 '</span>' +
                 '<button type="button" class="alert-resolve' + (done ? ' undo' : '') + '" ' +
                     'title="' + (done ? 'Move back to unresolved' : 'Acknowledge in this browser') + '" ' +
@@ -2529,6 +2904,7 @@
                     '(event, \'' + jsAttr(alertKey(a)) + '\')">' +
                     (done ? 'Undo' : 'Resolve') + '</button>' +
             '</div>';
+        };
 
         // Resolved alerts stay in the panel — the condition is still true on
         // the fleet, it has just been acknowledged — but drop out of the count
@@ -2768,21 +3144,127 @@
         }
     }
 
+    // ── Ranking drill-downs ──────────────────────────────────────────────
+    //
+    // Each row in the two ranking tables expands to the tasks behind its
+    // total. Today's come from the task history the page already holds; a
+    // past day is fetched once and kept, since a finished day cannot change.
+    const openRanks = new Set();
+    const dayTaskCache = {};
+
+    function rankKey(kind, name) { return kind + '|' + name; }
+
+    function rankRow(kind, i, entry) {
+        const key = rankKey(kind, entry.name);
+        const open = openRanks.has(key);
+        return '<tr class="rank-row' + (open ? ' open' : '') +
+                   '" onclick="toggleRank(\'' + jsAttr(key) + '\')">' +
+                '<td>' + (i + 1) + '</td>' +
+                '<td><span class="rank-caret">' + (open ? '▾' : '▸') + '</span>' +
+                    '<strong>' + esc(entry.name) + '</strong></td>' +
+                '<td style="text-align: right;"><span class="time-badge">' +
+                    esc(entry.duration) + '</span></td></tr>' +
+            '<tr class="rank-detail' + (open ? '' : ' hidden') + '" data-key="' + esc(key) + '">' +
+                '<td colspan="3"><div class="rank-detail-body">Loading…</div></td></tr>';
+    }
+
+    function toggleRank(key) {
+        if (openRanks.has(key)) openRanks.delete(key);
+        else openRanks.add(key);
+        if (lastRangeData) renderRangeStats(lastRangeData);
+    }
+
+    // Every task in the selected day(s), whatever the source.
+    async function selectionTasks() {
+        const days = [...(selectedDays || [])].sort().filter(d => !isWeekend(d));
+        const today = todayISO();
+        let out = [];
+        for (const d of days) {
+            if (d === today) {
+                // Already on the page, and current to the last completed run.
+                Object.values(histCache.task_history || {}).forEach(list => {
+                    (list || []).forEach(t => {
+                        const end = (Number(t.start_time) || 0) + (Number(t.duration_s) || 0);
+                        if (end && new Date(end * 1000).toISOString().slice(0, 10) &&
+                            sameLocalDay(end * 1000, today)) out.push(t);
+                    });
+                });
+                continue;
+            }
+            if (!dayTaskCache[d]) {
+                try {
+                    const res = await fetch(API_BASE + '/day_tasks?date=' + encodeURIComponent(d),
+                                            { headers: { ...authHeaders() } });
+                    dayTaskCache[d] = res.ok ? ((await res.json()).tasks || []) : [];
+                } catch (e) { dayTaskCache[d] = []; }
+            }
+            out = out.concat(dayTaskCache[d]);
+        }
+        return out;
+    }
+
+    function sameLocalDay(ms, iso) {
+        const d = new Date(ms);
+        const p = n => String(n).padStart(2, '0');
+        return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) === iso;
+    }
+
+    async function fillRankDetail(key) {
+        const cell = document.querySelector('.rank-detail[data-key="' + CSS.escape(key) + '"] .rank-detail-body');
+        if (!cell) return;
+        const [kind, name] = [key.slice(0, key.indexOf('|')), key.slice(key.indexOf('|') + 1)];
+        const all = await selectionTasks();
+        const mine = all.filter(t => kind === 'pi'
+            ? String(t.label || '') === name
+            : String(t.operator || 'Unknown') === name);
+        if (!mine.length) {
+            cell.innerHTML = '<span class="rank-empty">No individual tasks recorded for this selection.</span>';
+            return;
+        }
+        mine.sort((a, b) => (b.start_time || 0) - (a.start_time || 0));
+        cell.innerHTML = mine.map(t =>
+            '<div class="rank-task">' +
+                '<span class="rank-task-when">' + esc(formatStart(t)) + '</span>' +
+                '<span class="rank-task-name">' + esc(taskLabel(t)) + '</span>' +
+                // A rig row lists who ran each task; an operator row lists
+                // which rig they ran it on. Neither repeats the row's own name.
+                '<span class="rank-task-who">' +
+                    esc(kind === 'pi' ? (t.operator || '') : (t.label || '')) + '</span>' +
+                '<span class="rank-task-dur">' + esc(formatDuration(t.duration_s)) +
+                    apiDurationHtml(t) + '</span>' +
+            '</div>').join('');
+    }
+
+    let lastRangeData = null;
+
+    // "53.45 h" makes you do the minutes math yourself; "53h27m" doesn't.
+    function fmtHoursMins(hours) {
+        const totalMin = Math.round(hours * 60);
+        const h = Math.floor(totalMin / 60);
+        const m = totalMin % 60;
+        return h + 'h' + String(m).padStart(2, '0') + 'm';
+    }
+
     function renderRangeStats(rangeData) {
+        lastRangeData = rangeData;
         const _unnamedPiRe = /^rpi\d*-[0-9a-f]{4}-[0-9a-f]{4}$/i;
 
         document.getElementById('stat-hours').textContent =
-            rangeData.total_hours != null ? rangeData.total_hours.toFixed(2) + ' h' : '—';
+            rangeData.total_hours != null ? fmtHoursMins(rangeData.total_hours) : '—';
 
         const piRows = (rangeData.hours_by_pi || []).filter(p => !_unnamedPiRe.test(p.name));
-        document.getElementById('pi-rankings').innerHTML = piRows.length ? piRows.map((p, i) =>
-            `<tr><td>${i+1}</td><td><strong>${p.name}</strong></td><td style="text-align: right;"><span class="time-badge">${p.duration}</span></td></tr>`
-        ).join('') : '<tr><td colspan="3" style="color:var(--text-muted)">No metrics for the selected day(s).</td></tr>';
+        document.getElementById('pi-rankings').innerHTML = piRows.length
+            ? piRows.map((p, i) => rankRow('pi', i, p)).join('')
+            : '<tr><td colspan="3" style="color:var(--text-muted)">No metrics for the selected day(s).</td></tr>';
 
         const opRows = rangeData.hours_by_operator || [];
-        document.getElementById('operator-rankings').innerHTML = opRows.length ? opRows.map((o, i) =>
-            `<tr><td>${i+1}</td><td><strong>${o.name}</strong></td><td style="text-align: right;"><span class="time-badge">${o.duration}</span></td></tr>`
-        ).join('') : '<tr><td colspan="3" style="color:var(--text-muted)">No metrics for the selected day(s).</td></tr>';
+        document.getElementById('operator-rankings').innerHTML = opRows.length
+            ? opRows.map((o, i) => rankRow('op', i, o)).join('')
+            : '<tr><td colspan="3" style="color:var(--text-muted)">No metrics for the selected day(s).</td></tr>';
+
+        // A row that was open before the re-render stays open, so the table
+        // refreshing under a poll does not close what is being read.
+        openRanks.forEach(k => fillRankDetail(k));
 
         const piData   = piRows.slice(0, 10);
         const piLabels = piData.map(p => p.name);
@@ -2889,6 +3371,19 @@
         return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
     }
 
+    // The fleet API's duration for a session, in red parentheses, but only
+    // when it disagrees with what the recording's bytes imply. duration_s is
+    // then the byte estimate the backend actually counted, and duration_api_s
+    // is the wall-clock span it rejected; sessions where the two agree carry
+    // no duration_api_s at all and render exactly as before.
+    function apiDurationHtml(task) {
+        if (task.duration_api_s === null || task.duration_api_s === undefined) return '';
+        const api = esc(formatDuration(task.duration_api_s));
+        return ' <span class="dur-api" title="Fleet API reported ' + api +
+               ' for this recording; its size implies the duration shown, ' +
+               'so that is what is counted">(' + api + ')</span>';
+    }
+
     const SESSION_NAME_RE = /^(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})/;
 
     // Renders the session start as "mm/dd hh:mm:ss".
@@ -2924,7 +3419,8 @@
     let taskHistoryReverse = false;
     try { taskHistoryReverse = localStorage.getItem('fleet_task_history_reverse') === '1'; } catch (e) {}
 
-    function toggleTaskReverse() {
+    function toggleTaskReverse(evt) {
+        if (evt) evt.stopPropagation();
         taskHistoryReverse = !taskHistoryReverse;
         localStorage.setItem('fleet_task_history_reverse', taskHistoryReverse ? '1' : '0');
         const btn = document.getElementById('task-reverse-btn');
@@ -2959,7 +3455,7 @@
                 const startStr = formatStart(task);
                 const dur = formatDuration(task.duration_s);
                 const taskName = taskLabel(task);
-                html += `<div class="task-entry">${esc(startStr)} — ${esc(task.operator)} / ${esc(taskName)} (${dur})</div>`;
+                html += `<div class="task-entry">${esc(startStr)} — ${esc(task.operator)} / ${esc(taskName)} (${dur})${apiDurationHtml(task)}</div>`;
             });
             html += '</div>';
         });
@@ -2991,6 +3487,26 @@
         minEl.title = el.title;
         if (!fhLive && s.min_frame_health_pct != null) minEl.style.opacity = '0.65';
         else minEl.style.opacity = '';
+
+        // Total frames captured over total frames expected, fleet-wide — the
+        // real capture rate, as opposed to avg/min which weigh every rig the
+        // same regardless of how much it actually recorded.
+        const overallEl = document.getElementById('stat-fh-overall');
+        overallEl.textContent = s.overall_frame_health_pct != null
+            ? s.overall_frame_health_pct.toFixed(1) + '%' : '—';
+        overallEl.className = 'stat-value ' + healthClass(s.overall_frame_health_pct);
+        overallEl.title = el.title;
+        if (!fhLive && s.overall_frame_health_pct != null) overallEl.style.opacity = '0.65';
+        else overallEl.style.opacity = '';
+
+        const countsEl = document.getElementById('stat-fh-counts');
+        if (countsEl) {
+            countsEl.textContent = (s.frames_captured_total != null && s.frames_expected_total != null)
+                ? s.frames_captured_total.toLocaleString() + ' / ' +
+                  s.frames_expected_total.toLocaleString() + ' frames captured' +
+                  (s.frames_dropped_total != null ? ' · ' + s.frames_dropped_total.toLocaleString() + ' dropped' : '')
+                : '';
+        }
 
         document.getElementById('stat-active').textContent =
             s.active_recording_rigs != null ? s.active_recording_rigs : '—';
@@ -3079,6 +3595,7 @@
         });
         const avgData = hist.map(h => h.avg);
         const minData = hist.map(h => h.min);
+        const overallData = hist.map(h => h.overall);
         sizeChartInner('fh-chart-inner', Math.ceil(labels.length / 12), 26, 300);
 
         if (!fhChart) {
@@ -3111,6 +3628,17 @@
                             borderWidth: 1.5,
                             borderDash: [4, 3],
                             spanGaps: true,
+                        },
+                        {
+                            label: 'Overall %',
+                            data: overallData,
+                            borderColor: '#3b82f6',
+                            backgroundColor: 'transparent',
+                            fill: false,
+                            tension: 0.3,
+                            pointRadius: 0,
+                            borderWidth: 1.5,
+                            spanGaps: true,
                         }
                     ]
                 },
@@ -3138,6 +3666,7 @@
             fhChart.data.labels = labels;
             fhChart.data.datasets[0].data = avgData;
             fhChart.data.datasets[1].data = minData;
+            fhChart.data.datasets[2].data = overallData;
             fhChart.update('none');
         }
     }
@@ -3158,6 +3687,83 @@
         // Failures also print the detail on the page, not just in a tooltip.
         if (cls === 'status-off' && title) showPollError(title, text);
         else clearPollError();
+    }
+
+    // ── Dev console ──────────────────────────────────────────────────────
+    //
+    // Redis is billed per command and the quota is the binding constraint on
+    // this deployment, so the running total belongs somewhere visible rather
+    // than in a dashboard nobody opens. Backed by /api/health, which counts
+    // commands per container and keeps a fleet-wide total in shared state.
+    let devTimer = null;
+
+    async function renderDevConsole() {
+        const body = document.getElementById('dev-body');
+        if (!body) return;
+        let h = {}, a = {};
+        try {
+            [h, a] = await Promise.all([
+                fetch(API_BASE + '/health').then(r => r.json()),
+                fetch(API_BASE + '/agent').then(r => r.json()),
+            ]);
+        } catch (e) {
+            body.innerHTML = '<div class="dev-note">Could not reach the API.</div>';
+            return;
+        }
+        const f = h.fleet_commands;
+        const row = (k, v) => '<div class="dev-row"><span>' + esc(k) + '</span><span>' + v + '</span></div>';
+        const agentTxt = a.agent
+            ? '<span class="dev-ok">' + esc(a.id || 'yes') + '</span>'
+            : '<span class="dev-off">not running</span>';
+        body.innerHTML =
+            row('Redis commands', f ? esc(String(f.total)) : '—') +
+            row('Avg per minute', f ? esc(f.per_min.toFixed(2)) : '—') +
+            row('Counting for', f ? esc(fmtMinutes(f.minutes)) : '—') +
+            row('agent.py', agentTxt) +
+            (a.agent ? row('Agent cadence', esc(String(a.every_s)) + 's') +
+                       row('Last heartbeat', esc(String(a.age_s)) + 's ago') : '') +
+            row('This instance', esc(String(h.instance || '?'))) +
+            row('  its commands', esc(String(h.commands ?? '?'))) +
+            row('  its requests', esc(String(h.requests ?? '?'))) +
+            row('Fleet clock', esc(String(h.now || '')) + (h.night ? ' (night)' : '')) +
+            '<div class="dev-note">Total is a floor: a container that only ' +
+            'serves reads never writes, so its own commands are not counted.</div>';
+    }
+
+    function fmtMinutes(m) {
+        if (m < 60) return m.toFixed(0) + ' min';
+        if (m < 1440) return (m / 60).toFixed(1) + ' h';
+        return (m / 1440).toFixed(1) + ' d';
+    }
+
+    function toggleDevConsole(evt) {
+        if (evt) evt.stopPropagation();
+        const panel = document.getElementById('dev-panel');
+        if (!panel) return;
+        const opening = panel.classList.contains('hidden');
+        panel.classList.toggle('hidden', !opening);
+        if (devTimer) { clearInterval(devTimer); devTimer = null; }
+        if (opening) {
+            renderDevConsole();
+            devTimer = setInterval(renderDevConsole, 15000);
+        }
+    }
+
+    // Reported once on load, so it is in the log of anyone who opens devtools
+    // to work out why the numbers look the way they do.
+    async function reportAgent() {
+        try {
+            const a = await fetch(API_BASE + '/agent').then(r => r.json());
+            if (a.agent) {
+                console.log('[fleet] agent.py IS running — polling by "' + a.id +
+                            '" every ' + a.every_s + 's, last heartbeat ' + a.age_s + 's ago.');
+            } else {
+                console.log('[fleet] agent.py is NOT running — the fleet is being ' +
+                            'polled by the serverless function.');
+            }
+        } catch (e) {
+            console.log('[fleet] agent.py status unknown:', e && e.message || e);
+        }
     }
 
     function showPollError(detail, label) {

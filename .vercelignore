@@ -20,6 +20,7 @@ legacy/
 
 # Local secrets and runtime state.
 secrets.json
+categorize_config.txt
 .env
 .env.*
 *.local
@@ -30,6 +31,7 @@ secrets.json
 .pi_session_cache.json
 .task_history.json
 .device_locations.json
+task_report.raw.json
 
 # Generated logs.
 operator_sessions/

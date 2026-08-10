@@ -66,6 +66,19 @@ def _post(path: str, payload, timeout: float = 8.0):
 # a pipeline of five is five. /api/health reports it, which is the only way to
 # see the real per-request cost from outside.
 CMD_COUNT = 0
+_CMD_REPORTED = 0
+
+
+def take_command_delta() -> int:
+    """Commands issued since this was last called, on this container.
+
+    The caller folds it into a running total in shared state. Reading and
+    resetting together means two callers cannot count the same commands twice.
+    """
+    global _CMD_REPORTED
+    delta = CMD_COUNT - _CMD_REPORTED
+    _CMD_REPORTED = CMD_COUNT
+    return delta
 
 
 def cmd(*args, timeout: float = 8.0):
@@ -144,22 +157,37 @@ def jset(key, value, ttl: int | None = None):
     return cmd("SET", P + key, payload)
 
 
-def hgetall_json(key) -> dict:
-    """HGETALL, decoding each value as JSON. Upstash returns a flat array."""
-    raw = cmd("HGETALL", P + key)
+def decode_hash(raw) -> dict:
+    """Decode one HGETALL result, whose values are JSON.
+
+    Upstash answers with a flat array over the REST API and a dict over some
+    client versions, so both are handled.
+    """
     out = {}
     if not raw:
         return out
-    if isinstance(raw, dict):
-        items = raw.items()
-    else:
-        items = zip(raw[0::2], raw[1::2])
+    items = raw.items() if isinstance(raw, dict) else zip(raw[0::2], raw[1::2])
     for k, v in items:
         try:
             out[k] = json.loads(v)
         except Exception:
             out[k] = v
     return out
+
+
+def hgetall_json(key) -> dict:
+    return decode_hash(cmd("HGETALL", P + key))
+
+
+def hgetall_many_json(keys) -> list:
+    """HGETALL over several keys in one round trip, each decoded.
+
+    Still one billable command per key — this only saves the network hops.
+    """
+    keys = list(keys)
+    if not keys:
+        return []
+    return [decode_hash(r) for r in (pipeline([["HGETALL", P + k] for k in keys]) or [])]
 
 
 def hset_json(key, field, value):

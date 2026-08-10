@@ -17,6 +17,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
 
 import collections
+import statistics
 import secrets as _secrets
 from api_client import FleetAPIClient, FleetAPIError
 from auth import DashboardAuth
@@ -325,7 +326,15 @@ def _merge_pi_sessions(hostname: str, label: str, sessions: list[dict]) -> bool:
             if dur <= 0:
                 continue
             existing = entry["sessions"].get(sid)
-            if existing is None or existing.get("duration_s", 0) != dur or "start_unix" not in existing:
+            # What the recording actually weighs — the input to the
+            # byte-implied duration that keeps a hung session's wall clock out
+            # of the rankings (see session_durations()). A session still
+            # uploading reports no size at all, so a stored None is refreshed
+            # the moment the API starts reporting one, not left forever.
+            size_bytes = _extract_size_bytes(rec)
+            if (existing is None or existing.get("duration_s", 0) != dur
+                    or "start_unix" not in existing
+                    or (size_bytes is not None and existing.get("size_bytes") != size_bytes)):
                 entry["sessions"][sid] = {
                     "date": _session_date(rec),
                     "duration_s": dur,
@@ -336,17 +345,21 @@ def _merge_pi_sessions(hostname: str, label: str, sessions: list[dict]) -> bool:
                     # (20260619_132103) and has no date to render.
                     "task": clean_str(rec.get("task")),
                     "start_unix": _session_start_unix(rec),
+                    "size_bytes": size_bytes,
                 }
                 changed = True
     return changed
 
 def _pi_cached_day_total(hostname: str, date_str: str) -> float:
-    """Sums this Pi's cached session durations for a specific date."""
+    """Sums this Pi's cached session durations for a specific date, counting
+    the byte-implied duration wherever it disagrees with the API's span."""
     with _pi_session_cache_lock:
         entry = _pi_session_cache.get(hostname)
         if not entry:
             return 0.0
-        return sum(s["duration_s"] for s in entry["sessions"].values() if s.get("date") == date_str)
+        sessions = list(entry["sessions"].values())
+    return sum(session_durations(hostname, s)[0]
+               for s in sessions if s.get("date") == date_str)
 
 def _pi_cached_label(hostname: str) -> str | None:
     with _pi_session_cache_lock:
@@ -391,6 +404,120 @@ def _session_date(rec: dict) -> str | None:
         except Exception:
             pass
     return None
+
+
+# ── Byte-implied session duration ─────────────────────────────────────────
+# A session's duration_s is wall clock: the span between the recording folder
+# opening and closing. Usually that IS the recording, but a rig that hangs, or
+# finalizes/uploads long after capture really stopped, leaves the span far
+# longer than what actually got recorded — while the bytes on disk still
+# reflect the real thing. Bytes are much harder to fake, so each rig's own
+# median bytes/second gives an independent estimate of how long it recorded.
+# The API's figure is kept only when it lands within BYTE_DURATION_MARGIN of
+# that estimate; outside it, the estimate is what counts and the API number is
+# carried alongside so the dashboard can show what it replaced.
+BYTE_DURATION_MARGIN = 0.10      # 10% margin of error around the estimate
+MIN_BASELINE_DURATION_S = 120.0  # sessions shorter than this make noisy rates
+MIN_BASELINE_SESSIONS = 5        # per-rig samples needed to trust its own rate
+
+# Session-level total, whatever the rig's firmware calls it.
+_SIZE_KEYS = ("size_bytes", "total_bytes", "bytes_total", "total_size_bytes",
+              "session_bytes", "bytes")
+_SIZE_LIST_KEYS = ("mcap_files", "session_files", "files", "recordings")
+
+_byte_rate_host: dict[str, float] = {}   # hostname -> median bytes/sec
+_byte_rate_fleet: float | None = None    # fleet-wide fallback median
+_byte_rate_lock = threading.Lock()
+
+
+def _extract_size_bytes(rec: dict) -> int | None:
+    """Total bytes for one session record, or None if the API didn't say.
+
+    Falls back to summing the per-file lists, because the light=1 payload the
+    session fetch uses does not always carry a session-level total."""
+    for k in _SIZE_KEYS:
+        v = rec.get(k)
+        if v is None or isinstance(v, bool):
+            continue
+        try:
+            n = float(v)
+        except (TypeError, ValueError):
+            continue
+        if n > 0:
+            return int(n)
+
+    total = 0.0
+    for sub in _SIZE_LIST_KEYS:
+        items = rec.get(sub)
+        if not isinstance(items, list):
+            continue
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            try:
+                total += float(it.get("size_bytes") or 0)
+            except (TypeError, ValueError):
+                pass
+    return int(total) if total > 0 else None
+
+
+def _rebuild_byte_rate_baselines():
+    """Recomputes every rig's median bytes/second from its own cached sessions,
+    plus a fleet-wide median for rigs with too few samples of their own.
+
+    Medians, not means, so the very hangs this is meant to catch can't drag a
+    rig's baseline along with them. Runs once per backfill, off the persistent
+    cache, so the baselines keep sharpening as history accumulates."""
+    global _byte_rate_host, _byte_rate_fleet
+    with _pi_session_cache_lock:
+        snapshot = {h: dict(v) for h, v in _pi_session_cache.items()}
+
+    host_rates: dict[str, float] = {}
+    all_rates: list[float] = []
+    for hostname, entry in snapshot.items():
+        rates = []
+        for sess in entry.get("sessions", {}).values():
+            dur = float(sess.get("duration_s") or 0)
+            try:
+                nbytes = float(sess.get("size_bytes") or 0)
+            except (TypeError, ValueError):
+                continue
+            if dur < MIN_BASELINE_DURATION_S or nbytes <= 0:
+                continue
+            rates.append(nbytes / dur)
+        all_rates.extend(rates)
+        if len(rates) >= MIN_BASELINE_SESSIONS:
+            host_rates[hostname] = statistics.median(rates)
+
+    with _byte_rate_lock:
+        _byte_rate_host = host_rates
+        _byte_rate_fleet = statistics.median(all_rates) if all_rates else None
+
+
+def session_durations(hostname: str, sess: dict) -> tuple[float, float | None]:
+    """(duration to count, API duration when the two disagree).
+
+    Returns the byte-implied estimate whenever the rig's byte rate puts the
+    API's span further than BYTE_DURATION_MARGIN away from it. The second
+    element is None when they agree — or when there is no size or no baseline
+    to judge with, in which case the API duration stands unchallenged."""
+    api_dur = float(sess.get("duration_s") or 0)
+    try:
+        nbytes = float(sess.get("size_bytes") or 0)
+    except (TypeError, ValueError):
+        nbytes = 0.0
+    if api_dur <= 0 or nbytes <= 0:
+        return api_dur, None
+
+    with _byte_rate_lock:
+        rate = _byte_rate_host.get(hostname) or _byte_rate_fleet
+    if not rate:
+        return api_dur, None
+
+    implied = nbytes / rate
+    if abs(implied - api_dur) <= api_dur * BYTE_DURATION_MARGIN:
+        return api_dur, None
+    return implied, api_dur
 
 
 def backfill_daily_hours(client: "FleetAPIClient"):
@@ -446,10 +573,17 @@ def backfill_daily_hours(client: "FleetAPIClient"):
     if any_new:
         _save_pi_session_cache()
 
+    # Rates first: everything below counts byte-implied durations, and the
+    # baselines have to see this cycle's freshly merged sessions to produce
+    # them.
+    _rebuild_byte_rate_baselines()
+
     # ── Recompute all_by_day from the FULL persistent cache (covers Pis that ──
     # are currently offline and weren't in `results` this cycle at all).
     today = get_date_str()
     all_by_day: dict[str, float] = {}
+    corrected_days: set[str] = set()   # days holding a byte-corrected session
+    n_estimated = 0
     with _pi_session_cache_lock:
         cache_snapshot = {h: dict(v) for h, v in _pi_session_cache.items()}
     for hostname, entry in cache_snapshot.items():
@@ -462,14 +596,23 @@ def backfill_daily_hours(client: "FleetAPIClient"):
                 continue   # today is handled live by the leaderboard
             if is_weekend(date_str):
                 continue   # skip weekends
-            dur = sess.get("duration_s", 0)
+            dur, api_dur = session_durations(hostname, sess)
+            if api_dur is not None:
+                n_estimated += 1
+                corrected_days.add(date_str)
             if dur > 0:
                 all_by_day[date_str] = all_by_day.get(date_str, 0.0) + dur
 
     updated = False
     with _daily_hours_lock:
         for day, total_s in all_by_day.items():
-            if total_s > _daily_hours_cache.get(day, 0):
+            prev = _daily_hours_cache.get(day, 0)
+            # Normally the cache only ever climbs, so a Pi that goes offline
+            # can't erase hours it already reported. A day whose sessions the
+            # byte estimate corrected is the one case where the recomputed
+            # total is allowed to come DOWN — the whole point is to strike a
+            # hung session's phantom hours off the record.
+            if total_s > prev or (day in corrected_days and total_s < prev):
                 _daily_hours_cache[day] = total_s
                 updated = True
 
@@ -485,32 +628,52 @@ def backfill_daily_hours(client: "FleetAPIClient"):
             label = entry.get("label", hostname)
             if hostname not in _completed_tasks:
                 _completed_tasks[hostname] = []
-            existing_sids = {t.get("_session_id") for t in _completed_tasks[hostname]}
+            existing = {t.get("_session_id"): t for t in _completed_tasks[hostname]}
             for sid, sess in entry.get("sessions", {}).items():
-                if sid not in existing_sids:
-                    # Real task label ("First aid"), NOT the session folder
-                    # name. Only fall back to the folder name when the API
-                    # genuinely gave us no task for this session.
-                    task_name = sess.get("task")
-                    if not task_name or task_name == "Unknown":
-                        task_name = sess.get("name") or "Unknown"
-                    task_short = str(task_name)[:20]
+                # What this session actually recorded, and the API's own
+                # figure when the bytes say it was wrong. dur is what the
+                # history counts; api_dur is only carried so the dashboard can
+                # show, in red, the number it replaced.
+                dur, api_dur = session_durations(hostname, sess)
 
-                    # Real start time, parsed from the API field or the
-                    # YYYYMMDD_HHMMSS folder name — never "now", which is
-                    # what produced Invalid Date / wrong timestamps.
-                    start_unix = sess.get("start_unix")
-                    if not start_unix:
-                        start_unix = _session_start_unix({"name": sess.get("name")})
+                prior = existing.get(sid)
+                if prior is not None:
+                    # Already archived — but the baselines sharpen with every
+                    # sweep, so re-apply the current verdict rather than
+                    # leaving the first run's duration frozen in place.
+                    prior["duration_s"] = dur
+                    if api_dur is None:
+                        prior.pop("duration_api_s", None)
+                    else:
+                        prior["duration_api_s"] = api_dur
+                    continue
 
-                    _completed_tasks[hostname].append({
-                        "label": label,
-                        "operator": sess.get("operator", "Unknown"),
-                        "task": task_short,
-                        "duration_s": sess.get("duration_s", 0),
-                        "start_time": start_unix,   # may be None -> UI shows "—"
-                        "_session_id": sid
-                    })
+                # Real task label ("First aid"), NOT the session folder
+                # name. Only fall back to the folder name when the API
+                # genuinely gave us no task for this session.
+                task_name = sess.get("task")
+                if not task_name or task_name == "Unknown":
+                    task_name = sess.get("name") or "Unknown"
+                task_short = str(task_name)[:20]
+
+                # Real start time, parsed from the API field or the
+                # YYYYMMDD_HHMMSS folder name — never "now", which is
+                # what produced Invalid Date / wrong timestamps.
+                start_unix = sess.get("start_unix")
+                if not start_unix:
+                    start_unix = _session_start_unix({"name": sess.get("name")})
+
+                record = {
+                    "label": label,
+                    "operator": sess.get("operator", "Unknown"),
+                    "task": task_short,
+                    "duration_s": dur,
+                    "start_time": start_unix,   # may be None -> UI shows "—"
+                    "_session_id": sid
+                }
+                if api_dur is not None:
+                    record["duration_api_s"] = api_dur
+                _completed_tasks[hostname].append(record)
     _save_task_history()
 
     # ── Exactly ONE line per run, summarizing everything ────────────────────
@@ -522,9 +685,12 @@ def backfill_daily_hours(client: "FleetAPIClient"):
     if failed_other:
         fail_bits.append(f"{len(failed_other)} failed ({', '.join(l for l, _ in failed_other)})")
     fail_summary = f", {'; '.join(fail_bits)}" if fail_bits else ""
+    est_summary = (f", {ANSI_BRIGHT_RED}{n_estimated} session(s) counted by "
+                   f"byte estimate{ANSI_RESET}") if n_estimated else ""
     message = (f"[{ts()}] INFO   Backfill — {n} past day(s) totaled, "
                f"{n_offline_cached} Pi(s) from cache while unreachable, "
-               f"cache {'updated' if updated else 'unchanged'}{fail_summary}.")
+               f"cache {'updated' if updated else 'unchanged'}"
+               f"{est_summary}{fail_summary}.")
     if message != _last_backfill_message:
         web_print(message)
         _last_backfill_message = message
@@ -1746,7 +1912,10 @@ class EmbeddedUIServer(BaseHTTPRequestHandler):
                     for sess in entry.get("sessions", {}).values():
                         if sess.get("date") not in past_days:
                             continue
-                        dur = sess.get("duration_s", 0)
+                        # Byte-implied duration wherever it disagrees with the
+                        # API's wall clock, so a hung session can't rank a rig
+                        # or an operator above one that actually recorded.
+                        dur, _api_dur = session_durations(hostname, sess)
                         if dur <= 0:
                             continue
                         op = sess.get("operator") or "Unknown"
@@ -1912,6 +2081,9 @@ def run():
 
     _load_daily_hours_cache()
     _load_pi_session_cache()
+    # Byte rates off the restored cache, so requests served before the first
+    # backfill finishes already count corrected durations.
+    _rebuild_byte_rate_baselines()
     load_daily_totals()
     start_web_server()
     start_key_listener()

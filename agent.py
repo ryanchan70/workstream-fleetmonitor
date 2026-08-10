@@ -113,6 +113,50 @@ def cycle(agent_id, interval):
     return out
 
 
+def sync_feedback(path):
+    """Append new submissions to feedback.txt, leaving existing blocks alone.
+
+    The deployed function cannot write this file — a serverless filesystem is
+    read-only — so it only ever reads statuses out of it. This is the other
+    half: it brings the submissions down from Redis so there is something to
+    put a status against. Ids already present are skipped, so an entry whose
+    status has been edited is never overwritten.
+    """
+    from _lib import redis_state as R
+
+    existing = set()
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("["):
+                    existing.add(line[1:].partition("]")[0].strip())
+    except OSError:
+        pass
+
+    from _lib import core as C
+
+    entries = []
+    for e in (R.feedback_read(200) or []):
+        if not isinstance(e, dict):
+            continue
+        fid = C.feedback_id(e)
+        if fid and fid not in existing:
+            entries.append(dict(e, id=fid))
+    if not entries:
+        log(f"no new feedback ({len(existing)} already in {os.path.basename(path)})")
+        return
+
+    # Oldest first, so the file reads chronologically as it grows.
+    entries.sort(key=lambda e: float(e.get("at") or 0))
+    with open(path, "a", encoding="utf-8") as f:
+        for e in entries:
+            f.write(f"\n[{e['id']}] {e.get('when', '')}  "
+                    f"{e.get('email', '')}  status: submitted\n")
+            f.write(str(e.get("text", "")).strip() + "\n")
+    log(f"added {len(entries)} submission(s) to {os.path.basename(path)}")
+
+
 def serve(port):
     """Serve the dashboard from this process, on top of the poll loop.
 
@@ -173,6 +217,8 @@ def main():
     ap.add_argument("--serve", type=int, metavar="PORT",
                     help="also serve the dashboard on this port")
     ap.add_argument("--once", action="store_true", help="one sweep, then exit")
+    ap.add_argument("--feedback", action="store_true",
+                    help="append new dashboard suggestions to feedback.txt, then exit")
     ap.add_argument("--env", default=os.path.join(ROOT, "local", "agent.env"))
     ap.add_argument("--id", default=socket.gethostname(),
                     help="name shown on the dashboard as the poller (default: hostname)")
@@ -192,6 +238,10 @@ def main():
         log("  the Upstash pair is on the Upstash console / Vercel > Storage;")
         log("  `vercel env pull` returns [SENSITIVE] for them, not the value.")
         return 1
+
+    if args.feedback:
+        sync_feedback(os.path.join(ROOT, "feedback.txt"))
+        return 0
 
     if args.once:
         log(cycle(args.id, args.interval))
