@@ -123,9 +123,10 @@ RIG_SHARD_TARGET = 12
 # Redis key prefixes for the per-rig hashes the blobs are rebuilt from.
 _TASKS = "tasks:"
 _SESSIONS = "sessions:"
-# Per-rig median bytes/second, rebuilt by each backfill. Small enough to read
-# on a request that needs to judge a session's duration against its size.
-_BYTE_RATES = "byte_rates"
+# The head-camera KNN training points, rebuilt by each backfill. Small enough
+# to read on a request that needs to judge a session's duration against the
+# bytes its head camera wrote.
+_DURATION_MODEL = "duration_model"
 
 
 def _stamp(line: str) -> str:
@@ -296,19 +297,19 @@ def agent_alive(state) -> dict | None:
     return a if age <= max(3 * float(a.get("every") or 30), 90) else None
 
 
-def byte_rates(memo_ttl: float = 600.0):
-    """The per-rig bytes/second baselines the last backfill wrote.
+def duration_model(memo_ttl: float = 600.0):
+    """The head-camera KNN model the last backfill wrote.
 
-    Read on the poll path, which is why it is memoised: the rates only move
-    when a sweep rebuilds them, once an hour, and a warm instance would
+    Read on the poll path, which is why it is memoised: the model only moves
+    when a sweep rebuilds it, once an hour, and a warm instance would
     otherwise spend a billable command per tick re-reading a value that had
     not changed.
     """
-    hit = R.memo_get(_BYTE_RATES, memo_ttl)
+    hit = R.memo_get(_DURATION_MODEL, memo_ttl)
     if hit is not None:
         return hit
     try:
-        return R.memo_set(_BYTE_RATES, R.jget(_BYTE_RATES) or {})
+        return R.memo_set(_DURATION_MODEL, R.jget(_DURATION_MODEL) or {})
     except R.RedisUnavailable:
         return {}
 
@@ -646,7 +647,7 @@ def poll(force: bool = False, state=None, agent=None, requested=None):
         if "today" not in p:
             p["today"] = _migrate_today(today)
         by_pi, by_op = _rebuild_leaderboard(devices, today, observed, p["today"],
-                                            byte_rates())
+                                            duration_model())
         p["by_pi"], p["by_op"] = by_pi, by_op
 
         # Rides along in the blob that is being written anyway, so claiming the
@@ -773,7 +774,7 @@ def _migrate_today(today):
     merge above exists to prevent.
     """
     out = {}
-    rates = byte_rates()
+    rates = duration_model()
     try:
         for h, groups in (R.hgetall_json("today_sessions") or {}).items():
             if isinstance(groups, list):
@@ -1217,14 +1218,16 @@ def backfill(force: bool = False) -> dict:
                     "name": rec.get("name"),
                     "task": C.task_label(rec),
                     "start_unix": C.session_start_unix(rec),
-                    # What the recording actually weighs, and so how long it
-                    # really ran — see C.session_durations(). Sessions stored
-                    # before this field existed differ from the entry built
-                    # here and are rewritten with it on the next sweep. A
-                    # session still uploading reports no size yet; keep the
-                    # stored one rather than writing that gap back.
-                    "size_bytes": (C.extract_size_bytes(rec)
-                                   or (existing.get(sid) or {}).get("size_bytes")),
+                    # What the HEAD CAMERA wrote, and so how long it really
+                    # ran — see C.session_durations(). Per-camera bytes, not
+                    # the session total, because the total moves with camera
+                    # count. Sessions stored before this field existed differ
+                    # from the entry built here and are rewritten with it on
+                    # the next sweep. A session still uploading reports no
+                    # size yet; keep the stored one rather than writing that
+                    # gap back.
+                    "head_bytes": (C.extract_head_bytes(rec)
+                                   or (existing.get(sid) or {}).get("head_bytes")),
                 }
                 if existing.get(sid) != entry:
                     new_sessions[sid] = entry
@@ -1247,10 +1250,10 @@ def backfill(force: bool = False) -> dict:
         for h, stored in zip(missing, R.hgetall_many_json(_SESSIONS + h for h in missing)):
             all_sessions[h] = stored
 
-        # Rebuilt every sweep, then kept in Redis so a request can correct a
+        # Rebuilt every sweep, then kept in Redis so a request can judge a
         # session's duration without re-reading the fleet's history itself.
-        rates = C.byte_rate_baselines(all_sessions)
-        R.jset(_BYTE_RATES, rates)
+        rates = C.build_duration_model(all_sessions)
+        R.jset(_DURATION_MODEL, rates)
 
         for host, entries in fetched_entries.items():
             new_tasks = []

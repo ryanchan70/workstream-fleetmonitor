@@ -83,6 +83,20 @@ recorded rather than on a span a hang inflated. --min-seconds overrides it for
 a single run, and is the only way to ask for no minimum when the config sets
 one (--min-seconds 0).
 
+DURATION ESTIMATION
+-------------------
+disable_estimation=y (config, and the default) reports duration_s exactly as
+the fleet API gave it. The duration_implied column is still filled in, so the
+estimate can be checked against the wall clock by hand, but nothing is
+rewritten and duration_seconds always equals duration_s.
+
+Set disable_estimation=n to let the estimate apply. It reads the HEAD CAMERA's
+own bytes — the size of head_oakd.mcap, not the session total — and asks a
+k-nearest-neighbour fit over the fleet's sessions how long a recording that
+size takes. When that lands below three quarters of the wall clock the session
+is treated as hung and the estimate is counted instead. See the block above
+build_duration_model for why the head camera alone, and not the total.
+
 APPEND vs FULL REWRITE
 ----------------------
 append=y (config) only adds sessions the file doesn't already have; existing
@@ -125,6 +139,7 @@ Category codes are matched case-insensitively and flexibly:
 from __future__ import annotations
 
 import argparse
+import bisect
 import csv
 import datetime as dt
 import getpass
@@ -313,6 +328,7 @@ def load_config(config_file: str = "categorize_config.txt") -> dict:
         append=n
         keep_columns=category,task_name
         sheets_output=n
+        disable_estimation=y
     """
     config = {
         "email": "",
@@ -323,6 +339,10 @@ def load_config(config_file: str = "categorize_config.txt") -> dict:
         "append": "n",
         "keep_columns": "",
         "sheets_output": "n",
+        # Default ON, so a fresh install reports the API's own wall clock and
+        # nothing is silently rewritten by an estimate. Set to n to let the
+        # head-camera estimate correct inflated spans.
+        "disable_estimation": "y",
     }
 
     if os.path.exists(config_file):
@@ -381,6 +401,7 @@ def load_config(config_file: str = "categorize_config.txt") -> dict:
                 f.write(f"append={config['append']}\n")
                 f.write(f"keep_columns={config['keep_columns']}\n")
                 f.write(f"sheets_output={config['sheets_output']}\n")
+                f.write(f"disable_estimation={config['disable_estimation']}\n")
             print(f"Config saved to {config_file}", file=sys.stderr)
         except Exception as e:
             print(f"Error saving {config_file}: {e}", file=sys.stderr)
@@ -869,39 +890,147 @@ def extract_total_bytes(rec: dict):
 # span the folder was open for. Usually that's also how long the rig actually
 # recorded — but a hang, a stuck upload, or a late finalize can leave the span
 # far longer than what actually got captured, while the file sizes still
-# reflect the real recording. MIN_BASELINE_DURATION_S / _SESSIONS keep short or
-# sparse rigs from producing a noisy bytes/second baseline; RATIO is how far
-# below the wall clock the byte-implied duration has to fall before we trust
-# it over duration_s.
-MIN_BASELINE_DURATION_S = 120.0
-MIN_BASELINE_SESSIONS = 5
+# reflect the real recording.
+#
+# The estimate reads the HEAD CAMERA ONLY, never the session total. The head
+# unit (OAK-D-W) writes one fixed bundle into head_oakd.mcap — rgb 1080p30,
+# depth, both mono streams and the IMU — so its output does not move when a
+# wrist or chest camera is unplugged. Measured over 1961 sessions it runs at
+# 4.28 MB/s with a p10-p90 spread of 0.7%, against 22.4% for the session
+# total, whose swing is almost entirely camera count: a two-camera session
+# writes 0.673 of a four-camera one, which the old total-bytes baseline read
+# as a hung recording and "corrected" away.
+#
+# MIN_TRAIN_DURATION_S keeps very short sessions out of the training set,
+# where a few seconds of file-open overhead distorts the rate. RATIO is how
+# far below the wall clock the byte-implied duration has to fall before we
+# trust it over duration_s.
+MIN_TRAIN_DURATION_S = 120.0
 DURATION_MISMATCH_RATIO = 0.75
 
+# k-nearest-neighbour regression over (head bytes -> bytes/second), fleet-wide.
+# Neighbours are found in head-byte space and their MEDIAN rate is taken, so a
+# hung session sitting in the training data cannot drag its own neighbourhood:
+# it is one point among K, and the median ignores it. KNN_K is odd for a
+# well-defined median. MODEL_MAX_POINTS caps what gets carried between
+# processes (the dashboard keeps this model in Redis); the points are thinned
+# evenly across the sorted order, which preserves the shape of the curve.
+KNN_K = 15
+MODEL_MAX_POINTS = 600
 
-def build_byte_rate_baselines(raw: list[dict]) -> tuple[dict[str, float], float | None]:
-    """Median bytes/second per rig, learned from that rig's own sessions.
+# The head camera's files, by the role the API labels them with. Segmented
+# recordings appear as head_oakd.seg1.mcap and friends, so the name is matched
+# on a prefix rather than equality.
+#
+# Deliberately the OAK unit ONLY. A handful of rigs carry a different head
+# build that writes head_video/head_audio/head_stereo instead, and it runs at
+# 1.36 MB/s against the OAK's 4.28 — measuring one against the other's rate
+# would report a third of the real recording. Those sessions match nothing
+# here, so they get no estimate at all, which is the right answer rather than
+# a confident wrong one.
+_HEAD_ROLE_PREFIXES = ("head_oakd",)
+_HEAD_FILE_LISTS = ("mcap_files", "session_files", "files", "recordings")
 
-    Rigs with too few qualifying sessions fall back to the fleet-wide median
-    (second return value; None if nothing qualified at all).
+
+def extract_head_bytes(rec: dict):
+    """Bytes written by the head camera for one session, or None.
+
+    None means no head file was reported — 0.7% of sessions — and those get no
+    estimate rather than a guess from whatever else was recording.
     """
-    by_host: dict[str, list[float]] = defaultdict(list)
-    for rec in raw:
-        dur = rec.get("duration_s") or 0
-        if dur < MIN_BASELINE_DURATION_S:
+    # First list that yields anything wins, rather than summing across all of
+    # them: a rig reports the same head_oakd.mcap under both mcap_files and
+    # session_files, and adding both counted every head recording twice.
+    for sub in _HEAD_FILE_LISTS:
+        items = rec.get(sub)
+        if not isinstance(items, list):
             continue
-        nbytes = extract_total_bytes(rec.get("_raw") or {})
+        total = 0.0
+        seen = set()
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            role = str(it.get("role") or "").lower()
+            name = str(it.get("name") or "").lower()
+            # No topic fallback: /head-camera/... is also what the other head
+            # build publishes, and matching it would pull that rig's much
+            # smaller files in under the OAK's rate.
+            if not (role.startswith(_HEAD_ROLE_PREFIXES)
+                    or name.startswith(_HEAD_ROLE_PREFIXES)):
+                continue
+            key = str(it.get("path") or it.get("name") or it.get("topic") or "")
+            if key and key in seen:
+                continue
+            seen.add(key)
+            try:
+                total += float(it.get("size_bytes") or 0)
+            except (TypeError, ValueError):
+                pass
+        if total > 0:
+            return int(total)
+    return None
+
+
+def build_duration_model(raw: list[dict]) -> dict:
+    """Training points for the KNN estimate: (head bytes, duration) per session.
+
+    Fleet-wide rather than per rig. The head unit is the same hardware writing
+    the same streams on every rig, and the measured spread across all of them
+    is under a percent, so splitting by rig would only shrink the sample.
+    """
+    pts = []
+    for rec in raw:
+        dur = float(rec.get("duration_s") or 0)
+        if dur < MIN_TRAIN_DURATION_S:
+            continue
+        nbytes = extract_head_bytes(rec.get("_raw") or {})
         if not nbytes:
             continue
-        by_host[rec.get("pi_id")].append(nbytes / dur)
+        pts.append((nbytes, dur))
 
-    host_rates: dict[str, float] = {}
-    all_rates: list[float] = []
-    for host, rates in by_host.items():
-        all_rates.extend(rates)
-        if len(rates) >= MIN_BASELINE_SESSIONS:
-            host_rates[host] = statistics.median(rates)
-    fleet_rate = statistics.median(all_rates) if all_rates else None
-    return host_rates, fleet_rate
+    pts.sort()
+    if len(pts) > MODEL_MAX_POINTS:
+        step = len(pts) / MODEL_MAX_POINTS
+        pts = [pts[int(i * step)] for i in range(MODEL_MAX_POINTS)]
+    return {"k": KNN_K, "pts": pts}
+
+
+def knn_implied_duration(head_bytes, model: dict):
+    """How long the head camera was recording, from its byte count.
+
+    Takes the k training sessions nearest in head bytes, and applies the median
+    of their bytes/second to this session's own byte count. Returns None when
+    there is nothing to judge with.
+    """
+    if not head_bytes or not model:
+        return None
+    pts = model.get("pts") or []
+    k = int(model.get("k") or KNN_K)
+    if len(pts) < k:
+        return None
+
+    # pts is sorted by byte count: walk outwards from the insertion point to
+    # collect the k nearest, rather than scanning all of them.
+    lo = bisect.bisect_left(pts, (head_bytes,)) - 1
+    hi = lo + 1
+    near = []
+    while len(near) < k:
+        if lo < 0 and hi >= len(pts):
+            break
+        if lo < 0:
+            near.append(pts[hi]); hi += 1
+        elif hi >= len(pts):
+            near.append(pts[lo]); lo -= 1
+        elif head_bytes - pts[lo][0] <= pts[hi][0] - head_bytes:
+            near.append(pts[lo]); lo -= 1
+        else:
+            near.append(pts[hi]); hi += 1
+
+    rates = [b / d for b, d in near if d > 0]
+    if not rates:
+        return None
+    rate = statistics.median(rates)
+    return (head_bytes / rate) if rate > 0 else None
 
 
 def extract_upload_status(rec: dict) -> str:
@@ -953,8 +1082,8 @@ UNNAMED_PI = re.compile(r"^rpi\d*-[0-9a-f]{4}-[0-9a-f]{4}$", re.IGNORECASE)
 
 
 def enrich(rec: dict, matchers, keywords,
-           host_rates: dict[str, float] | None = None,
-           fleet_rate: float | None = None) -> dict:
+           model: dict | None = None,
+           estimation_enabled: bool = False) -> dict:
     task = (rec.get("task") or "").strip()
     code, category, matched_by, hit_codes = categorize(task, matchers, keywords)
     dur = float(rec.get("duration_s") or 0)
@@ -975,20 +1104,25 @@ def enrich(rec: dict, matchers, keywords,
 
     raw = rec.get("_raw") or {}
     nbytes = extract_total_bytes(raw)
+    head_bytes = extract_head_bytes(raw)
 
     # duration_s (the wall-clock span between session start and end) can be
     # much longer than what actually got recorded (a rig that hung, or
-    # finalized/uploaded long after recording really stopped). File size is a
-    # much harder thing to fake, so when the rig's own bytes/second rate
-    # implies a much shorter recording than duration_s claims, trust the
-    # bytes instead — duration_seconds/hhmmss/hours below are that corrected
-    # figure.
+    # finalized/uploaded long after recording really stopped). Bytes are a much
+    # harder thing to fake, so when the head camera's output implies a much
+    # shorter recording than duration_s claims, trust the bytes instead —
+    # duration_seconds/hhmmss/hours below are that corrected figure.
+    #
+    # duration_implied is filled in whenever it can be computed, INCLUDING when
+    # estimation is switched off: the column is then a reference figure to
+    # check the wall clock against by hand, and nothing is applied to the
+    # durations the report totals.
     dur_actual = dur
     implied = None
-    rate = (host_rates or {}).get(rec.get("pi_id")) or fleet_rate
-    if rate and nbytes and dur > 0:
-        implied = nbytes / rate
-        if implied < dur * DURATION_MISMATCH_RATIO:
+    if dur > 0:
+        implied = knn_implied_duration(head_bytes, model)
+        if (estimation_enabled and implied is not None
+                and implied < dur * DURATION_MISMATCH_RATIO):
             dur_actual = implied
 
     session_id = rec.get("session_id") or ""
@@ -1577,6 +1711,9 @@ def main(argv=None):
     days_filter = parse_days_filter(config["days"])
     include_uncategorized = config["include_uncategorized"].lower() == "y"
     append_mode = config["append"].lower() == "y"
+    # disable_estimation is the kill switch, and it defaults to on: durations
+    # are the API's own unless this is explicitly turned off.
+    estimation_enabled = config["disable_estimation"].lower() not in ("y", "yes", "true", "1")
     # --min-seconds is the one-off override; min_duration (hh:mm:ss) is the
     # standing setting. A bad value is worth stopping for: silently falling
     # back to "no minimum" would quietly widen the report instead of narrowing
@@ -1653,8 +1790,8 @@ def main(argv=None):
         return 0
 
     matchers = build_matchers(codes)
-    host_rates, fleet_rate = build_byte_rate_baselines(raw)
-    rows = [enrich(r, matchers, keywords, host_rates, fleet_rate) for r in raw]
+    model = build_duration_model(raw)
+    rows = [enrich(r, matchers, keywords, model, estimation_enabled) for r in raw]
 
     if a.make_rules_template:
         by_name: dict[str, float] = defaultdict(float)
@@ -1884,6 +2021,21 @@ def main(argv=None):
     have_upload = sum(1 for r in kept if str(r["upload_status"]).strip())
     print(f"Sizes    {have_bytes}/{len(kept)} rows have total_bytes")
     print(f"Upload   {have_upload}/{len(kept)} rows have upload_status")
+
+    # Which durations this file actually holds. Two runs of the same command
+    # can disagree by hours depending on this one setting, so it is stated
+    # rather than left to be inferred from the numbers.
+    have_implied = sum(1 for r in kept if str(r["duration_implied"]).strip() not in ("", "None"))
+    if estimation_enabled:
+        corrected = sum(1 for r in kept
+                        if str(r["duration_implied"]).strip() not in ("", "None")
+                        and abs(float(r["duration_seconds"]) - float(r["duration_s"])) > 1)
+        print(f"Duration head-camera estimate ON — {corrected}/{len(kept)} session(s) "
+              f"counted at the estimate, {have_implied} have one")
+    else:
+        print(f"Duration estimation OFF (disable_estimation=y) — every row is the "
+              f"API's own duration_s; {have_implied}/{len(kept)} carry a "
+              f"duration_implied for reference")
     if not have_bytes or not have_upload:
         missing = " and ".join(x for x in (
             "total_bytes" if not have_bytes else "",

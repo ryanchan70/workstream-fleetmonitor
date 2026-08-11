@@ -6,7 +6,9 @@ it stays trivially testable — which matters more now that the rest of the
 system is spread across serverless invocations.
 """
 
+import bisect
 import datetime
+import os
 import re
 import statistics
 import time
@@ -644,29 +646,55 @@ def evaluate_rigs(devices, locations=None, should_alert=None, prev_status=None,
 # opening and closing. Usually that IS the recording, but a rig that hangs, or
 # finalizes/uploads long after capture really stopped, leaves the span far
 # longer than what actually got recorded — while the bytes on disk still
-# reflect the real thing. Bytes are much harder to fake, so each rig's own
-# median bytes/second gives an independent estimate of how long it recorded.
+# reflect the real thing.
 #
-# These are categorize_tasks.py's constants and its rule, deliberately: the
-# correction only ever runs ONE WAY. A byte estimate above the wall clock means
-# the rig recorded denser than its median — more cameras, a higher bitrate —
-# not that it ran longer than the folder was open, so an estimate that comes in
-# high is ignored. Only an estimate that falls to DURATION_MISMATCH_RATIO of
-# the wall clock or below is treated as evidence the span is inflated, and only
-# then does the estimate become the counted duration, with the API's number
-# carried alongside so the dashboard can show what it replaced.
+# The estimate reads the HEAD CAMERA ONLY, never the session total. The head
+# unit (OAK-D-W) writes one fixed bundle into head_oakd.mcap — rgb 1080p30,
+# depth, both mono streams and the IMU — so its output does not move when a
+# wrist or chest camera is unplugged. Measured over 1961 sessions it runs at
+# 4.28 MB/s with a p10-p90 spread of 0.7%, against 22.4% for the session
+# total, whose swing is almost entirely camera count: a two-camera session
+# writes 0.673 of a four-camera one, which a total-bytes baseline reads as a
+# hung recording and "corrects" away.
 #
-# The rates live in Redis under "byte_rates", rebuilt by each backfill, so a
-# request can correct a session without re-reading the whole fleet's history.
-MIN_BASELINE_DURATION_S = 120.0  # sessions shorter than this make noisy rates
-MIN_BASELINE_SESSIONS = 5        # per-rig samples needed to trust its own rate
+# This mirrors categorize_tasks.py deliberately — same head-only input, same
+# KNN fit, same ratio — so the dashboard and the report cannot disagree about
+# how long a session ran. Change one, change both.
+#
+# The correction only ever runs ONE WAY. An estimate above the wall clock
+# means the head wrote faster than its neighbours, not that the folder was
+# open for less time than it recorded, so a high estimate is ignored. Only an
+# estimate at or below DURATION_MISMATCH_RATIO of the wall clock is treated as
+# evidence the span is inflated, and only then does it become the counted
+# duration, with the API's number carried alongside so the dashboard can show
+# what it replaced.
+#
+# The model lives in Redis under "duration_model", rebuilt by each backfill,
+# so a request can judge a session without re-reading the fleet's history.
+MIN_TRAIN_DURATION_S = 120.0     # shorter sessions make noisy training points
 DURATION_MISMATCH_RATIO = 0.75   # how far below wall clock the estimate must
                                  # fall before the wall clock is distrusted
+KNN_K = 15                       # odd, so the neighbour median is well defined
+MODEL_MAX_POINTS = 600           # cap on what is carried through Redis
 
-# Session-level total, whatever the rig's firmware calls it.
-_SIZE_KEYS = ("size_bytes", "total_bytes", "bytes_total", "total_size_bytes",
-              "session_bytes", "bytes")
-_SIZE_LIST_KEYS = ("mcap_files", "session_files", "files", "recordings")
+# Estimation is OFF unless explicitly enabled, matching the config default in
+# categorize_tasks.py: durations are the API's own until someone opts in.
+# FLEET_DISABLE_ESTIMATION=n (or 0/false/no) in the environment turns it on.
+DISABLE_ESTIMATION = os.environ.get(
+    "FLEET_DISABLE_ESTIMATION", "y").strip().lower() not in ("n", "no", "false", "0")
+
+# The head camera's files, by the role the API labels them with. Segmented
+# recordings appear as head_oakd.seg1.mcap and friends, so names are matched on
+# a prefix rather than equality.
+#
+# Deliberately the OAK unit ONLY. A handful of rigs carry a different head
+# build that writes head_video/head_audio/head_stereo instead, and it runs at
+# 1.36 MB/s against the OAK's 4.28 — measuring one against the other's rate
+# would report a third of the real recording. Those sessions match nothing
+# here, so they get no estimate at all, which is the right answer rather than
+# a confident wrong one.
+_HEAD_ROLE_PREFIXES = ("head_oakd",)
+_HEAD_FILE_LISTS = ("mcap_files", "session_files", "files", "recordings")
 
 
 def _positive_number(value):
@@ -680,78 +708,127 @@ def _positive_number(value):
     return n if n > 0 else None
 
 
-def extract_size_bytes(rec: dict):
-    """Total bytes for one session record, or None if the API didn't say.
+def extract_head_bytes(rec: dict):
+    """Bytes written by the head camera for one session, or None.
 
-    Falls back to summing the per-file lists, because the light=1 payload the
-    session fetch uses does not always carry a session-level total."""
-    for k in _SIZE_KEYS:
-        n = _positive_number(rec.get(k))
-        if n is not None:
-            return int(n)
-
-    total = 0.0
-    for sub in _SIZE_LIST_KEYS:
-        for it in rec.get(sub) or []:
-            if isinstance(it, dict):
-                total += _positive_number(it.get("size_bytes")) or 0.0
-    return int(total) if total > 0 else None
-
-
-def _host_byte_rates(stored: dict) -> list:
-    """Every usable bytes/second sample from one rig's stored sessions."""
-    rates = []
-    for sess in (stored or {}).values():
-        if not isinstance(sess, dict):
+    Per-file sizes out of mcap_files, never the session-level total — the
+    total moves with camera count and that is exactly what this avoids. None
+    means no head file was reported, and those sessions get no estimate rather
+    than a guess from whatever else happened to be recording.
+    """
+    # First list that yields anything wins, rather than summing across all of
+    # them: a rig reports the same head_oakd.mcap under both mcap_files and
+    # session_files, and adding both counted every head recording twice.
+    for sub in _HEAD_FILE_LISTS:
+        items = rec.get(sub)
+        if not isinstance(items, list):
             continue
-        dur = _positive_number(sess.get("duration_s"))
-        nbytes = _positive_number(sess.get("size_bytes"))
-        if dur is None or nbytes is None or dur < MIN_BASELINE_DURATION_S:
-            continue
-        rates.append(nbytes / dur)
-    return rates
+        total = 0.0
+        seen = set()
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            role = str(it.get("role") or "").lower()
+            name = str(it.get("name") or "").lower()
+            # No topic fallback: /head-camera/... is also what the other head
+            # build publishes, and matching it would pull that rig's much
+            # smaller files in under the OAK's rate.
+            if not (role.startswith(_HEAD_ROLE_PREFIXES)
+                    or name.startswith(_HEAD_ROLE_PREFIXES)):
+                continue
+            key = str(it.get("path") or it.get("name") or it.get("topic") or "")
+            if key and key in seen:
+                continue
+            seen.add(key)
+            total += _positive_number(it.get("size_bytes")) or 0.0
+        if total > 0:
+            return int(total)
+    return None
 
 
-def byte_rate_baselines(sessions_by_host: dict) -> dict:
-    """Each rig's median bytes/second, plus a fleet-wide fallback median.
+def build_duration_model(sessions_by_host: dict) -> dict:
+    """Training points for the KNN estimate: (head bytes, duration) per session.
 
-    Medians, not means, so the very hangs this is meant to catch cannot drag a
-    rig's own baseline along with them. Rigs with fewer than
-    MIN_BASELINE_SESSIONS usable sessions get no rate of their own and fall
-    back to the fleet's."""
-    hosts = {}
-    all_rates = []
-    for host, stored in (sessions_by_host or {}).items():
-        rates = _host_byte_rates(stored)
-        all_rates.extend(rates)
-        if len(rates) >= MIN_BASELINE_SESSIONS:
-            hosts[host] = statistics.median(rates)
-    return {"hosts": hosts,
-            "fleet": statistics.median(all_rates) if all_rates else None}
+    Fleet-wide rather than per rig. The head unit is the same hardware writing
+    the same streams on every rig, and the measured spread across all of them
+    is under a percent, so splitting by rig would only shrink the sample.
+    """
+    pts = []
+    for stored in (sessions_by_host or {}).values():
+        for sess in (stored or {}).values():
+            if not isinstance(sess, dict):
+                continue
+            dur = _positive_number(sess.get("duration_s"))
+            head = _positive_number(sess.get("head_bytes"))
+            if dur is None or head is None or dur < MIN_TRAIN_DURATION_S:
+                continue
+            pts.append((int(head), dur))
+
+    pts.sort()
+    if len(pts) > MODEL_MAX_POINTS:
+        step = len(pts) / MODEL_MAX_POINTS
+        pts = [pts[int(i * step)] for i in range(MODEL_MAX_POINTS)]
+    return {"k": KNN_K, "pts": pts}
 
 
-def session_durations(host: str, sess: dict, rates: dict):
+def knn_implied_duration(head_bytes, model: dict):
+    """How long the head camera was recording, from its byte count.
+
+    Takes the k training sessions nearest in head bytes and applies the median
+    of their bytes/second to this session's own count. The median is what makes
+    a hung session in the training data harmless: it is one point among k.
+    """
+    if not head_bytes or not model:
+        return None
+    pts = model.get("pts") or []
+    k = int(model.get("k") or KNN_K)
+    if len(pts) < k:
+        return None
+
+    # pts is sorted by byte count: walk outwards from the insertion point to
+    # collect the k nearest, rather than scanning all of them.
+    lo = bisect.bisect_left(pts, (head_bytes,)) - 1
+    hi = lo + 1
+    near = []
+    while len(near) < k:
+        if lo < 0 and hi >= len(pts):
+            break
+        if lo < 0:
+            near.append(pts[hi]); hi += 1
+        elif hi >= len(pts):
+            near.append(pts[lo]); lo -= 1
+        elif head_bytes - pts[lo][0] <= pts[hi][0] - head_bytes:
+            near.append(pts[lo]); lo -= 1
+        else:
+            near.append(pts[hi]); hi += 1
+
+    rates = [b / d for b, d in near if d > 0]
+    if not rates:
+        return None
+    rate = statistics.median(rates)
+    return (head_bytes / rate) if rate > 0 else None
+
+
+def session_durations(host: str, sess: dict, model: dict):
     """(duration to count, API duration when the bytes contradict it).
 
-    Returns the byte-implied estimate only when it falls to
+    Returns the head-camera estimate only when it falls to
     DURATION_MISMATCH_RATIO of the API's span or below — the signature of an
     inflated wall clock. The second element is None every other time: an
-    estimate that agrees, an estimate that comes in high, or no size and no
-    baseline to judge with. In all of those the API duration stands."""
+    estimate that agrees, one that comes in high, no head file to measure, or
+    estimation switched off. In all of those the API duration stands.
+
+    `host` is unused by the fleet-wide model and kept in the signature so the
+    call sites do not have to change if a per-rig fit is ever reintroduced.
+    """
     api_dur = _positive_number(sess.get("duration_s"))
     if api_dur is None:
         return 0.0, None
-    nbytes = _positive_number(sess.get("size_bytes"))
-    if nbytes is None:
+    if DISABLE_ESTIMATION:
         return api_dur, None
 
-    rates = rates or {}
-    rate = (rates.get("hosts") or {}).get(host) or rates.get("fleet")
-    if not rate:
-        return api_dur, None
-
-    implied = nbytes / rate
-    if implied < api_dur * DURATION_MISMATCH_RATIO:
+    implied = knn_implied_duration(_positive_number(sess.get("head_bytes")), model)
+    if implied is not None and implied < api_dur * DURATION_MISMATCH_RATIO:
         return implied, api_dur
     return api_dur, None
 

@@ -558,10 +558,10 @@ class handler(BaseHTTPRequestHandler):
         hosts = [r.get("hostname")
                  for r in ((self._view().get("devices") or {}).get("rigs") or [])
                  if r.get("hostname")]
-        # The rates the backfill learned, so a session whose bytes contradict
+        # The head-camera model the backfill learned, so a session whose bytes contradict
         # its wall clock is listed at the duration it actually recorded. One
         # read, and only on the build — the cache below holds the result.
-        rates = R.jget("byte_rates") or {}
+        rates = R.jget("duration_model") or {}
         out = []
         # One round trip for the fan-out. It is still one command per rig on
         # the bill, which is why the answer is kept.
