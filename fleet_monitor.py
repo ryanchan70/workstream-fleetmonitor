@@ -16,7 +16,6 @@ import re
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
 
-import bisect
 import collections
 import statistics
 import secrets as _secrets
@@ -425,7 +424,7 @@ def _session_date(rec: dict) -> str | None:
 # hung recording and "corrects" away.
 #
 # This mirrors categorize_tasks.py deliberately — same head-only input, same
-# KNN fit, same ratio — so the dashboard and the report cannot disagree about
+# least-squares fit, same ratio — so dashboard and report cannot disagree about
 # how long a session ran. Change one, change both.
 #
 # The correction only ever runs ONE WAY. An estimate above the wall clock
@@ -434,8 +433,12 @@ def _session_date(rec: dict) -> str | None:
 MIN_TRAIN_DURATION_S = 120.0     # shorter sessions make noisy training points
 DURATION_MISMATCH_RATIO = 0.75   # how far below wall clock the estimate must
                                  # fall before the wall clock is distrusted
-KNN_K = 15                       # odd, so the neighbour median is well defined
-MODEL_MAX_POINTS = 600           # cap on the carried training set
+# Least-squares fit of duration against head bytes, fleet-wide rather than per
+# rig: the head unit is the same hardware writing the same streams on every rig
+# and the measured spread across all of them is under a percent, so splitting
+# by rig would only shrink the sample. The whole model is two numbers.
+TRIM_SIGMA = 3.0                 # residuals beyond this are dropped before the refit
+MIN_TRAIN_POINTS = 30            # below this there is nothing worth fitting
 
 # Estimation is OFF unless explicitly enabled, matching disable_estimation=y in
 # categorize_config.txt: durations are the API's own until someone opts in.
@@ -456,7 +459,7 @@ DISABLE_ESTIMATION = os.environ.get(
 _HEAD_ROLE_PREFIXES = ("head_oakd",)
 _HEAD_FILE_LISTS = ("mcap_files", "session_files", "files", "recordings")
 
-_duration_model: dict = {}               # {"k": .., "pts": [(head_bytes, dur)]}
+_duration_model: dict = {}               # {"slope": .., "intercept": ..}
 _duration_model_lock = threading.Lock()
 
 
@@ -502,12 +505,10 @@ def _extract_head_bytes(rec: dict) -> int | None:
 
 
 def _rebuild_duration_model():
-    """Rebuilds the KNN training set from the persistent session cache.
+    """Refits the duration model from the persistent session cache.
 
-    Fleet-wide rather than per rig. The head unit is the same hardware writing
-    the same streams on every rig, and the measured spread across all of them
-    is under a percent, so splitting by rig would only shrink the sample.
-    Cheap enough to run once per backfill.
+    Cheap enough to run once per backfill: one pass over the cached sessions
+    and two sums.
     """
     global _duration_model
     with _pi_session_cache_lock:
@@ -523,54 +524,71 @@ def _rebuild_duration_model():
                 continue
             if dur < MIN_TRAIN_DURATION_S or head <= 0:
                 continue
-            pts.append((int(head), dur))
+            pts.append((head, dur))
 
-    pts.sort()
-    if len(pts) > MODEL_MAX_POINTS:
-        step = len(pts) / MODEL_MAX_POINTS
-        pts = [pts[int(i * step)] for i in range(MODEL_MAX_POINTS)]
+    fitted = _fit_trimmed(pts) or {}
     with _duration_model_lock:
-        _duration_model = {"k": KNN_K, "pts": pts}
+        _duration_model = fitted
 
 
-def _knn_implied_duration(head_bytes) -> float | None:
-    """How long the head camera was recording, from its byte count.
+def _least_squares(pts):
+    """(slope, intercept) of duration against head bytes, or None."""
+    n = len(pts)
+    if n < 2:
+        return None
+    sx = sum(b for b, _ in pts)
+    sy = sum(d for _, d in pts)
+    sxx = sum(b * b for b, _ in pts)
+    sxy = sum(b * d for b, d in pts)
+    den = n * sxx - sx * sx
+    if den <= 0:
+        return None
+    slope = (n * sxy - sx * sy) / den
+    return slope, (sy - slope * sx) / n
 
-    Takes the k training sessions nearest in head bytes and applies the median
-    of their bytes/second to this session's own count. The median is what makes
-    a hung session in the training data harmless: it is one point among k.
+
+def _fit_trimmed(pts):
+    """Least squares, refit once with the worst residuals dropped.
+
+    The outliers this model exists to FIND are high-leverage points in its own
+    training data: a hung session pairs an ordinary byte count with an enormous
+    wall clock, and on the raw fit those drag R^2 to 0.71 and push the
+    intercept to 131s, which then inflates every estimate the model makes. One
+    pass at TRIM_SIGMA takes R^2 to 0.99 and the intercept to 37s, without the
+    fit having to be told which sessions are the bad ones.
     """
+    if len(pts) < MIN_TRAIN_POINTS:
+        return None
+    first = _least_squares(pts)
+    if first is None:
+        return None
+    slope, inter = first
+
+    res = [abs(d - (slope * b + inter)) for b, d in pts]
+    mean = sum(res) / len(res)
+    sd = (sum((r - mean) ** 2 for r in res) / len(res)) ** 0.5
+    if sd > 0:
+        kept = [p for p, r in zip(pts, res) if r <= TRIM_SIGMA * sd]
+        if len(kept) >= MIN_TRAIN_POINTS:
+            second = _least_squares(kept)
+            if second is not None:
+                slope, inter = second
+                return {"slope": slope, "intercept": inter,
+                        "n": len(kept), "dropped": len(pts) - len(kept)}
+    return {"slope": slope, "intercept": inter, "n": len(pts), "dropped": 0}
+
+
+def _predict_duration(head_bytes) -> float | None:
+    """How long the head camera was recording, from its byte count."""
     if not head_bytes:
         return None
     with _duration_model_lock:
         model = _duration_model
-    pts = model.get("pts") or []
-    k = int(model.get("k") or KNN_K)
-    if len(pts) < k:
+    slope = model.get("slope")
+    if not slope or slope <= 0:
         return None
-
-    # pts is sorted by byte count: walk outwards from the insertion point to
-    # collect the k nearest, rather than scanning all of them.
-    lo = bisect.bisect_left(pts, (head_bytes,)) - 1
-    hi = lo + 1
-    near = []
-    while len(near) < k:
-        if lo < 0 and hi >= len(pts):
-            break
-        if lo < 0:
-            near.append(pts[hi]); hi += 1
-        elif hi >= len(pts):
-            near.append(pts[lo]); lo -= 1
-        elif head_bytes - pts[lo][0] <= pts[hi][0] - head_bytes:
-            near.append(pts[lo]); lo -= 1
-        else:
-            near.append(pts[hi]); hi += 1
-
-    rates = [b / d for b, d in near if d > 0]
-    if not rates:
-        return None
-    rate = statistics.median(rates)
-    return (head_bytes / rate) if rate > 0 else None
+    est = slope * float(head_bytes) + (model.get("intercept") or 0.0)
+    return est if est > 0 else None
 
 
 def session_durations(hostname: str, sess: dict) -> tuple[float, float | None]:
@@ -595,7 +613,7 @@ def session_durations(hostname: str, sess: dict) -> tuple[float, float | None]:
         head = float(sess.get("head_bytes") or 0)
     except (TypeError, ValueError):
         head = 0.0
-    implied = _knn_implied_duration(head)
+    implied = _predict_duration(head)
     if implied is not None and implied < api_dur * DURATION_MISMATCH_RATIO:
         return implied, api_dur
     return api_dur, None
