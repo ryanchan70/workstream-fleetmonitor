@@ -1297,7 +1297,12 @@ LEADERBOARD_STATE_FILE = os.path.join(_CACHE_DIR, ".leaderboard_cache.json")
 def _trim_groups(groups: list[dict], today_str: str) -> list[dict]:
     keep = ("id", "session_uuid", "name", "operator", "task", "duration_s",
             "start_time_unix", "mtime", "location", "environment")
-    return [{k: g.get(k) for k in keep} for g in groups if session_is_today(g, today_str)]
+    # size_bytes is derived rather than copied: the projection below drops the
+    # per-file lists _extract_size_bytes falls back to, so the total has to be
+    # taken while the whole record is still in hand. Without it today's
+    # leaderboard has no way to tell a hung session from a long one.
+    return [{**{k: g.get(k) for k in keep}, "size_bytes": _extract_size_bytes(g)}
+            for g in groups if session_is_today(g, today_str)]
 
 def _load_leaderboard_state():
     try:
@@ -1473,13 +1478,16 @@ def build_api_leaderboard(client: FleetAPIClient) -> dict | None:
 
     seen_ids: set[str] = set()
     confirmed_ops: set[str] = set()
-    for label, groups in results.values():
+    for hostname, (label, groups) in results.items():
         for rec in groups:
             if not session_is_today(rec, today_str): continue
             session_id = rec.get("id") or rec.get("session_uuid") or f"{label}|{rec.get('name')}"
             if session_id in seen_ids: continue
             seen_ids.add(session_id)
-            dur = float(rec.get("duration_s") or 0)
+            # Byte-corrected, exactly as the past-day rankings are, so a rig
+            # that hung this morning does not top today's board on wall clock
+            # alone until a sweep catches it tomorrow.
+            dur, _api_dur = session_durations(hostname, rec)
             op = clean_str(rec.get("operator"))
             by_pi[label] = by_pi.get(label, 0.0) + dur
             by_op[op] = by_op.get(op, 0.0) + dur
@@ -1673,7 +1681,10 @@ def verify_on_close():
 
         for rec in groups:
             if session_is_today(rec, today_str):
-                duration = float(rec.get("duration_s") or 0)
+                # The same byte-corrected figure the leaderboard counts, so
+                # this reconciliation cannot overwrite a corrected day total
+                # with the wall clock it was corrected away from.
+                duration, _api_dur = session_durations(hostname, rec)
                 api_day_sum += duration
                 op_name = clean_str(rec.get("operator"))
                 operator_contributions[op_name] = operator_contributions.get(op_name, 0.0) + duration

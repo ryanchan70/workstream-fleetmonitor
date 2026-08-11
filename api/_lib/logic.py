@@ -296,6 +296,23 @@ def agent_alive(state) -> dict | None:
     return a if age <= max(3 * float(a.get("every") or 30), 90) else None
 
 
+def byte_rates(memo_ttl: float = 600.0):
+    """The per-rig bytes/second baselines the last backfill wrote.
+
+    Read on the poll path, which is why it is memoised: the rates only move
+    when a sweep rebuilds them, once an hour, and a warm instance would
+    otherwise spend a billable command per tick re-reading a value that had
+    not changed.
+    """
+    hit = R.memo_get(_BYTE_RATES, memo_ttl)
+    if hit is not None:
+        return hit
+    try:
+        return R.memo_set(_BYTE_RATES, R.jget(_BYTE_RATES) or {})
+    except R.RedisUnavailable:
+        return {}
+
+
 def _bank_observed(stt: dict):
     """Move the in-progress self-tracked segment into its operator's bank.
 
@@ -628,7 +645,8 @@ def poll(force: bool = False, state=None, agent=None, requested=None):
 
         if "today" not in p:
             p["today"] = _migrate_today(today)
-        by_pi, by_op = _rebuild_leaderboard(devices, today, observed, p["today"])
+        by_pi, by_op = _rebuild_leaderboard(devices, today, observed, p["today"],
+                                            byte_rates())
         p["by_pi"], p["by_op"] = by_pi, by_op
 
         # Rides along in the blob that is being written anyway, so claiming the
@@ -755,22 +773,27 @@ def _migrate_today(today):
     merge above exists to prevent.
     """
     out = {}
+    rates = byte_rates()
     try:
         for h, groups in (R.hgetall_json("today_sessions") or {}).items():
             if isinstance(groups, list):
-                out[h] = _aggregate_sessions(groups, today)
+                out[h] = _aggregate_sessions(groups, today, h, rates)
     except R.RedisUnavailable:
         pass
     return out
 
 
-def _aggregate_sessions(groups, today):
+def _aggregate_sessions(groups, today, host=None, rates=None):
     """Today's sessions for one rig, reduced to the two numbers that matter.
 
     Only the totals are ever read back, so only the totals are kept: storing
     the session lists themselves meant a hash big enough to need its own read
     and write every cycle, and it held several hundred records to answer a
     question about fifty sums.
+
+    Durations are byte-corrected on the way in, the same as the past-day
+    totals — otherwise a rig that hung this morning ranks on its wall clock
+    until the day rolls over and a backfill sweep finally sees it.
     """
     seen = set()
     total = 0.0
@@ -782,7 +805,7 @@ def _aggregate_sessions(groups, today):
         if sid in seen:
             continue
         seen.add(sid)
-        dur = float(rec.get("duration_s") or 0)
+        dur, _api_dur = C.session_durations(host, rec, rates)
         if dur <= 0:
             continue
         total += dur
@@ -791,12 +814,18 @@ def _aggregate_sessions(groups, today):
     return {"d": today, "s": round(total, 2), "op": by_op}
 
 
-def _rebuild_leaderboard(devices, today, observed, cache):
+def _rebuild_leaderboard(devices, today, observed, cache, rates=None):
     """Today's per-Pi / per-operator totals from the API session lists, topped
     up by our own observed time where the API has not caught up yet.
 
     `cache` is the per-rig aggregate carried in the state blob; it is updated
     in place and the caller writes it back with everything else.
+
+    NOTE: the self-tracked top-up below cannot be byte-corrected. It exists for
+    sessions the API has not reported yet, which is exactly when there are no
+    final bytes to judge a duration against — a recording still in progress has
+    written only part of what it will. Those land on the API's corrected figure
+    once the session finishes and is fetched.
     """
     by_pi, by_op = {}, {}
     status = {d.get("hostname"): C.get_status(d) for d in devices if d.get("hostname")}
@@ -814,7 +843,7 @@ def _rebuild_leaderboard(devices, today, observed, cache):
                           RIG_SHARD_TARGET)
     for h, groups in _gather(fleet.device_sessions, targets,
                              SESSION_FETCH_BUDGET).items():
-        fresh = _aggregate_sessions(groups, today)
+        fresh = _aggregate_sessions(groups, today, h, rates)
         # A device that answers with nothing is almost always a failed or
         # truncated fetch, not a rig that un-recorded its morning. Taking the
         # larger of the two keeps the total monotonic through the day, which
