@@ -235,6 +235,24 @@ def task_label(rec: dict) -> str:
     return "Untitled task"
 
 
+def is_test_task(task) -> bool:
+    """True when a task name mentions a test, case-insensitively.
+
+    Test sessions are real recordings — they burn disk and show up in the
+    history — but they are not work, so the ranked totals leave them out while
+    still listing them under the rig and the operator.
+
+    A plain substring, so it also catches names with no word boundary to find:
+    ls4test, IM4TEST, SMOKE_TEST_PR68_AUTOMATED. The cost of that breadth is
+    that a genuine task whose name happens to contain the letters is excluded
+    too — "LS4-1285 Filling Test Tubes" is the live example, 11 sessions and
+    10.3 hours of real work. Name matching is the only signal available: the
+    fleet API carries its own `test` boolean, and it is False on all 2215
+    sessions in the sample, so it cannot be used for this.
+    """
+    return "test" in str(task or "").lower()
+
+
 def feedback_id(entry: dict) -> str:
     """Stable id for a feedback submission.
 

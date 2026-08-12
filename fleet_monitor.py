@@ -175,14 +175,19 @@ def _archive_completed_task(hostname: str, label: str, operator: str, task: str,
         # Truncate task name to 20 chars
         task_short = task[:20] if task else "Unknown"
 
-        _completed_tasks[hostname].append({
+        record = {
             "label": label,
             "operator": operator,
             "task": task_short,
             "duration_s": duration_s,
             "start_time": int(start_time_unix),
             "_session_id": f"{label}|{operator}|{task}|{duration_s}|{int(start_time_unix)}"
-        })
+        }
+        # Listed under the rig and the operator, greyed out, but left out of
+        # every ranked total — see is_test_task.
+        if is_test_task(task):
+            record["test"] = True
+        _completed_tasks[hostname].append(record)
     _save_task_history()
 
 dashboard_auth = DashboardAuth()
@@ -693,6 +698,8 @@ def backfill_daily_hours(client: "FleetAPIClient"):
                 continue   # today is handled live by the leaderboard
             if is_weekend(date_str):
                 continue   # skip weekends
+            if is_test_task(sess.get("task")):
+                continue   # listed, never counted — see is_test_task
             dur, api_dur = session_durations(hostname, sess)
             if api_dur is not None:
                 n_estimated += 1
@@ -771,6 +778,10 @@ def backfill_daily_hours(client: "FleetAPIClient"):
                 }
                 if api_dur is not None:
                     record["duration_api_s"] = api_dur
+                # Listed under the rig and the operator, greyed out, but left
+                # out of every ranked total — see is_test_task.
+                if is_test_task(sess.get("task")):
+                    record["test"] = True
                 _completed_tasks[hostname].append(record)
     _save_task_history()
 
@@ -844,6 +855,23 @@ def clean_str(val, default="Unknown"):
     if not val or str(val).strip() in ("", "None", "null", "—"):
         return default
     return str(val).strip()
+
+def is_test_task(task) -> bool:
+    """True when a task name mentions a test, case-insensitively.
+
+    Test sessions are real recordings — they burn disk and show up in the
+    history — but they are not work, so the ranked totals leave them out while
+    still listing them under the rig and the operator, greyed out.
+
+    A plain substring, so it also catches names with no word boundary to find:
+    ls4test, IM4TEST, SMOKE_TEST_PR68_AUTOMATED. The cost of that breadth is
+    that a genuine task whose name happens to contain the letters is excluded
+    too — "LS4-1285 Filling Test Tubes" is the live example, 11 sessions and
+    10.3 hours of real work. Name matching is the only signal available: the
+    fleet API carries its own `test` boolean, and it is False on all 2215
+    sessions in the sample, so it cannot be used for this.
+    """
+    return "test" in str(task or "").lower()
 
 def parse_duration_from_log(duration_str: str) -> float:
     duration_str = duration_str.strip()
@@ -1574,6 +1602,9 @@ def build_api_leaderboard(client: FleetAPIClient) -> dict | None:
             session_id = rec.get("id") or rec.get("session_uuid") or f"{label}|{rec.get('name')}"
             if session_id in seen_ids: continue
             seen_ids.add(session_id)
+            # Test sessions are listed but never counted — see is_test_task.
+            if is_test_task(rec.get("task")):
+                continue
             # Byte-corrected, exactly as the past-day rankings are, so a rig
             # that hung this morning does not top today's board on wall clock
             # alone until a sweep catches it tomorrow.
@@ -1770,7 +1801,7 @@ def verify_on_close():
             continue
 
         for rec in groups:
-            if session_is_today(rec, today_str):
+            if session_is_today(rec, today_str) and not is_test_task(rec.get("task")):
                 # The same byte-corrected figure the leaderboard counts, so
                 # this reconciliation cannot overwrite a corrected day total
                 # with the wall clock it was corrected away from.
@@ -2020,6 +2051,8 @@ class EmbeddedUIServer(BaseHTTPRequestHandler):
                         continue
                     for sess in entry.get("sessions", {}).values():
                         if sess.get("date") not in past_days:
+                            continue
+                        if is_test_task(sess.get("task")):
                             continue
                         # Byte-implied duration wherever it disagrees with the
                         # API's wall clock, so a hung session can't rank a rig

@@ -323,6 +323,12 @@ def _bank_observed(stt: dict):
     credit 100% of a rig's self-tracked overflow to whichever operator
     happened to be on it last.
     """
+    # A test session is never banked, so its time cannot reach the ranked
+    # totals through the self-tracked top-up either — see C.is_test_task. The
+    # segment is dropped rather than stored and filtered later, because the
+    # bank is keyed by operator alone and loses the task name.
+    if C.is_test_task(stt.get("cur_task")):
+        return
     op = stt.get("cur_op") or "Unknown"
     by_op = stt.setdefault("banked_by_op", {})
     by_op[op] = by_op.get(op, 0.0) + stt["cur_dur"]
@@ -809,6 +815,9 @@ def _aggregate_sessions(groups, today, host=None, rates=None):
         dur, _api_dur = C.session_durations(host, rec, rates)
         if dur <= 0:
             continue
+        # Test sessions are listed but never counted — see C.is_test_task.
+        if C.is_test_task(rec.get("task")):
+            continue
         total += dur
         op = C.clean_str(rec.get("operator"))
         by_op[op] = by_op.get(op, 0.0) + dur
@@ -893,6 +902,8 @@ def _rebuild_leaderboard(devices, today, observed, cache, rates=None):
         h = d.get("hostname")
         if not h or status.get(h) != "recording":
             continue
+        if C.is_test_task(d.get("task")):
+            continue
         dur = float(d.get("recording_duration_s") or 0)
         label = labels.get(h, h)
         op = C.clean_str(d.get("operator"))
@@ -935,11 +946,14 @@ def _record_finished(finished):
     """
     entries = {}
     for f in finished:
-        entries.setdefault(f["hostname"], []).append({
+        entry = {
             "label": f["label"], "operator": f["operator"], "task": f["task"],
             "duration_s": f["duration_s"], "start_time": f["start_time"],
             "src": "live",
-        })
+        }
+        if C.is_test_task(f["task"]):
+            entry["test"] = True
+        entries.setdefault(f["hostname"], []).append(entry)
 
     history = R.history_load()
     _history_touch(history, entries)
@@ -1112,9 +1126,10 @@ def backfill_due(state=None) -> bool:
 def _past_day_totals(named, all_sessions, labels, today, rates):
     """Per-day hours and the per-day rig/operator split, from stored sessions.
 
-    Excludes today (handled live) and weekends (excluded by request). Counts
-    the byte-implied duration wherever the session's size contradicts the API's
-    wall clock.
+    Excludes today (handled live), weekends (excluded by request) and test
+    sessions (see C.is_test_task — they stay in the per-day task lists, they
+    just do not count). Counts the byte-implied duration wherever the session's
+    size contradicts the API's wall clock.
 
     Returns (by_day, breakdown).
     """
@@ -1128,6 +1143,8 @@ def _past_day_totals(named, all_sessions, labels, today, rates):
                 continue
             ds = sess.get("date")
             if not ds or ds == today or C.is_weekend(ds):
+                continue
+            if C.is_test_task(sess.get("task")):
                 continue
             dur, _api_dur = C.session_durations(host, sess, rates)
             if dur <= 0:
@@ -1271,6 +1288,10 @@ def backfill(force: bool = False) -> dict:
                 }
                 if api_dur is not None:
                     task["duration_api_s"] = api_dur
+                # Listed under the rig and the operator, greyed out, but left
+                # out of every ranked total — see C.is_test_task.
+                if C.is_test_task(entry["task"]):
+                    task["test"] = True
                 new_tasks.append(task)
             tasks_by_host[host] = new_tasks
             _reconcile_unknown(history_tasks.get(host), new_tasks)

@@ -916,6 +916,14 @@
         .rank-task-who { color: #7c8798; }
         .rank-task-dur { font-family: 'Geist Mono', monospace; color: #93c5fd; }
         .rank-empty { color: var(--text-muted); }
+        /* A test session: listed under the rig and the operator so the time is
+           still accounted for visibly, but greyed because none of it is in the
+           total above. Each child carries its own colour, so they are all
+           overridden rather than relying on inheritance. */
+        .rank-task-excluded .rank-task-when,
+        .rank-task-excluded .rank-task-name,
+        .rank-task-excluded .rank-task-who,
+        .rank-task-excluded .rank-task-dur { color: #6b7280; }
         @media (max-width: 600px) {
             .rank-task { grid-template-columns: 1fr auto; }
             .rank-task-when, .rank-task-who { font-size: 0.7rem; }
@@ -1226,6 +1234,9 @@
            imply a different recording length. The figure in front of it is the
            byte estimate — this red one is what it replaced. */
         .dur-api { color: var(--accent-red); }
+        /* Same treatment in the task history panel, so a test session reads the
+           same way wherever it is listed. */
+        .task-entry.task-excluded { color: #6b7280; }
     </style>
 </head>
 <body>
@@ -3223,7 +3234,11 @@
         }
         mine.sort((a, b) => (b.start_time || 0) - (a.start_time || 0));
         cell.innerHTML = mine.map(t =>
-            '<div class="rank-task">' +
+            // A test session is still listed here — it happened, and hiding it
+            // makes a rig look idle for time it spent recording — but it is
+            // greyed out and its duration is not in the total above.
+            '<div class="rank-task' + (t.test ? ' rank-task-excluded' : '') + '"' +
+                (t.test ? ' title="Test session — listed, but not counted in the total"' : '') + '>' +
                 '<span class="rank-task-when">' + esc(formatStart(t)) + '</span>' +
                 '<span class="rank-task-name">' + esc(taskLabel(t)) + '</span>' +
                 // A rig row lists who ran each task; an operator row lists
@@ -3455,7 +3470,9 @@
                 const startStr = formatStart(task);
                 const dur = formatDuration(task.duration_s);
                 const taskName = taskLabel(task);
-                html += `<div class="task-entry">${esc(startStr)} — ${esc(task.operator)} / ${esc(taskName)} (${dur})${apiDurationHtml(task)}</div>`;
+                const cls = task.test ? 'task-entry task-excluded' : 'task-entry';
+                const tip = task.test ? ' title="Test session — not counted in the ranked totals"' : '';
+                html += `<div class="${cls}"${tip}>${esc(startStr)} — ${esc(task.operator)} / ${esc(taskName)} (${dur})${apiDurationHtml(task)}</div>`;
             });
             html += '</div>';
         });

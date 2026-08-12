@@ -583,6 +583,10 @@ class handler(BaseHTTPRequestHandler):
                 # red next to the duration above.
                 if api_dur is not None:
                     task["duration_api_s"] = api_dur
+                # Still listed, greyed out by the dashboard, but excluded from
+                # every ranked total — see C.is_test_task.
+                if C.is_test_task(sess.get("task")):
+                    task["test"] = True
                 out.append(task)
 
         out.sort(key=lambda t: t.get("start_time") or 0, reverse=True)
