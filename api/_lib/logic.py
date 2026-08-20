@@ -314,6 +314,63 @@ def duration_model(memo_ttl: float = 600.0):
         return {}
 
 
+_NOTES_ALL = "notes:all"
+# How long a full sweep of the fleet's notes stands. Notes are written by hand
+# in the fleet UI and then sit for weeks, so this trades a few minutes of
+# staleness for not re-reading 75 rigs on every dashboard load.
+NOTES_TTL = 300
+NOTES_PARTIAL_TTL = 60
+NOTES_FETCH_BUDGET = 15.0
+
+
+def notes_all(force: bool = False) -> dict:
+    """Every rig's notes, keyed by hostname — only rigs that have any.
+
+    The tiles need this to decide whether to show a Notes control at all, so
+    it is read by every open tab on every load. The fleet has no bulk notes
+    endpoint — GET /api/notes is 405, the collection only accepts POST — so
+    the only way to answer "which rigs have notes" is one call per rig. Hence
+    the cache: the fan-out happens once per NOTES_TTL for the whole fleet
+    rather than once per page load.
+
+    A sweep that only partially answered is still cached, so a slow fleet does
+    not mean re-running 75 requests on the next load — but for a fraction of
+    the time, because the rigs that timed out would otherwise look like rigs
+    with nothing written about them.
+    """
+    if not force:
+        try:
+            cached = R.jget(_NOTES_ALL)
+        except R.RedisUnavailable:
+            cached = None
+        if cached:
+            return cached
+
+    rigs = ((load_state().get("view") or {}).get("devices") or {}).get("rigs") or []
+    hosts = [r.get("hostname") for r in rigs if r.get("hostname")]
+    if not hosts:
+        # Nothing has polled yet this container knows about; ask the fleet
+        # directly rather than returning "no rig has notes", which the tiles
+        # cannot tell apart from a real answer.
+        hosts = [d.get("hostname") for d in (fleet.fleet_status() or []) if d.get("hostname")]
+
+    got = _gather(fleet.device_notes, hosts, NOTES_FETCH_BUDGET)
+    payload = {
+        "at": time.time(),
+        # device_notes returns None for a host the fleet does not know; both
+        # that and [] mean "no note to show".
+        "notes": {h: n for h, n in got.items() if n},
+        "rigs": len(hosts),
+        "answered": len(got),
+    }
+    complete = len(got) == len(hosts)
+    try:
+        R.jset(_NOTES_ALL, payload, ttl=NOTES_TTL if complete else NOTES_PARTIAL_TTL)
+    except R.RedisUnavailable:
+        pass
+    return payload
+
+
 def _bank_observed(stt: dict):
     """Move the in-progress self-tracked segment into its operator's bank.
 
@@ -652,9 +709,10 @@ def poll(force: bool = False, state=None, agent=None, requested=None):
 
         if "today" not in p:
             p["today"] = _migrate_today(today)
-        by_pi, by_op = _rebuild_leaderboard(devices, today, observed, p["today"],
-                                            duration_model())
+        by_pi, by_op, by_pi_api, by_op_api = _rebuild_leaderboard(
+            devices, today, observed, p["today"], duration_model())
         p["by_pi"], p["by_op"] = by_pi, by_op
+        p["by_pi_api"], p["by_op_api"] = by_pi_api, by_op_api
 
         # Rides along in the blob that is being written anyway, so claiming the
         # loop costs the agent nothing.
@@ -672,6 +730,7 @@ def poll(force: bool = False, state=None, agent=None, requested=None):
         }
 
         st["view"] = _build_view(st, rigs, alerts, by_pi, by_op,
+                                 by_pi_api, by_op_api,
                                  health_point, [_stamp(l) for l in lines])
         R.state_save(st)
 
@@ -685,7 +744,8 @@ def poll(force: bool = False, state=None, agent=None, requested=None):
         raise
 
 
-def _build_view(st, rigs, alerts, by_pi, by_op, health_point, new_lines):
+def _build_view(st, rigs, alerts, by_pi, by_op, by_pi_api, by_op_api,
+                health_point, new_lines):
     """Everything a dashboard tick needs, assembled once per poll.
 
     Assembling it here rather than per request is the whole point: the fleet
@@ -713,6 +773,7 @@ def _build_view(st, rigs, alerts, by_pi, by_op, health_point, new_lines):
     # used to filter them out here, which made the tile disagree with both
     # /stats_range's total (already unfiltered) and the operator leaderboard.
     total_s = sum(by_pi.values())
+    total_s_api = sum(by_pi_api.values())
     online = [r for r in rigs if r.get("online")]
     live = [r["frame_health_pct"] for r in online if r.get("frame_health_pct") is not None]
     prev_stats = prev.get("stats") or {}
@@ -745,11 +806,17 @@ def _build_view(st, rigs, alerts, by_pi, by_op, health_point, new_lines):
                     # Milliseconds since the fleet was last actually polled, so
                     # the UI can say how stale it is rather than implying live.
                     "updated": now_ms, "night": is_night()},
+        # Both rankings ride along on every tick. They are two short lists of
+        # names and numbers, and sending both means the aggregate toggle is a
+        # client-side switch rather than a refetch.
         "rankings": {"pi": C.ranked(by_pi, hide_unnamed=True),
                      "operator": C.ranked(by_op),
+                     "pi_api": C.ranked(by_pi_api, hide_unnamed=True),
+                     "operator_api": C.ranked(by_op_api),
                      "active": True, "source": "api"},
         "stats": {
             "total_hours_today": round(total_s / 3600, 3),
+            "total_hours_today_api": round(total_s_api / 3600, 3),
             "avg_frame_health_pct": avg_fh,
             "min_frame_health_pct": min_fh,
             "overall_frame_health_pct": overall_fh,
@@ -791,20 +858,22 @@ def _migrate_today(today):
 
 
 def _aggregate_sessions(groups, today, host=None, rates=None):
-    """Today's sessions for one rig, reduced to the two numbers that matter.
+    """Today's sessions for one rig, reduced to the numbers that matter.
 
     Only the totals are ever read back, so only the totals are kept: storing
     the session lists themselves meant a hash big enough to need its own read
     and write every cycle, and it held several hundred records to answer a
     question about fifty sums.
 
-    Durations are byte-corrected on the way in, the same as the past-day
-    totals — otherwise a rig that hung this morning ranks on its wall clock
-    until the day rolls over and a backfill sweep finally sees it.
+    Each total is kept twice: "s"/"op" count the byte estimate, "s_api"/
+    "op_api" the API's own wall clock. The dashboard's aggregate toggle picks
+    between them, so both have to be summed here — deriving one from the other
+    later is impossible once the per-session pairs have been added up.
     """
     seen = set()
     total = 0.0
-    by_op = {}
+    total_api = 0.0
+    by_op, by_op_api = {}, {}
     for rec in groups or []:
         if not C.session_is_today(rec, today):
             continue
@@ -812,16 +881,22 @@ def _aggregate_sessions(groups, today, host=None, rates=None):
         if sid in seen:
             continue
         seen.add(sid)
-        dur, _api_dur = C.session_durations(host, rec, rates)
+        dur, api_dur = C.session_durations(host, rec, rates)
         if dur <= 0:
             continue
         # Test sessions are listed but never counted — see C.is_test_task.
         if C.is_test_task(rec.get("task")):
             continue
+        # An unestimated session has no second figure; it counts the same on
+        # both sides rather than dropping out of the API total.
+        api_dur = dur if api_dur is None else api_dur
         total += dur
+        total_api += api_dur
         op = C.clean_str(rec.get("operator"))
         by_op[op] = by_op.get(op, 0.0) + dur
-    return {"d": today, "s": round(total, 2), "op": by_op}
+        by_op_api[op] = by_op_api.get(op, 0.0) + api_dur
+    return {"d": today, "s": round(total, 2), "op": by_op,
+            "s_api": round(total_api, 2), "op_api": by_op_api}
 
 
 def _rebuild_leaderboard(devices, today, observed, cache, rates=None):
@@ -838,6 +913,11 @@ def _rebuild_leaderboard(devices, today, observed, cache, rates=None):
     once the session finishes and is fetched.
     """
     by_pi, by_op = {}, {}
+    # The same totals on the API's wall clock, for the aggregate toggle. The
+    # self-tracked and in-progress top-ups below are wall clock on both sides
+    # — there are no final bytes to estimate from yet — so they are added to
+    # each pair identically and only the session-derived part diverges.
+    by_pi_api, by_op_api = {}, {}
     status = {d.get("hostname"): C.get_status(d) for d in devices if d.get("hostname")}
     labels = {d.get("hostname"): C.device_label(d) for d in devices if d.get("hostname")}
 
@@ -869,6 +949,13 @@ def _rebuild_leaderboard(devices, today, observed, cache, rates=None):
         by_pi[label] = by_pi.get(label, 0.0) + float(agg.get("s") or 0)
         for op, dur in (agg.get("op") or {}).items():
             by_op[op] = by_op.get(op, 0.0) + float(dur)
+        # Aggregates cached before the API side existed carry only "s"/"op".
+        # Falling back to those keeps a rig in the API total at its estimate
+        # until the next sweep rewrites it, rather than zeroing it.
+        by_pi_api[label] = by_pi_api.get(label, 0.0) + float(
+            agg.get("s_api", agg.get("s")) or 0)
+        for op, dur in (agg.get("op_api") or agg.get("op") or {}).items():
+            by_op_api[op] = by_op_api.get(op, 0.0) + float(dur)
 
     # Fold in self-tracked time using max(), never addition, so a host can
     # never be counted from both its API total and its observed total.
@@ -884,9 +971,14 @@ def _rebuild_leaderboard(devices, today, observed, cache, rates=None):
         obs = sum(by_op_secs.values())
         if obs <= 0:
             continue
-        api = by_pi.get(label, 0.0)
-        if obs > api:
-            by_pi[label] = obs
+        # Applied to each side against its own baseline: the estimate total is
+        # usually the lower of the two on a hung rig, so a single shared
+        # comparison would top one side up using the other's shortfall.
+        for pi_side, op_side in ((by_pi, by_op), (by_pi_api, by_op_api)):
+            api = pi_side.get(label, 0.0)
+            if obs <= api:
+                continue
+            pi_side[label] = obs
             # Split the overflow across the operators who actually banked
             # it, proportional to each one's share — crediting all of it to
             # whichever operator is currently on the rig (the old behaviour)
@@ -895,7 +987,7 @@ def _rebuild_leaderboard(devices, today, observed, cache, rates=None):
             # would not add up to this same total.
             extra = obs - api
             for op, secs in by_op_secs.items():
-                by_op[op] = by_op.get(op, 0.0) + extra * (secs / obs)
+                op_side[op] = op_side.get(op, 0.0) + extra * (secs / obs)
 
     # In-progress recordings are not in the session API yet.
     for d in devices:
@@ -909,8 +1001,10 @@ def _rebuild_leaderboard(devices, today, observed, cache, rates=None):
         op = C.clean_str(d.get("operator"))
         by_pi[label] = by_pi.get(label, 0.0) + dur
         by_op[op] = by_op.get(op, 0.0) + dur
+        by_pi_api[label] = by_pi_api.get(label, 0.0) + dur
+        by_op_api[op] = by_op_api.get(op, 0.0) + dur
 
-    return by_pi, by_op
+    return by_pi, by_op, by_pi_api, by_op_api
 
 
 # ── History ───────────────────────────────────────────────────────────────
@@ -1088,9 +1182,9 @@ def _reconcile_unknown(entries, fresh):
             e["duration_s"] = f["duration_s"]
             e["start_time"] = f["start_time"]
             e["src"] = "api"
-            # f's duration may be the byte estimate rather than the API's own
-            # span; carry the rejected figure across too, or this row would
-            # show a corrected duration with nothing to explain it.
+            # f's duration is the byte estimate wherever there is one; carry
+            # the API's own span across too, or this row would show an
+            # estimated duration with nothing to compare it against.
             if f.get("duration_api_s") is None:
                 e.pop("duration_api_s", None)
             else:
@@ -1128,12 +1222,13 @@ def _past_day_totals(named, all_sessions, labels, today, rates):
 
     Excludes today (handled live), weekends (excluded by request) and test
     sessions (see C.is_test_task — they stay in the per-day task lists, they
-    just do not count). Counts the byte-implied duration wherever the session's
-    size contradicts the API's wall clock.
+    just do not count). Counts the byte-implied duration, and carries the
+    API's own wall clock alongside it for the aggregate toggle.
 
-    Returns (by_day, breakdown).
+    Returns (by_day, by_day_api, breakdown), where each breakdown day holds
+    "pi"/"op" on the estimate and "pi_api"/"op_api" on the API.
     """
-    by_day, breakdown = {}, {}
+    by_day, by_day_api, breakdown = {}, {}, {}
     for host, _ in named:
         stored = all_sessions.get(host)
         if stored is None:
@@ -1146,16 +1241,23 @@ def _past_day_totals(named, all_sessions, labels, today, rates):
                 continue
             if C.is_test_task(sess.get("task")):
                 continue
-            dur, _api_dur = C.session_durations(host, sess, rates)
+            dur, api_dur = C.session_durations(host, sess, rates)
             if dur <= 0:
                 continue
+            # No estimate means the one figure counts on both sides, rather
+            # than the session vanishing from the API total.
+            api_dur = dur if api_dur is None else api_dur
             by_day[ds] = by_day.get(ds, 0.0) + dur
-            day = breakdown.setdefault(ds, {"pi": {}, "op": {}})
+            by_day_api[ds] = by_day_api.get(ds, 0.0) + api_dur
+            day = breakdown.setdefault(
+                ds, {"pi": {}, "op": {}, "pi_api": {}, "op_api": {}})
             label = sess.get("label") or labels.get(host) or host
             day["pi"][label] = day["pi"].get(label, 0.0) + dur
+            day["pi_api"][label] = day["pi_api"].get(label, 0.0) + api_dur
             op = sess.get("operator") or "Unknown"
             day["op"][op] = day["op"].get(op, 0.0) + dur
-    return by_day, breakdown
+            day["op_api"][op] = day["op_api"].get(op, 0.0) + api_dur
+    return by_day, by_day_api, breakdown
 
 
 def backfill(force: bool = False) -> dict:
@@ -1275,8 +1377,9 @@ def backfill(force: bool = False) -> dict:
         for host, entries in fetched_entries.items():
             new_tasks = []
             for entry in entries:
-                # dur is what the history counts; api_dur is only carried so
-                # the dashboard can show, in red, the number it replaced.
+                # dur is what the history counts — the byte estimate wherever
+                # there is one. api_dur is the API's own span, carried on every
+                # estimated session so the dashboard can show both.
                 dur, api_dur = C.session_durations(host, entry, rates)
                 task = {
                     "label": entry["label"],
@@ -1304,7 +1407,7 @@ def backfill(force: bool = False) -> dict:
         # weekends (excluded by request). The same pass builds the per-day
         # rig/operator split, so /stats_range no longer has to re-read every
         # session hash on every request.
-        by_day, breakdown = _past_day_totals(
+        by_day, by_day_api, breakdown = _past_day_totals(
             named, all_sessions, labels, today, rates)
 
         if by_day:
@@ -1340,7 +1443,11 @@ def backfill(force: bool = False) -> dict:
 
         _history_touch(history, tasks_by_host)
         if by_day:
-            history["days"] = [{"date": d, "hours": round(s / 3600, 3)}
+            # Each day carries both figures on the one record, so the chart
+            # can switch series without refetching the history blob.
+            history["days"] = [{"date": d, "hours": round(s / 3600, 3),
+                                "hours_api": round(
+                                    by_day_api.get(d, s) / 3600, 3)}
                                for d, s in sorted(by_day.items())]
             history["breakdown"] = breakdown
         history["health"] = list((R.state_load().get("poll") or {}).get("health")

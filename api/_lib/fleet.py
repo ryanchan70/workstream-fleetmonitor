@@ -156,3 +156,12 @@ def fleet_status():
 
 def device_sessions(hostname: str):
     return with_retry(lambda c: c.get_device_sessions(hostname)) or []
+
+
+def device_notes(hostname: str):
+    """The fleet's notes for one rig, or None if it does not know the host.
+
+    `or []` is deliberately absent: None is a real answer here, and collapsing
+    it would turn an unknown hostname into "no notes yet".
+    """
+    return with_retry(lambda c: c.get_device_notes(hostname))

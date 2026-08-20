@@ -22,6 +22,11 @@
             --accent-yellow: #f59e0b;
             --text-main: #f3f4f6;
             --text-muted: #9ca3af;
+            /* Which duration an aggregate was summed from. Every total on the
+               page carries one of these two colours, so a number read off the
+               dashboard is never ambiguous about its source. */
+            --agg-est: #32a6a8;
+            --agg-api: #3273a8;
         }
 
         body {
@@ -386,6 +391,23 @@
             font-weight: 700;
             color: #ff3333;
         }
+        /* Notes reads as one more entry in the tile's stats line rather than
+           a control bolted onto it, so `font: inherit` picks up the monospace
+           the line is set in. It is only ever rendered for a rig that has a
+           note, which is what makes it safe to put inline: it never displaces
+           a health figure on a tile with nothing to say. */
+        .rig-notes-btn {
+            font: inherit;
+            color: var(--accent-blue);
+            background: none;
+            border: none;
+            padding: 0;
+            cursor: pointer;
+            text-decoration: underline dotted;
+            text-underline-offset: 2px;
+        }
+        .rig-notes-btn:hover { text-decoration-style: solid; }
+        .rig-notes-btn:focus-visible { outline: 2px solid var(--accent-blue); outline-offset: 2px; }
         .rig-filter {
             display: flex;
             flex-wrap: wrap;
@@ -439,6 +461,37 @@
         /* During the cooldown the button says what it is doing and why it is
            not available, rather than silently ignoring clicks. */
         .action-btn:disabled { opacity: 0.4; cursor: default; }
+
+        /* ── Aggregate source: two halves of one control ──────────────────
+           Which duration every total on the page is summed from. The selected
+           half carries that source's own colour — the same colour the totals,
+           the ranked badges and the daily bars are drawn in — so the control
+           and the numbers it governs always read as one thing.
+
+           The colours themselves are set inline from --agg-est / --agg-api
+           rather than hard-coded here, because the chart needs the same two
+           values as rgb triples and there is no point holding them twice. */
+        .agg-source-group { display: inline-flex; }
+        .agg-source-group .action-btn { border-radius: 0; }
+        .agg-source-group .action-btn:first-child { border-radius: 6px 0 0 6px; }
+        /* Pulled onto its neighbour so the pair shares one seam rather than
+           showing two adjacent 1px borders. */
+        .agg-source-group .action-btn:last-child {
+            border-radius: 0 6px 6px 0;
+            margin-left: -1px;
+        }
+        /* The selected half sits above the seam, or its neighbour's border
+           would cut across the colour that marks it. */
+        .agg-source-group .action-btn[aria-pressed="true"] {
+            position: relative;
+            z-index: 1;
+            font-weight: 700;
+        }
+        /* Hover must not imply the other half is already active. */
+        .agg-source-group .action-btn[aria-pressed="false"]:hover {
+            border-color: #3f4c63;
+            color: var(--text-main);
+        }
         .rate-select {
             font-family: inherit;
             font-size: 0.7rem;
@@ -1230,18 +1283,120 @@
             .task-entry { font-size: 0.8rem; }
         }
         .task-pi-group { min-width: 0; }
-        /* The fleet API's own duration, shown only when the session's bytes
-           imply a different recording length. The figure in front of it is the
-           byte estimate — this red one is what it replaced. */
-        .dur-api { color: var(--accent-red); }
+        /* The fleet API's own duration, in parentheses after the byte estimate
+           on every recording that carries one. The figure in front of it is
+           what gets counted; this is the wall clock it was measured against.
+
+           Tinted by how far the two have drifted, because the interesting
+           cases are invisible otherwise: a rig whose clock was 15 days slow
+           reported a two-hour recording as 374 hours, and at one flat colour
+           that read exactly like a rounding difference. Under 5% is noise the
+           model's own residual accounts for, so it stays grey. */
+        .dur-api { color: var(--text-muted); }
+        .dur-api.drift-warn { color: var(--accent-yellow); }
+        .dur-api.drift-bad  { color: var(--accent-red); font-weight: 600; }
         /* Same treatment in the task history panel, so a test session reads the
            same way wherever it is listed. */
         .task-entry.task-excluded { color: #6b7280; }
+
+        /* ── Per-rig notes overlay ────────────────────────────────────────
+           A native <dialog> opened with showModal(), rather than the
+           hidden-div pattern the alert panel uses: that buys the focus trap,
+           Escape-to-close and the top-layer stacking for free, none of which
+           this would otherwise get right. Centred over a dimmed page rather
+           than anchored to the tile, because the grid reflows on every poll
+           and a tile-anchored panel would walk across the screen mid-read. */
+        .notes-modal {
+            width: calc(100vw - 32px);
+            max-width: 460px;
+            max-height: 80vh;
+            padding: 0;
+            color: var(--text-main);
+            background: var(--card-bg);
+            border: 1px solid #1f2937;
+            border-left: 4px solid var(--accent-blue);
+            border-radius: 10px;
+            box-shadow: 0 16px 40px rgba(0,0,0,0.6);
+        }
+        /* display lives here, not on the base rule: a closed <dialog> is
+           hidden by the UA stylesheet, and any author-level `display` beats
+           that — a `display: flex` above would leave the modal on screen
+           before it is ever opened. */
+        .notes-modal[open] {
+            display: flex;
+            flex-direction: column;
+            animation: notes-in 0.18s ease-out;
+        }
+        .notes-modal::backdrop { background: rgba(2, 6, 15, 0.72); }
+        @keyframes notes-in {
+            from { opacity: 0; transform: translateY(12px) scale(0.98); }
+            to   { opacity: 1; transform: translateY(0) scale(1); }
+        }
+        .notes-head {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 10px;
+            padding: 12px 8px 12px 14px;
+            border-bottom: 1px solid #1f2937;
+        }
+        .notes-title { font-size: 0.9rem; font-weight: 700; overflow-wrap: anywhere; }
+        .notes-host {
+            display: block;
+            margin-top: 2px;
+            font-family: 'Geist Mono', monospace;
+            font-size: 0.7rem;
+            font-weight: 400;
+            color: var(--text-muted);
+        }
+        .notes-close {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            font-size: 1.2rem;
+            line-height: 1;
+            cursor: pointer;
+            padding: 4px 8px;
+            border-radius: 6px;
+            flex: none;
+        }
+        .notes-close:hover { color: var(--text-main); }
+        .notes-close:focus-visible { outline: 2px solid var(--accent-blue); outline-offset: 2px; }
+        .notes-body {
+            padding: 6px 14px 14px;
+            overflow-y: auto;
+            font-size: 0.82rem;
+            line-height: 1.5;
+        }
+        .note-item {
+            padding: 10px 0;
+            border-bottom: 1px solid rgba(31,41,55,0.7);
+        }
+        .note-item:last-child { border-bottom: none; }
+        .note-text { color: var(--text-main); overflow-wrap: anywhere; white-space: pre-wrap; }
+        .note-meta {
+            margin-top: 4px;
+            font-size: 0.7rem;
+            color: var(--text-muted);
+            overflow-wrap: anywhere;
+        }
+        .notes-empty, .notes-loading { padding: 14px 0; color: var(--text-muted); }
+        .notes-error { padding: 14px 0; color: var(--accent-red); overflow-wrap: anywhere; }
     </style>
 </head>
 <body>
 
 <div id="toast-host"></div>
+
+<dialog id="notes-modal" class="notes-modal" aria-labelledby="notes-title">
+    <div class="notes-head">
+        <div class="notes-title" id="notes-title"><span id="notes-title-text">Notes</span>
+            <span class="notes-host" id="notes-host"></span>
+        </div>
+        <button type="button" class="notes-close" onclick="closeNotes()" aria-label="Close notes">&times;</button>
+    </div>
+    <div class="notes-body" id="notes-body"></div>
+</dialog>
 
 <div id="new-changes-popup" class="new-changes-popup hidden" aria-label="New changes">
     <div class="ncp-head">
@@ -1400,6 +1555,18 @@
                 <span id="stat-last-updated" style="font-size:0.75rem;color:var(--text-muted);font-weight:400;"></span>
                 <button type="button" id="backfill-btn" class="action-btn" onclick="manualBackfill(event)"
                         title="Re-sweep session history for every rig">&#8635; Backfill</button>
+                <!-- The header collapses the card on click, so this has to stop
+                     the event travelling — same guard the task history's
+                     reverse button uses. -->
+                <span onclick="event.stopPropagation()" class="agg-source-group"
+                      role="group" aria-label="Which duration the totals are summed from">
+                    <button type="button" id="agg-src-est" class="action-btn"
+                            aria-pressed="true"
+                            onclick="setAggSource('est', event)">Estimates</button>
+                    <button type="button" id="agg-src-api" class="action-btn"
+                            aria-pressed="false"
+                            onclick="setAggSource('api', event)">API</button>
+                </span>
             </div>
             <span class="chevron" id="stats-chev">▾</span>
         </div>
@@ -1663,7 +1830,9 @@
         try {
             // ?force=1 bypasses the server's cadence gate (and the night
             // throttle) in the same invocation that returns the fresh data.
-            await fetchUpdates(true, true);
+            // Notes are swept on their own five-minute cache, so Refresh is
+            // also the way to see a note added in the fleet UI moments ago.
+            await Promise.all([fetchUpdates(true, true), fetchNotes(true)]);
         } finally {
             manualPollBusy = false;
             runCooldown(btn, 5, '↻ Refresh');
@@ -1960,6 +2129,12 @@
         hydrateFromCache();
         reportAgent();
         loadNewChanges();
+        // Its own cadence, not the poll's: the sweep behind it is cached
+        // server-side for the same five minutes, so asking on every tick would
+        // just be re-reading one cached blob thirty times an hour.
+        fetchNotes();
+        if (notesTimer) clearInterval(notesTimer);
+        notesTimer = setInterval(fetchNotes, NOTES_REFRESH_MS);
         // Forced: a tab that just opened has nothing to show, and might not
         // win the poll lease. The server's cadence gate makes this cheap if
         // another device polled moments ago.
@@ -2382,6 +2557,10 @@
                 else if (r.storage_free_gb != null) stats.push('&#128190; ' + r.storage_free_gb.toFixed(0) + ' GB free');
                 else if (r.storage_free_pct != null) stats.push('&#128190; ' + r.storage_free_pct.toFixed(0) + '% free');
             }
+            // Outside the online/offline split on purpose: a note explaining
+            // why a rig is down is exactly what you want on the tile of a rig
+            // that is down.
+            stats.push(notesChip(r));
             const meta = [];
             if (r.location) meta.push('Loc: ' + esc(r.location));
             if (r.operator && r.operator !== 'Unknown') meta.push('Op: ' + esc(r.operator));
@@ -2424,6 +2603,153 @@
                '&#8617; ' + esc(bits.join(' / ')) + ' &mdash; ended ' + esc(when) +
                '</span>';
     }
+
+    // ── Per-rig notes ────────────────────────────────────────────────────
+    //
+    // Notes are the fleet's own record — "goes offline, hotspot spotty in
+    // field" — and they live on fleet.shiftiq.us, not in this dashboard's
+    // state. /api/notes/<hostname> reads them through on demand.
+    //
+    // Deliberately NOT part of the poll: the fleet has no bulk notes endpoint,
+    // so one sweep costs a request per rig. /api/notes does that sweep behind a
+    // five-minute cache and hands back only the rigs that have something, and
+    // this page reads it on load and on the same cadence. A note added in the
+    // fleet UI therefore takes a few minutes to surface a control here.
+    let notesByHost = {};     // hostname -> [note, ...], for rigs that have any
+    let notesHost = null;     // hostname the overlay is currently showing
+
+    // Only rendered for a rig that actually has a note — which is what lets
+    // this sit inline in the stats line without pushing anything around on the
+    // sixty-odd tiles that have nothing to show.
+    function notesChip(r) {
+        const notes = notesByHost[r.hostname];
+        if (!notes || !notes.length) return '';
+        const label = notes.length === 1 ? '1 note' : notes.length + ' notes';
+        return '<button type="button" class="rig-notes-btn"' +
+               ' onclick="openNotes(\'' + jsAttr(r.hostname) + '\', \'' + jsAttr(r.label) + '\')"' +
+               ' title="Maintenance notes for this rig">' + label + '</button>';
+    }
+
+    async function openNotes(hostname, label) {
+        const dlg  = document.getElementById('notes-modal');
+        const body = document.getElementById('notes-body');
+        notesHost = hostname;
+        document.getElementById('notes-title-text').textContent = 'Notes — ' + label;
+        document.getElementById('notes-host').textContent = hostname;
+        // The swept copy is already in hand, so the overlay opens with content
+        // rather than a spinner; the read below is only to catch an edit made
+        // since the sweep.
+        const known = notesByHost[hostname];
+        body.innerHTML = known && known.length
+            ? renderNotes(known)
+            : '<div class="notes-loading">Loading…</div>';
+        if (!dlg.open) dlg.showModal();
+
+        try {
+            const res = await fetch(API_BASE + '/notes/' + encodeURIComponent(hostname),
+                                    { headers: { ...authHeaders() } });
+            if (res.status === 401) return logout();
+            const data = await res.json().catch(() => ({}));
+            // Another tile may have been opened while this was in flight; the
+            // late response must not overwrite the newer one.
+            if (notesHost !== hostname) return;
+            if (!res.ok || !data.ok) {
+                // Only replace real content with an error if there is none —
+                // a failed refresh should not blank out notes already on screen.
+                if (!known || !known.length) {
+                    body.innerHTML = '<div class="notes-error">' +
+                        esc(data.error || ('Could not load notes (HTTP ' + res.status + ').')) +
+                        '</div>';
+                }
+                return;
+            }
+            const notes = data.notes || [];
+            if (notes.length) notesByHost[hostname] = notes;
+            else delete notesByHost[hostname];
+            saveCached(NOTES_KEY, notesByHost);
+            body.innerHTML = renderNotes(notes);
+            // A note deleted since the sweep should take its chip with it.
+            if (lastDevData) renderRigs(lastDevData);
+        } catch (e) {
+            if (notesHost !== hostname) return;
+            if (!known || !known.length) {
+                body.innerHTML = '<div class="notes-error">' +
+                    esc(String((e && e.message) || e)) + '</div>';
+            }
+        }
+    }
+
+    function renderNotes(notes) {
+        if (!notes.length) return '<div class="notes-empty">No notes for this rig yet.</div>';
+        return notes.map(n => {
+            const meta = [];
+            // created_at is epoch seconds, like every other timestamp the
+            // fleet API hands back.
+            const when = fmtNoteWhen(Number(n.created_at) * 1000);
+            if (when) meta.push(when);
+            if (n.by) meta.push(esc(n.by));
+            return '<div class="note-item">' +
+                   '<div class="note-text">' + esc(n.text) + '</div>' +
+                   (meta.length ? '<div class="note-meta">' + meta.join(' &middot; ') + '</div>' : '') +
+                   '</div>';
+        }).join('');
+    }
+
+    // Always carries the calendar date, unlike fmtWhen, which drops it for
+    // anything written today. A note is a record of when something was found,
+    // so "2:14 PM" alone is not enough to file it against a shift.
+    function fmtNoteWhen(ms) {
+        if (!ms) return '';
+        const d = new Date(ms);
+        if (Number.isNaN(d.getTime())) return '';
+        const opts = { month: 'short', day: 'numeric' };
+        if (d.getFullYear() !== new Date().getFullYear()) opts.year = 'numeric';
+        const stamp = d.toLocaleDateString([], opts) + ', ' +
+                      d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+        const mins = Math.round((Date.now() - ms) / 60000);
+        let rel;
+        if (mins < 1) rel = 'just now';
+        else if (mins < 60) rel = mins + 'm ago';
+        else if (mins < 1440) rel = Math.round(mins / 60) + 'h ago';
+        else rel = Math.round(mins / 1440) + 'd ago';
+        // A clock skewed behind the fleet's would otherwise read "-3m ago".
+        return mins < 0 ? stamp : stamp + ' (' + rel + ')';
+    }
+
+    // The fleet-wide sweep behind the chips. Cheap for the page (one request),
+    // expensive for the server (one per rig), which is why the server caches it
+    // and this only asks on load and every few minutes.
+    const NOTES_KEY = 'fleet_notes_v1';
+    const NOTES_REFRESH_MS = 300000;
+    let notesTimer = null;
+
+    async function fetchNotes(force) {
+        try {
+            const res = await fetch(API_BASE + '/notes' + (force ? '?force=1' : ''),
+                                    { headers: { ...authHeaders() } });
+            if (!res.ok) return;
+            const d = await res.json();
+            if (!d || !d.ok) return;
+            notesByHost = d.notes || {};
+            saveCached(NOTES_KEY, notesByHost);
+            if (lastDevData) renderRigs(lastDevData);
+        } catch (e) { /* keep whatever chips are already up */ }
+    }
+
+    function closeNotes() {
+        const dlg = document.getElementById('notes-modal');
+        if (dlg.open) dlg.close();
+        notesHost = null;
+    }
+
+    // Clicking the dimmed area outside the modal closes it. With showModal()
+    // that click lands on the dialog element itself — the children cover its
+    // whole box, so target === dialog can only mean the backdrop.
+    document.getElementById('notes-modal').addEventListener('click', (e) => {
+        if (e.target.id === 'notes-modal') closeNotes();
+    });
+    // Escape is handled by the dialog itself; this keeps our own state in step.
+    document.getElementById('notes-modal').addEventListener('close', () => { notesHost = null; });
 
     // ── Notifications (W3C Notifications API) ────────────────────────────
     //
@@ -3060,6 +3386,10 @@
         // Restore task history reverse button state
         const taskReverseBtn = document.getElementById('task-reverse-btn');
         if (taskReverseBtn) taskReverseBtn.style.opacity = taskHistoryReverse ? '1' : '0.5';
+
+        // Label and colour the aggregate source button from the stored
+        // preference, so it is right before the first range response lands.
+        syncAggSourceBtn();
     }
 
     function tempClass(c, warnC, critC) {
@@ -3112,12 +3442,14 @@
     }
 
     function dailyBarColors() {
-        // Selection has to read at a glance across a 30-bar chart, so the
-        // selected blue is near-solid and a stop darker, and the unselected
-        // green is dialled back to sit behind it.
+        // Hue carries the aggregate source, alpha carries selection: the
+        // selected bars are near-solid against the same colour dialled back to
+        // 22%, which still reads at a glance across a 30-bar chart while
+        // leaving the bars the same colour as the totals they add up to.
+        const rgb = aggRgb(), edge = aggEdge();
         return lastDayDates.map(d => selectedDays && selectedDays.has(d)
-            ? { bg: 'rgba(37,99,235,0.88)',  border: '#60a5fa' }
-            : { bg: 'rgba(16,185,129,0.22)', border: 'rgba(16,185,129,0.55)' });
+            ? { bg: 'rgba(' + rgb + ',0.88)', border: edge }
+            : { bg: 'rgba(' + rgb + ',0.22)', border: 'rgba(' + rgb + ',0.55)' });
     }
 
     // The range totals were re-fetched after every tick, and answering that
@@ -3173,7 +3505,8 @@
                 '<td>' + (i + 1) + '</td>' +
                 '<td><span class="rank-caret">' + (open ? '▾' : '▸') + '</span>' +
                     '<strong>' + esc(entry.name) + '</strong></td>' +
-                '<td style="text-align: right;"><span class="time-badge">' +
+                '<td style="text-align: right;"><span class="time-badge" ' +
+                    'style="color:' + aggColor() + '">' +
                     esc(entry.duration) + '</span></td></tr>' +
             '<tr class="rank-detail' + (open ? '' : ' hidden') + '" data-key="' + esc(key) + '">' +
                 '<td colspan="3"><div class="rank-detail-body">Loading…</div></td></tr>';
@@ -3264,15 +3597,25 @@
         lastRangeData = rangeData;
         const _unnamedPiRe = /^rpi\d*-[0-9a-f]{4}-[0-9a-f]{4}$/i;
 
-        document.getElementById('stat-hours').textContent =
-            rangeData.total_hours != null ? fmtHoursMins(rangeData.total_hours) : '—';
+        // Both series ride along on the one response, so the toggle is a
+        // client-side switch. A backend that predates the API side sends only
+        // the estimate lists; falling back to those keeps the toggle harmless
+        // rather than blanking every total.
+        const useApi = aggSource === 'api';
+        const total = useApi && rangeData.total_hours_api != null
+            ? rangeData.total_hours_api : rangeData.total_hours;
+        const hoursEl = document.getElementById('stat-hours');
+        hoursEl.textContent = total != null ? fmtHoursMins(total) : '—';
+        hoursEl.style.color = aggColor();
+        syncAggSourceBtn();
 
-        const piRows = (rangeData.hours_by_pi || []).filter(p => !_unnamedPiRe.test(p.name));
+        const piSrc = (useApi && rangeData.hours_by_pi_api) || rangeData.hours_by_pi || [];
+        const piRows = piSrc.filter(p => !_unnamedPiRe.test(p.name));
         document.getElementById('pi-rankings').innerHTML = piRows.length
             ? piRows.map((p, i) => rankRow('pi', i, p)).join('')
             : '<tr><td colspan="3" style="color:var(--text-muted)">No metrics for the selected day(s).</td></tr>';
 
-        const opRows = rangeData.hours_by_operator || [];
+        const opRows = (useApi && rangeData.hours_by_operator_api) || rangeData.hours_by_operator || [];
         document.getElementById('operator-rankings').innerHTML = opRows.length
             ? opRows.map((o, i) => rankRow('op', i, o)).join('')
             : '<tr><td colspan="3" style="color:var(--text-muted)">No metrics for the selected day(s).</td></tr>';
@@ -3386,17 +3729,89 @@
         return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
     }
 
-    // The fleet API's duration for a session, in red parentheses, but only
-    // when it disagrees with what the recording's bytes imply. duration_s is
-    // then the byte estimate the backend actually counted, and duration_api_s
-    // is the wall-clock span it rejected; sessions where the two agree carry
-    // no duration_api_s at all and render exactly as before.
+    // The fleet API's own duration for a session, in parentheses after the
+    // figure that was counted. duration_s is the byte estimate the backend
+    // counted; duration_api_s is the wall clock it was measured against, and
+    // now rides along on every estimated session rather than only the ones
+    // that disagreed. A session with no estimate at all — no head-camera file,
+    // or estimation switched off — carries no duration_api_s and renders the
+    // one figure alone, rather than the same number twice.
+    //
+    // Drift is measured against the estimate rather than the wall clock: the
+    // estimate is the number being trusted, so "how far off is the API" is the
+    // question, and a 374-hour span against a two-hour recording reads as
+    // 32000% rather than the 99.7% the other denominator would give.
+    function driftClass(estimate, api) {
+        const est = Number(estimate);
+        if (!isFinite(est) || est <= 0) return '';
+        const drift = Math.abs(Number(api) - est) / est;
+        if (drift > 0.20) return ' drift-bad';
+        if (drift >= 0.05) return ' drift-warn';
+        return '';
+    }
+
     function apiDurationHtml(task) {
         if (task.duration_api_s === null || task.duration_api_s === undefined) return '';
         const api = esc(formatDuration(task.duration_api_s));
-        return ' <span class="dur-api" title="Fleet API reported ' + api +
-               ' for this recording; its size implies the duration shown, ' +
-               'so that is what is counted">(' + api + ')</span>';
+        return ' <span class="dur-api' + driftClass(task.duration_s, task.duration_api_s) +
+               '" title="Fleet API reported ' + api + ' for this recording. The ' +
+               'figure in front is what its head-camera bytes imply, and that ' +
+               'is what gets counted.">(' + api + ')</span>';
+    }
+
+    // ── Which duration the aggregates sum ────────────────────────────────
+    //
+    // Estimates by default: they are what the ranked totals count, and what a
+    // wall clock inflated by a slow rig clock gets corrected to. The switch is
+    // persisted, so a deliberate move to the API's own numbers survives a
+    // reload rather than snapping back on the next tick.
+    let aggSource = 'est';
+    try { aggSource = localStorage.getItem('fleet_agg_source') === 'api' ? 'api' : 'est'; } catch (e) {}
+
+    function aggColor() { return aggSource === 'api' ? 'var(--agg-api)' : 'var(--agg-est)'; }
+
+    // Base rgb of the active source, for the chart, which needs alpha
+    // variants rather than a CSS variable.
+    function aggRgb() { return AGG_SOURCES[aggSource].rgb; }
+    function aggEdge() { return aggSource === 'api' ? '#5fa2d6' : '#5fd4d6'; }
+
+    // Estimates on the left, API on the right, the selected half painted in
+    // that source's colour. Two buttons rather than one that flips label:
+    // a lone button had to name the state it was IN while looking like a
+    // control for the state it would move to, and there was no reading of it
+    // that was not ambiguous.
+    const AGG_SOURCES = {
+        est: { btn: 'agg-src-est', rgb: '50,166,168',
+               title: 'Totals, rankings and the daily chart sum the head-camera '
+                      + 'byte estimate for each recording.' },
+        api: { btn: 'agg-src-api', rgb: '50,115,168',
+               title: 'Totals, rankings and the daily chart sum the fleet API\'s '
+                      + 'own wall clock for each recording.' },
+    };
+
+    function syncAggSourceBtn() {
+        for (const [key, spec] of Object.entries(AGG_SOURCES)) {
+            const btn = document.getElementById(spec.btn);
+            if (!btn) continue;
+            const on = key === aggSource;
+            btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+            // Cleared rather than set to a default when off, so the stylesheet's
+            // own hover and focus rules still apply to the inactive half.
+            btn.style.color       = on ? 'rgb(' + spec.rgb + ')' : '';
+            btn.style.borderColor = on ? 'rgb(' + spec.rgb + ')' : '';
+            btn.style.background  = on ? 'rgba(' + spec.rgb + ',0.15)' : '';
+            btn.title = spec.title;
+        }
+    }
+
+    function setAggSource(src, evt) {
+        if (evt) evt.stopPropagation();
+        if (!AGG_SOURCES[src] || src === aggSource) return;   // re-click is a no-op
+        aggSource = src;
+        try { localStorage.setItem('fleet_agg_source', aggSource); } catch (e) {}
+        syncAggSourceBtn();
+        if (lastRangeData) renderRangeStats(lastRangeData);
+        if (lastStats) renderStats(mergedStats(lastStats));
     }
 
     const SESSION_NAME_RE = /^(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})/;
@@ -3533,7 +3948,11 @@
         const dayData = (s.hours_by_day || []).slice(-30).filter(d => !isWeekend(d.date));
         lastDayDates  = dayData.map(d => d.date);
         const dayLabels = dayData.map(d => d.date.slice(5));
-        const dayHours  = dayData.map(d => d.hours);
+        // hours_api is absent on days recorded before the API side was kept,
+        // and on backends that only ever summed one series; those fall back to
+        // the estimate rather than dropping to zero mid-chart.
+        const dayHours  = dayData.map(d => aggSource === 'api' && d.hours_api != null
+                                           ? d.hours_api : d.hours);
 
         if (selectedDays === null) {
             const today = todayISO();
@@ -3908,7 +4327,11 @@
 
     function mergedStats(s) {
         const days = (histCache.hours_by_day || []).filter(d => d.date !== todayISO());
-        if (s.total_hours_today != null) days.push({ date: todayISO(), hours: s.total_hours_today });
+        if (s.total_hours_today != null) {
+            days.push({ date: todayISO(), hours: s.total_hours_today,
+                        hours_api: s.total_hours_today_api != null
+                                   ? s.total_hours_today_api : s.total_hours_today });
+        }
         days.sort((a, b) => a.date.localeCompare(b.date));
         return Object.assign({}, s, {
             hours_by_day: days,
@@ -3969,6 +4392,10 @@
     // nothing to do.
     function hydrateFromCache() {
         histCache = loadCached(HISTORY_KEY, histCache) || histCache;
+        // Restored before the view replay below, so the tiles it paints carry
+        // their notes chips on the first frame rather than popping in when the
+        // sweep answers.
+        notesByHost = loadCached(NOTES_KEY, {}) || {};
         healthSeries = (histCache.frame_health_history || []).slice();
         if (histCache.task_history) renderTaskHistory(histCache.task_history);
         // Restored before the view is replayed, so the render below finds the

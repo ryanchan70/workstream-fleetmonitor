@@ -39,5 +39,8 @@ recording_logs/
 daily_recording_log_*.txt
 operator_sessions_*.txt
 *.log
+task_report.csv
+task_report_sheets.csv
+task_report.raw.json
 
 .DS_Store

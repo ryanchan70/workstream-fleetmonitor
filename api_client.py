@@ -8,12 +8,21 @@ frontend uses.
 """
 
 import requests
+from urllib.parse import quote
 
 BASE_URL = "https://fleet.shiftiq.us"
 
 
 class FleetAPIError(Exception):
     """Raised when a fleet.shiftiq.us API call fails or returns bad data."""
+
+
+def _as_float(v) -> float:
+    """A sort key that survives a null or a string timestamp."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 class FleetAPIClient:
@@ -86,6 +95,41 @@ class FleetAPIClient:
             return r.json().get("devices", [])
         except ValueError:
             return None
+
+    def get_device_notes(self, hostname: str) -> list[dict] | None:
+        """Returns the fleet's maintenance notes for a device, newest first.
+
+        Each note is {"id", "text", "by", "created_at"}. Unlike the session
+        endpoints this one is answered by fleet.shiftiq.us itself rather than
+        proxied through to the Pi, so it stays fast even for an offline rig —
+        which is exactly when the note ("hotspot spotty in field") is worth
+        reading.
+
+        Returns None if the fleet does not know the hostname, as opposed to []
+        for a known device carrying no notes. Callers surface that difference
+        as a 404 rather than an empty list, so a typo in a hostname does not
+        look like a rig nobody has written about.
+        """
+        url = f"{self.base_url}/api/notes/{quote(hostname, safe='')}"
+        try:
+            r = self.session.get(url, timeout=self.timeout)
+        except requests.RequestException as e:
+            raise FleetAPIError(f"notes for {hostname} unreachable: {e}") from e
+        if r.status_code == 404:
+            return None
+        if not r.ok:
+            raise FleetAPIError(f"notes for {hostname} returned status {r.status_code}")
+        try:
+            data = r.json()
+        except ValueError as e:
+            raise FleetAPIError(f"notes for {hostname} returned invalid JSON: {e}") from e
+
+        notes = data.get("notes") or []
+        # The API happens to hand these back newest-first, but nothing
+        # documents that. Sorting here means both backends and the page agree
+        # on the order without each repeating the rule.
+        notes.sort(key=lambda n: _as_float(n.get("created_at")), reverse=True)
+        return notes
 
     def get_device_sessions(self, hostname: str, light: bool = True, limit: int = 100,
                             timeout: float | None = None, retries: int = 1) -> list[dict]:

@@ -1,5 +1,35 @@
 # changelog
 
+## 08/19
+
+- code cleanup & reorganization
+
+## 08/18
+
+- fixed duration estimates using bytes
+
+  - changed from averaging -> K-nearest neighbors -> linear regression
+
+- every recording in the ranked timings and completed tasks shows the estimate first and the API's own duration in parentheses after, colored grey / amber / red for 0-5% / 5-20% / 20%+ discrepancy
+
+- aggregate fleet stats now has a Estimates | API toggle (estimated durations in aquamarine, API durations in blue)
+
+
+
+## 08/13
+
+- only shows notes button if there are notes for pis
+
+## 08/12
+
+- added notes
+
+- diagnosing issues with wrong API recording duration and byte estimations
+
+## 08/11
+
+- **fixed and implemented time estimates based on bytes**
+
 ## 07/30
 
 - filtered, sorted, and optimized data dump python script 

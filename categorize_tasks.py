@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
 categorize_tasks.py — pulls completed recording sessions, categorizes, and
-    exports useful info as CSV. raw JSON also saved for reference.
+    exports useful info as CSV.
+
+Scans for a categorize_config.txt file to avoid repeated prompts.
 
 Requires Python 3.9+ and the `requests` package.
 
@@ -69,11 +71,10 @@ DURATION
 The API's duration_s is a wall-clock span: session start timestamp to end
 timestamp. Usually that's also how long the rig recorded, but a hang or a
 late finalize/upload can leave the span far longer than what actually got
-captured. To catch that, each rig's own bytes/second rate (learned from its
-other sessions) is used to check whether the file sizes could plausibly
-account for the full span. When they fall far short (below
-DURATION_MISMATCH_RATIO), duration_seconds/hhmmss/hours report the
-byte-implied duration instead of the raw span.
+captured. To catch that, the fleet's bytes/second rate for the head camera is
+used to work out how long a recording of that size takes, and
+duration_seconds/hhmmss/hours report that byte-implied duration rather than
+the raw span.
 
 min_duration (config) drops sessions shorter than a given hh:mm:ss - the usual
 way to keep aborted starts and a few seconds of test footage out of the
@@ -93,8 +94,8 @@ rewritten and duration_seconds always equals duration_s.
 Set disable_estimation=n to let the estimate apply. It reads the HEAD CAMERA's
 own bytes — the size of head_oakd.mcap, not the session total — and asks a
 least-squares fit over the fleet's sessions how long a recording that size
-takes. When that lands below three quarters of the wall clock the session
-is treated as hung and the estimate is counted instead. See the block above
+takes. That estimate is then what gets counted, in either direction; a session
+with no head file to measure keeps duration_s. See the block above
 build_duration_model for why the head camera alone, and not the total.
 
 APPEND vs FULL REWRITE
@@ -901,9 +902,11 @@ def extract_total_bytes(rec: dict):
 # as a hung recording and "corrected" away.
 #
 # MIN_TRAIN_DURATION_S keeps very short sessions out of the training set,
-# where a few seconds of file-open overhead distorts the rate. RATIO is how
-# far below the wall clock the byte-implied duration has to fall before we
-# trust it over duration_s.
+# where a few seconds of file-open overhead distorts the rate.
+#
+# DURATION_MISMATCH_RATIO is no longer applied: the estimate is counted
+# whenever there is one. It is kept here because --list-fields and the run
+# summary still describe the old behaviour to anyone reading an older report.
 MIN_TRAIN_DURATION_S = 120.0
 DURATION_MISMATCH_RATIO = 0.75
 
@@ -913,7 +916,7 @@ DURATION_MISMATCH_RATIO = 0.75
 # by rig would only shrink the sample. The whole model is two numbers, so it
 # costs nothing to carry between processes.
 TRIM_SIGMA = 3.0        # residuals beyond this are dropped before the refit
-MIN_TRAIN_POINTS = 30   # below this there is nothing worth fitting
+MIN_TRAIN_POINTS = 2    # a straight line needs two points; that is the only bar
 
 # The head camera's files, by the role the API labels them with. Segmented
 # recordings appear as head_oakd.seg1.mcap and friends, so the name is matched
@@ -1116,9 +1119,12 @@ def enrich(rec: dict, matchers, keywords,
     # duration_s (the wall-clock span between session start and end) can be
     # much longer than what actually got recorded (a rig that hung, or
     # finalized/uploaded long after recording really stopped). Bytes are a much
-    # harder thing to fake, so when the head camera's output implies a much
-    # shorter recording than duration_s claims, trust the bytes instead —
-    # duration_seconds/hhmmss/hours below are that corrected figure.
+    # harder thing to fake, so the head camera's output is trusted over
+    # duration_s outright — duration_seconds/hhmmss/hours below are that
+    # figure. The estimate used to have to fall below DURATION_MISMATCH_RATIO
+    # of the wall clock before it was allowed to win, which meant a span the
+    # bytes could not remotely account for still had to clear a ratio test to
+    # be questioned, and an over-long span was never questioned at all.
     #
     # duration_implied is filled in whenever it can be computed, INCLUDING when
     # estimation is switched off: the column is then a reference figure to
@@ -1128,8 +1134,7 @@ def enrich(rec: dict, matchers, keywords,
     implied = None
     if dur > 0:
         implied = predict_duration(head_bytes, model)
-        if (estimation_enabled and implied is not None
-                and implied < dur * DURATION_MISMATCH_RATIO):
+        if estimation_enabled and implied is not None:
             dur_actual = implied
 
     session_id = rec.get("session_id") or ""

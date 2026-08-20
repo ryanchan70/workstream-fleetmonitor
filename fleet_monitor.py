@@ -14,10 +14,11 @@ import threading
 import os
 import re
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 
 import collections
 import statistics
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import secrets as _secrets
 from api_client import FleetAPIClient, FleetAPIError
 from auth import DashboardAuth
@@ -436,20 +437,27 @@ def _session_date(rec: dict) -> str | None:
 # means the head wrote faster than its neighbours, not that the folder was
 # open for less time than it recorded, so a high estimate is ignored.
 MIN_TRAIN_DURATION_S = 120.0     # shorter sessions make noisy training points
-DURATION_MISMATCH_RATIO = 0.75   # how far below wall clock the estimate must
-                                 # fall before the wall clock is distrusted
+DURATION_MISMATCH_RATIO = 0.75   # unused here now that the estimate always
+                                 # counts; still the gate in categorize_tasks.py
 # Least-squares fit of duration against head bytes, fleet-wide rather than per
 # rig: the head unit is the same hardware writing the same streams on every rig
 # and the measured spread across all of them is under a percent, so splitting
 # by rig would only shrink the sample. The whole model is two numbers.
 TRIM_SIGMA = 3.0                 # residuals beyond this are dropped before the refit
-MIN_TRAIN_POINTS = 30            # below this there is nothing worth fitting
+# Two points is what a straight line needs, and that is now the only bar. At 30
+# a fleet whose stored sessions had not yet accumulated 30 head-byte readings
+# got an empty model, and an empty model is indistinguishable from "no
+# estimate" — every duration fell back to the wall clock with nothing to show.
+MIN_TRAIN_POINTS = 2
 
-# Estimation is OFF unless explicitly enabled, matching disable_estimation=y in
-# categorize_config.txt: durations are the API's own until someone opts in.
-# FLEET_DISABLE_ESTIMATION=n (or 0/false/no) in the environment turns it on.
+# Estimation is ON. It was opt-in while the model was being trusted, which is
+# how two 370-hour sessions reached the ranked totals unchallenged; catching
+# exactly that is what the model is for, so it no longer waits to be asked.
+# FLEET_DISABLE_ESTIMATION=y (or 1/true/yes) in the environment is the kill
+# switch, and turning it off also removes the API figure the dashboard shows
+# in parentheses — with nothing estimated there is nothing to compare.
 DISABLE_ESTIMATION = os.environ.get(
-    "FLEET_DISABLE_ESTIMATION", "y").strip().lower() not in ("n", "no", "false", "0")
+    "FLEET_DISABLE_ESTIMATION", "n").strip().lower() in ("y", "yes", "true", "1")
 
 # The head camera's files, by the role the API labels them with. Segmented
 # recordings appear as head_oakd.seg1.mcap and friends, so names are matched on
@@ -524,9 +532,9 @@ def _rebuild_duration_model():
         for sess in entry.get("sessions", {}).values():
             try:
                 dur = float(sess.get("duration_s") or 0)
-                head = float(sess.get("head_bytes") or 0)
             except (TypeError, ValueError):
                 continue
+            head = _head_bytes_of(sess)
             if dur < MIN_TRAIN_DURATION_S or head <= 0:
                 continue
             pts.append((head, dur))
@@ -596,14 +604,35 @@ def _predict_duration(head_bytes) -> float | None:
     return est if est > 0 else None
 
 
-def session_durations(hostname: str, sess: dict) -> tuple[float, float | None]:
-    """(duration to count, API duration when the bytes contradict it).
+def _head_bytes_of(sess: dict) -> float:
+    """The session's head-camera bytes, stored or derived. 0.0 when unknown.
 
-    Returns the head-camera estimate only when it falls to
-    DURATION_MISMATCH_RATIO of the API's span or below — the signature of an
-    inflated wall clock. The second element is None every other time: an
-    estimate that agrees, one that comes in high, no head file to measure, or
-    estimation switched off. In all of those the API duration stands.
+    The stored field is written by the session-cache merge; a record handed
+    straight from the fleet API has per-file sizes instead and no such key.
+    Reading only the key meant those records estimated nothing at all, which
+    is indistinguishable from the estimate agreeing with the wall clock.
+    """
+    try:
+        stored = float(sess.get("head_bytes") or 0)
+    except (TypeError, ValueError):
+        stored = 0.0
+    if stored > 0:
+        return stored
+    return float(_extract_head_bytes(sess) or 0)
+
+
+def session_durations(hostname: str, sess: dict) -> tuple[float, float | None]:
+    """(duration to count, the API's own wall clock alongside it).
+
+    The head-camera estimate is what counts whenever there is one, in either
+    direction. The old rule only distrusted a wall clock the estimate fell
+    below, which is how a rig whose clock was 15 days slow banked a two-hour
+    recording as 374 hours. The second element is the API's figure, returned
+    whenever there is an estimate to compare it against, so callers can show
+    both numbers and aggregate either.
+
+    None alongside means the session was never estimated — no head file, or
+    estimation switched off — and the counted value is the API's own.
 
     `hostname` is unused by the fleet-wide model and kept in the signature so
     the call sites do not change if a per-rig fit is ever reintroduced.
@@ -614,14 +643,10 @@ def session_durations(hostname: str, sess: dict) -> tuple[float, float | None]:
     if DISABLE_ESTIMATION:
         return api_dur, None
 
-    try:
-        head = float(sess.get("head_bytes") or 0)
-    except (TypeError, ValueError):
-        head = 0.0
-    implied = _predict_duration(head)
-    if implied is not None and implied < api_dur * DURATION_MISMATCH_RATIO:
-        return implied, api_dur
-    return api_dur, None
+    implied = _predict_duration(_head_bytes_of(sess))
+    if implied is None:
+        return api_dur, None
+    return implied, api_dur
 
 
 def backfill_daily_hours(client: "FleetAPIClient"):
@@ -686,6 +711,11 @@ def backfill_daily_hours(client: "FleetAPIClient"):
     today = get_date_str()
     all_by_day: dict[str, float] = {}
     n_estimated = 0
+    # Sessions whose wall clock the bytes cannot account for at all. Now that
+    # every session is estimated, "estimated" is the normal case and no longer
+    # worth shouting about — a span this far out is what actually wants
+    # looking at, and used to pass unremarked.
+    n_diverged = 0
     with _pi_session_cache_lock:
         cache_snapshot = {h: dict(v) for h, v in _pi_session_cache.items()}
     for hostname, entry in cache_snapshot.items():
@@ -703,6 +733,8 @@ def backfill_daily_hours(client: "FleetAPIClient"):
             dur, api_dur = session_durations(hostname, sess)
             if api_dur is not None:
                 n_estimated += 1
+                if dur > 0 and abs(api_dur - dur) / dur > 0.20:
+                    n_diverged += 1
             if dur > 0:
                 all_by_day[date_str] = all_by_day.get(date_str, 0.0) + dur
 
@@ -736,9 +768,9 @@ def backfill_daily_hours(client: "FleetAPIClient"):
             existing = {t.get("_session_id"): t for t in _completed_tasks[hostname]}
             for sid, sess in entry.get("sessions", {}).items():
                 # What this session actually recorded, and the API's own
-                # figure when the bytes say it was wrong. dur is what the
-                # history counts; api_dur is only carried so the dashboard can
-                # show, in red, the number it replaced.
+                # figure alongside it. dur is what the history counts; api_dur
+                # rides along on every estimated session so the dashboard can
+                # show both.
                 dur, api_dur = session_durations(hostname, sess)
 
                 prior = existing.get(sid)
@@ -794,8 +826,10 @@ def backfill_daily_hours(client: "FleetAPIClient"):
     if failed_other:
         fail_bits.append(f"{len(failed_other)} failed ({', '.join(l for l, _ in failed_other)})")
     fail_summary = f", {'; '.join(fail_bits)}" if fail_bits else ""
-    est_summary = (f", {ANSI_BRIGHT_RED}{n_estimated} session(s) counted by "
-                   f"byte estimate{ANSI_RESET}") if n_estimated else ""
+    est_summary = f", {n_estimated} session(s) counted by byte estimate" if n_estimated else ""
+    if n_diverged:
+        est_summary += (f" ({ANSI_BRIGHT_RED}{n_diverged} more than 20% off the "
+                        f"API's wall clock{ANSI_RESET})")
     message = (f"[{ts()}] INFO   Backfill — {n} past day(s) totaled, "
                f"{n_offline_cached} Pi(s) from cache while unreachable, "
                f"cache {'updated' if updated else 'unchanged'}"
@@ -1329,6 +1363,52 @@ def evaluate_rigs(devices: list[dict]) -> tuple[list[dict], list[dict]]:
         })
     return rigs, alerts
 
+# ── Per-rig notes ────────────────────────────────────────────────────────
+# The fleet has no bulk notes endpoint — GET /api/notes is 405, the collection
+# only accepts POST — so answering "which rigs have a note" costs one call per
+# rig. The tiles ask on every load to decide whether to show the control at
+# all, hence the cache: one sweep of the fleet per TTL rather than one per
+# page load. A partial sweep is held for less time, because a rig that timed
+# out is indistinguishable from a rig with nothing written about it.
+NOTES_CACHE_TTL = 300
+NOTES_PARTIAL_TTL = 60
+NOTES_FETCH_WORKERS = 12
+_notes_cache: dict = {"ts": 0.0, "ttl": 0.0, "data": None}
+_notes_lock = threading.Lock()
+
+def get_all_notes(client: FleetAPIClient, force: bool = False) -> dict:
+    """Every rig's notes keyed by hostname, for the rigs that have any."""
+    with _notes_lock:
+        cached = _notes_cache["data"]
+        if not force and cached is not None and time.time() - _notes_cache["ts"] < _notes_cache["ttl"]:
+            return cached
+
+    with _rig_lock:
+        rigs = (_rig_cache["data"] or {}).get("rigs") or []
+    hosts = [r.get("hostname") for r in rigs if r.get("hostname")]
+    if not hosts:
+        hosts = [d.get("hostname") for d in (client.get_fleet_status() or []) if d.get("hostname")]
+
+    found: dict[str, list] = {}
+    answered = 0
+    with ThreadPoolExecutor(max_workers=NOTES_FETCH_WORKERS) as ex:
+        futs = {ex.submit(client.get_device_notes, h): h for h in hosts}
+        for fut in as_completed(futs):
+            try:
+                notes = fut.result()
+            except Exception:
+                continue        # one unreachable rig must not sink the sweep
+            answered += 1
+            if notes:
+                found[futs[fut]] = notes
+
+    data = {"at": time.time(), "notes": found, "rigs": len(hosts), "answered": answered}
+    with _notes_lock:
+        _notes_cache["ts"] = time.time()
+        _notes_cache["ttl"] = NOTES_CACHE_TTL if answered == len(hosts) else NOTES_PARTIAL_TTL
+        _notes_cache["data"] = data
+    return data
+
 def process_alert_transitions(alerts: list[dict]):
     """Logs newly critical conditions in bright red (once per incident) and
     logs recovery in green when they clear."""
@@ -1395,7 +1475,11 @@ _observed_totals: dict[str, dict] = {}
 
 # Prevents momentary drops when a Pi stops recording and the API hasn't
 # committed the session yet (~20-second window). Cleared each new day.
-_pi_total_floor: dict = {"day": "", "pi": {}, "op": {}}
+# "pi"/"op" hold the floors for the byte-estimate board, "pi_api"/"op_api"
+# the same for the API's wall clock — see the floor pass in
+# build_api_leaderboard for why the two cannot share one.
+_pi_total_floor: dict = {"day": "", "pi": {}, "op": {},
+                         "pi_api": {}, "op_api": {}}
 _pi_floor_lock = threading.Lock()
 
 # Only print a Leaderboard fetch WARN when a device's fetch state actually
@@ -1513,6 +1597,12 @@ def build_api_leaderboard(client: FleetAPIClient) -> dict | None:
     today_str = get_date_str()
     by_pi: dict[str, float] = {}
     by_op: dict[str, float] = {}
+    # The same board on the API's own wall clock, for the dashboard's
+    # aggregate toggle. Only the session-derived part below diverges: the
+    # observed and live top-ups are wall clock on both sides, since a
+    # recording still in progress has no final bytes to estimate from.
+    by_pi_api: dict[str, float] = {}
+    by_op_api: dict[str, float] = {}
     results: dict[str, tuple[str, list[dict]]] = {}
 
     # ── Tracks which Pis had a genuinely successful, fresh API fetch this ──────
@@ -1608,10 +1698,14 @@ def build_api_leaderboard(client: FleetAPIClient) -> dict | None:
             # Byte-corrected, exactly as the past-day rankings are, so a rig
             # that hung this morning does not top today's board on wall clock
             # alone until a sweep catches it tomorrow.
-            dur, _api_dur = session_durations(hostname, rec)
+            dur, api_dur = session_durations(hostname, rec)
+            # No estimate means the one figure counts on both sides.
+            api_dur = dur if api_dur is None else api_dur
             op = clean_str(rec.get("operator"))
             by_pi[label] = by_pi.get(label, 0.0) + dur
             by_op[op] = by_op.get(op, 0.0) + dur
+            by_pi_api[label] = by_pi_api.get(label, 0.0) + api_dur
+            by_op_api[op] = by_op_api.get(op, 0.0) + api_dur
             if label in confirmed_labels:
                 confirmed_ops.add(op)
 
@@ -1641,13 +1735,18 @@ def build_api_leaderboard(client: FleetAPIClient) -> dict | None:
         obs_op = st.get("cur_op") or "Unknown"
         if obs_dur <= 0:
             continue
-        api_dur = by_pi.get(label, 0.0)
-        if obs_dur > api_dur:
+        # Each series is topped up against its own baseline: on a hung rig the
+        # estimate total sits below the wall-clock one, so a single shared
+        # comparison would raise one side using the other's shortfall.
+        for pi_side, op_side in ((by_pi, by_op), (by_pi_api, by_op_api)):
+            fetched_dur = pi_side.get(label, 0.0)
+            if obs_dur <= fetched_dur:
+                continue
             # Move the whole Pi total up to the observed value rather than
             # adding a "gap" — arithmetically identical when done once, but
             # immune to double-adding if this hostname is ever visited twice.
-            by_pi[label] = obs_dur
-            by_op[obs_op] = by_op.get(obs_op, 0.0) + (obs_dur - api_dur)
+            pi_side[label] = obs_dur
+            op_side[obs_op] = op_side.get(obs_op, 0.0) + (obs_dur - fetched_dur)
             # This label's total no longer purely reflects a clean API fetch —
             # don't let it reset the floor as if it were fully confirmed.
             confirmed_labels.discard(label)
@@ -1673,6 +1772,8 @@ def build_api_leaderboard(client: FleetAPIClient) -> dict | None:
         op = clean_str(d.get("operator"))
         by_pi[label] = by_pi.get(label, 0.0) + dur
         by_op[op] = by_op.get(op, 0.0) + dur
+        by_pi_api[label] = by_pi_api.get(label, 0.0) + dur
+        by_op_api[op] = by_op_api.get(op, 0.0) + dur
 
     # ── Floor: never let an ESTIMATED total drop compared to last cycle ────────
     # Clears at midnight so stale data from yesterday doesn't carry forward.
@@ -1686,24 +1787,34 @@ def build_api_leaderboard(client: FleetAPIClient) -> dict | None:
             _pi_total_floor["day"] = today_str
             _pi_total_floor["pi"] = {}
             _pi_total_floor["op"] = {}
-        for label, total in by_pi.items():
-            if label in confirmed_labels:
-                _pi_total_floor["pi"][label] = total   # trust fully, reset floor
-                continue
-            floor = _pi_total_floor["pi"].get(label, 0.0)
-            if total < floor:
-                by_pi[label] = floor          # hold the floor
-            else:
-                _pi_total_floor["pi"][label] = total   # raise the floor
-        for op, total in by_op.items():
-            if op in confirmed_ops:
-                _pi_total_floor["op"][op] = total       # trust fully, reset floor
-                continue
-            floor = _pi_total_floor["op"].get(op, 0.0)
-            if total < floor:
-                by_op[op] = floor
-            else:
-                _pi_total_floor["op"][op] = total
+            _pi_total_floor["pi_api"] = {}
+            _pi_total_floor["op_api"] = {}
+        # Each series holds its own floor. Sharing one would let the larger
+        # series — usually the wall clock — pin the other up to its value and
+        # erase exactly the gap the toggle exists to show.
+        for pi_side, op_side, pi_key, op_key in (
+                (by_pi, by_op, "pi", "op"),
+                (by_pi_api, by_op_api, "pi_api", "op_api")):
+            pi_floor = _pi_total_floor.setdefault(pi_key, {})
+            op_floor = _pi_total_floor.setdefault(op_key, {})
+            for label, total in pi_side.items():
+                if label in confirmed_labels:
+                    pi_floor[label] = total       # trust fully, reset floor
+                    continue
+                floor = pi_floor.get(label, 0.0)
+                if total < floor:
+                    pi_side[label] = floor        # hold the floor
+                else:
+                    pi_floor[label] = total       # raise the floor
+            for op, total in op_side.items():
+                if op in confirmed_ops:
+                    op_floor[op] = total          # trust fully, reset floor
+                    continue
+                floor = op_floor.get(op, 0.0)
+                if total < floor:
+                    op_side[op] = floor
+                else:
+                    op_floor[op] = total
 
     def ranked(source: dict[str, float], hide_unnamed: bool = False) -> list[dict]:
         return [
@@ -1712,7 +1823,9 @@ def build_api_leaderboard(client: FleetAPIClient) -> dict | None:
             if not (hide_unnamed and is_unnamed_pi(k))
         ]
 
-    return {"pi": ranked(by_pi, hide_unnamed=True), "operator": ranked(by_op), "source": "api"}
+    return {"pi": ranked(by_pi, hide_unnamed=True), "operator": ranked(by_op),
+            "pi_api": ranked(by_pi_api, hide_unnamed=True),
+            "operator_api": ranked(by_op_api), "source": "api"}
 
 def _leaderboard_refresher():
     """Rebuilds the leaderboard in the background. Also runs a full session
@@ -1767,6 +1880,15 @@ _UNNAMED_PI_RE = re.compile(r'^rpi\d*-[0-9a-f]{4}-[0-9a-f]{4}$', re.IGNORECASE)
 def is_unnamed_pi(label: str) -> bool:
     """Returns True for default hostnames like rpi5-867a-7c29 that have no display name."""
     return bool(_UNNAMED_PI_RE.match(label))
+
+# Hostnames arrive from the page as a path segment, and are pasted straight
+# into an upstream URL. Anything outside this set is rejected before the call
+# rather than escaped after it, so there is no argument to be had about
+# whether "rpi5-..%2f..%2fadmin" survives one round of decoding.
+_HOSTNAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
+
+def valid_hostname(host) -> bool:
+    return bool(_HOSTNAME_RE.match(str(host or "")))
 
 def device_label(device: dict) -> str:
     return device.get("display_name") or device.get("hostname", "?")
@@ -1906,6 +2028,43 @@ class EmbeddedUIServer(BaseHTTPRequestHandler):
                 snap = dict(_completed_tasks)
             return _send_json(self, 200, snap)
 
+        # Every rig's notes at once, cached — this is what tells the tiles
+        # which rigs have a note to offer. ?force=1 re-sweeps.
+        if path == '/notes':
+            if self._require_auth() is None:
+                return
+            client = dashboard_auth.get_client(self._bearer_token()) or api_client
+            if client is None:
+                return _send_json(self, 503, {"ok": False, "error": "fleet API unavailable"})
+            force = 'force' in parse_qs(urlparse(self.path).query)
+            try:
+                data = get_all_notes(client, force=force)
+            except Exception as e:
+                return _send_json(self, 502, {"ok": False,
+                                              "error": f"fleet API: {type(e).__name__}: {e}"})
+            return _send_json(self, 200, {**data, "ok": True})
+
+        # /notes/<hostname> — one rig, read straight through with no cache, so
+        # the overlay shows the current text even if the swept copy behind the
+        # button is minutes old.
+        if path.startswith('/notes/'):
+            if self._require_auth() is None:
+                return
+            hostname = unquote(path[len('/notes/'):]).strip('/')
+            if not valid_hostname(hostname):
+                return _send_json(self, 400, {"ok": False, "error": "bad hostname"})
+            client = dashboard_auth.get_client(self._bearer_token()) or api_client
+            if client is None:
+                return _send_json(self, 503, {"ok": False, "error": "fleet API unavailable"})
+            try:
+                notes = client.get_device_notes(hostname)
+            except Exception as e:
+                return _send_json(self, 502, {"ok": False,
+                                              "error": f"fleet API: {type(e).__name__}: {e}"})
+            if notes is None:
+                return _send_json(self, 404, {"ok": False, "error": "unknown device"})
+            return _send_json(self, 200, {"ok": True, "hostname": hostname, "notes": notes})
+
         if path == '/weekend_filter':
             qs = parse_qs(urlparse(self.path).query)
             date_str = (qs.get('date') or [''])[0]
@@ -2024,22 +2183,36 @@ class EmbeddedUIServer(BaseHTTPRequestHandler):
             today_str = get_date_str()
             by_pi: dict[str, float] = {}
             by_op: dict[str, float] = {}
+            # The API's own wall clock, summed in parallel for the aggregate
+            # toggle. Every fallback below feeds both sides the same figure:
+            # those paths have no per-session bytes to estimate from.
+            by_pi_api: dict[str, float] = {}
+            by_op_api: dict[str, float] = {}
+
+            def _add_board(target, rows):
+                for r in rows or []:
+                    target[r["name"]] = target.get(r["name"], 0.0) + \
+                        parse_duration_from_log(r["duration"])
 
             if today_str in days:
                 board = get_api_leaderboard()
                 if board:
-                    for p in board.get("pi", []):
-                        by_pi[p["name"]] = by_pi.get(p["name"], 0.0) + parse_duration_from_log(p["duration"])
-                    for o in board.get("operator", []):
-                        by_op[o["name"]] = by_op.get(o["name"], 0.0) + parse_duration_from_log(o["duration"])
+                    _add_board(by_pi, board.get("pi"))
+                    _add_board(by_op, board.get("operator"))
+                    # A board built before the API side existed carries only
+                    # pi/operator; falling back keeps today in the API total.
+                    _add_board(by_pi_api, board.get("pi_api") or board.get("pi"))
+                    _add_board(by_op_api, board.get("operator_api") or board.get("operator"))
                 else:
                     with log_lock:
                         stats = daily_totals.get(today_str, {"by_pi": {}, "by_operator": {}})
                         for k, v in (stats.get("ui_live_pi") or stats.get("by_pi", {})).items():
                             if not is_unnamed_pi(k):
                                 by_pi[k] = by_pi.get(k, 0.0) + v
+                                by_pi_api[k] = by_pi_api.get(k, 0.0) + v
                         for k, v in (stats.get("ui_live_operator") or stats.get("by_operator", {})).items():
                             by_op[k] = by_op.get(k, 0.0) + v
+                            by_op_api[k] = by_op_api.get(k, 0.0) + v
 
             past_days = [d for d in days if d != today_str]
             if past_days:
@@ -2054,15 +2227,18 @@ class EmbeddedUIServer(BaseHTTPRequestHandler):
                             continue
                         if is_test_task(sess.get("task")):
                             continue
-                        # Byte-implied duration wherever it disagrees with the
-                        # API's wall clock, so a hung session can't rank a rig
-                        # or an operator above one that actually recorded.
-                        dur, _api_dur = session_durations(hostname, sess)
+                        # The byte-implied duration, so a hung session can't
+                        # rank a rig or an operator above one that actually
+                        # recorded, with the wall clock summed alongside it.
+                        dur, api_dur = session_durations(hostname, sess)
                         if dur <= 0:
                             continue
+                        api_dur = dur if api_dur is None else api_dur
                         op = sess.get("operator") or "Unknown"
                         by_pi[label] = by_pi.get(label, 0.0) + dur
                         by_op[op] = by_op.get(op, 0.0) + dur
+                        by_pi_api[label] = by_pi_api.get(label, 0.0) + api_dur
+                        by_op_api[op] = by_op_api.get(op, 0.0) + api_dur
 
             total_s = sum(by_pi.values())
 
@@ -2075,6 +2251,9 @@ class EmbeddedUIServer(BaseHTTPRequestHandler):
                 "total_hours": round(total_s / 3600, 3),
                 "hours_by_pi": ranked(by_pi),
                 "hours_by_operator": ranked(by_op),
+                "total_hours_api": round(sum(by_pi_api.values()) / 3600, 3),
+                "hours_by_pi_api": ranked(by_pi_api),
+                "hours_by_operator_api": ranked(by_op_api),
             })
 
     def do_POST(self):

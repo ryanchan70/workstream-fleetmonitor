@@ -211,6 +211,16 @@ class handler(BaseHTTPRequestHandler):
                 return self._json(200, {"feedback": self._feedback()})
             if route == "locations":
                 return self._json(200, R.hgetall_json("locations"))
+            # Every rig's notes at once, cached — the tiles need it to know
+            # which rigs have a note to offer. ?force=1 re-sweeps.
+            if route == "notes":
+                return self._json(200, dict(logic.notes_all(force="force" in qs),
+                                            ok=True))
+            # The one prefix route: /api/notes/<hostname>. A single rig, read
+            # straight through with no cache, so the overlay shows the current
+            # text even if the swept copy behind the button is minutes old.
+            if route.startswith("notes/"):
+                return self._notes(route[len("notes/"):])
             if route == "poll":
                 return self._json(200, logic.poll(force="force" in qs)[0])
             if route == "backfill":
@@ -369,6 +379,22 @@ class handler(BaseHTTPRequestHandler):
             "frame_health_history": h.get("health") or [],
         }
 
+    def _notes(self, hostname: str):
+        """GET /api/notes/<hostname> — the fleet's notes for one rig."""
+        hostname = (hostname or "").strip("/")
+        if not C.valid_hostname(hostname):
+            return self._json(400, {"ok": False, "error": "bad hostname"})
+        try:
+            notes = fleet.device_notes(hostname)
+        except Exception as e:
+            # The fleet being unreachable is not this dashboard falling over,
+            # and the overlay says so rather than showing an empty note list.
+            return self._json(502, {"ok": False,
+                                    "error": f"fleet API: {type(e).__name__}: {e}"})
+        if notes is None:
+            return self._json(404, {"ok": False, "error": "unknown device"})
+        return self._json(200, {"ok": True, "hostname": hostname, "notes": notes})
+
     @staticmethod
     def _fleet_commands():
         """Running Redis command total and the rate it implies."""
@@ -488,7 +514,9 @@ class handler(BaseHTTPRequestHandler):
         today = C.get_date_str()
         if stats.get("total_hours_today") is not None:
             days = [d for d in days if d.get("date") != today]
-            days.append({"date": today, "hours": stats["total_hours_today"]})
+            days.append({"date": today, "hours": stats["total_hours_today"],
+                         "hours_api": stats.get("total_hours_today_api",
+                                                stats["total_hours_today"])})
             days.sort(key=lambda d: d["date"])
         stats["hours_by_day"] = days
         stats["frame_health_history"] = hist["frame_health_history"]
@@ -512,6 +540,10 @@ class handler(BaseHTTPRequestHandler):
 
         by_pi, by_op = {}, {}
 
+        # The same four totals on the API's own wall clock, so the dashboard's
+        # aggregate toggle switches series without a second request.
+        by_pi_api, by_op_api = {}, {}
+
         def _add(target, src):
             for k, v in (src or {}).items():
                 target[k] = target.get(k, 0.0) + float(v)
@@ -520,6 +552,11 @@ class handler(BaseHTTPRequestHandler):
             p = logic.load_state().get("poll") or {}
             _add(by_pi, p.get("by_pi"))
             _add(by_op, p.get("by_op"))
+            # State written before the API side existed carries only by_pi /
+            # by_op. Falling back to those leaves the API total equal to the
+            # estimate for one poll, rather than empty.
+            _add(by_pi_api, p.get("by_pi_api") or p.get("by_pi"))
+            _add(by_op_api, p.get("by_op_api") or p.get("by_op"))
 
         past = [d for d in days if d != today]
         if past:
@@ -528,12 +565,17 @@ class handler(BaseHTTPRequestHandler):
                 day = breakdown.get(d) or {}
                 _add(by_pi, day.get("pi"))
                 _add(by_op, day.get("op"))
+                _add(by_pi_api, day.get("pi_api") or day.get("pi"))
+                _add(by_op_api, day.get("op_api") or day.get("op"))
 
         return {
             "days": days,
             "total_hours": round(sum(by_pi.values()) / 3600, 3),
             "hours_by_pi": C.ranked(by_pi, hide_unnamed=True),
             "hours_by_operator": C.ranked(by_op),
+            "total_hours_api": round(sum(by_pi_api.values()) / 3600, 3),
+            "hours_by_pi_api": C.ranked(by_pi_api, hide_unnamed=True),
+            "hours_by_operator_api": C.ranked(by_op_api),
         }
 
     def _day_tasks(self, qs):
@@ -579,8 +621,9 @@ class handler(BaseHTTPRequestHandler):
                     "duration_s": dur,
                     "start_time": sess.get("start_unix"),
                 }
-                # Only present when the two disagree; the dashboard shows it in
-                # red next to the duration above.
+                # Present on every estimated session; the dashboard shows it in
+                # parentheses next to the duration above, tinted by how far the
+                # two have drifted apart.
                 if api_dur is not None:
                     task["duration_api_s"] = api_dur
                 # Still listed, greyed out by the dashboard, but excluded from

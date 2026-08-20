@@ -114,6 +114,17 @@ def is_unnamed_pi(label: str) -> bool:
     return bool(_UNNAMED_PI_RE.match(label or ""))
 
 
+# Hostnames arrive from the page as a path segment, and are pasted straight
+# into an upstream URL. Anything outside this set is rejected before the call
+# rather than escaped after it, so there is no argument to be had about
+# whether "rpi5-..%2f..%2fadmin" survives one round of decoding.
+_HOSTNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def valid_hostname(host) -> bool:
+    return bool(_HOSTNAME_RE.match(str(host or "")))
+
+
 def device_label(device: dict) -> str:
     return device.get("display_name") or device.get("hostname", "?")
 
@@ -674,17 +685,25 @@ def evaluate_rigs(devices, locations=None, should_alert=None, prev_status=None,
 # writes 0.673 of a four-camera one, which a total-bytes baseline reads as a
 # hung recording and "corrects" away.
 #
-# This mirrors categorize_tasks.py deliberately — same head-only input, same
-# least-squares fit, same ratio — so dashboard and report cannot disagree about
-# how long a session ran. Change one, change both.
+# The head-only input and the least-squares fit still mirror
+# categorize_tasks.py exactly, and changing either belongs in both. What no
+# longer matches is which duration gets COUNTED: the dashboard now counts the
+# estimate whenever it has one, while the report still counts the wall clock
+# unless the estimate falls below DURATION_MISMATCH_RATIO of it. So the two
+# agree on every corrected session and can differ by the model's residual —
+# under a percent on the head unit — on ordinary ones.
 #
-# The correction only ever runs ONE WAY. An estimate above the wall clock
-# means the head wrote faster than its neighbours, not that the folder was
-# open for less time than it recorded, so a high estimate is ignored. Only an
-# estimate at or below DURATION_MISMATCH_RATIO of the wall clock is treated as
-# evidence the span is inflated, and only then does it become the counted
-# duration, with the API's number carried alongside so the dashboard can show
-# what it replaced.
+# The estimate is the COUNTED duration whenever the head camera gives one,
+# in both directions. It used to apply one way only — a high estimate was
+# ignored as "the head wrote faster than its neighbours" — but that rule is
+# what let a rig whose clock was 15 days slow report a two-hour recording as
+# 374 hours: nothing else in the pipeline questions a wall clock, so a span
+# the bytes cannot possibly account for was banked in full. The wall clock is
+# now carried alongside rather than trusted, and the dashboard shows both.
+#
+# DURATION_MISMATCH_RATIO no longer gates what is counted here. It still gates
+# categorize_tasks.py, whose report keeps the one-way rule — see the note on
+# mirroring below.
 #
 # The model lives in Redis under "duration_model", rebuilt by each backfill,
 # so a request can judge a session without re-reading the fleet's history.
@@ -697,13 +716,21 @@ DURATION_MISMATCH_RATIO = 0.75   # how far below wall clock the estimate must
 # by rig would only shrink the sample. The whole model is two numbers, so it
 # costs almost nothing to keep in Redis and read on a request.
 TRIM_SIGMA = 3.0        # residuals beyond this are dropped before the refit
-MIN_TRAIN_POINTS = 30   # below this there is nothing worth fitting
+# Two points is what a straight line mathematically needs, and that is now the
+# only bar. It used to be 30, which meant a fleet whose stored sessions had not
+# yet accumulated 30 head-byte readings got an empty model — and an empty model
+# is indistinguishable from "no estimate", so every duration silently fell back
+# to the API's wall clock with nothing to show it had.
+MIN_TRAIN_POINTS = 2
 
-# Estimation is OFF unless explicitly enabled, matching the config default in
-# categorize_tasks.py: durations are the API's own until someone opts in.
-# FLEET_DISABLE_ESTIMATION=n (or 0/false/no) in the environment turns it on.
+# Estimation is ON. It was opt-in while the model was being trusted, which is
+# how two 370-hour sessions reached the ranked totals unchallenged; the whole
+# point of the model is to catch exactly that, so it no longer waits to be
+# asked. FLEET_DISABLE_ESTIMATION=y (or 1/true/yes) in the environment is the
+# kill switch, and turning it off also removes the API figure the dashboard
+# shows in parentheses — with nothing estimated there is nothing to compare.
 DISABLE_ESTIMATION = os.environ.get(
-    "FLEET_DISABLE_ESTIMATION", "y").strip().lower() not in ("n", "no", "false", "0")
+    "FLEET_DISABLE_ESTIMATION", "n").strip().lower() in ("y", "yes", "true", "1")
 
 # The head camera's files, by the role the API labels them with. Segmented
 # recordings appear as head_oakd.seg1.mcap and friends, so names are matched on
@@ -768,6 +795,22 @@ def extract_head_bytes(rec: dict):
     return None
 
 
+def head_bytes_of(sess: dict):
+    """The session's head-camera bytes, stored or derived, or None.
+
+    The stored field is only ever written by the backfill. Everything else —
+    today's live leaderboard, anything reading a session straight off the fleet
+    API — was handing raw records to session_durations(), where `head_bytes`
+    simply was not a key, so predict_duration() got None and the estimate
+    silently never applied. Falling back to the per-file sizes on the record
+    itself means a caller no longer has to know which of the two it is holding.
+    """
+    stored = _positive_number(sess.get("head_bytes"))
+    if stored is not None:
+        return stored
+    return _positive_number(extract_head_bytes(sess))
+
+
 def build_duration_model(sessions_by_host: dict) -> dict:
     """Fits the duration model over every stored session with head bytes."""
     pts = []
@@ -776,7 +819,7 @@ def build_duration_model(sessions_by_host: dict) -> dict:
             if not isinstance(sess, dict):
                 continue
             dur = _positive_number(sess.get("duration_s"))
-            head = _positive_number(sess.get("head_bytes"))
+            head = head_bytes_of(sess)
             if dur is None or head is None or dur < MIN_TRAIN_DURATION_S:
                 continue
             pts.append((head, dur))
@@ -842,13 +885,17 @@ def predict_duration(head_bytes, model: dict):
 
 
 def session_durations(host: str, sess: dict, model: dict):
-    """(duration to count, API duration when the bytes contradict it).
+    """(duration to count, the API's own wall clock alongside it).
 
-    Returns the head-camera estimate only when it falls to
-    DURATION_MISMATCH_RATIO of the API's span or below — the signature of an
-    inflated wall clock. The second element is None every other time: an
-    estimate that agrees, one that comes in high, no head file to measure, or
-    estimation switched off. In all of those the API duration stands.
+    The head-camera estimate is what counts whenever there is one, however far
+    it lands from the span — see the note above on why the old one-way rule was
+    dropped. The second element is the API's figure, returned whenever the API
+    reported one, so callers can show both numbers and aggregate either.
+
+    When the two are the same object the caller is looking at an unestimated
+    session: no head file to measure, or estimation switched off. Those return
+    the API duration as the counted value and None alongside it, so nothing
+    downstream renders a number in parentheses against itself.
 
     `host` is unused by the fleet-wide model and kept in the signature so the
     call sites do not have to change if a per-rig fit is ever reintroduced.
@@ -859,10 +906,10 @@ def session_durations(host: str, sess: dict, model: dict):
     if DISABLE_ESTIMATION:
         return api_dur, None
 
-    implied = predict_duration(_positive_number(sess.get("head_bytes")), model)
-    if implied is not None and implied < api_dur * DURATION_MISMATCH_RATIO:
-        return implied, api_dur
-    return api_dur, None
+    implied = predict_duration(head_bytes_of(sess), model)
+    if implied is None:
+        return api_dur, None
+    return implied, api_dur
 
 
 def ranked(source: dict, hide_unnamed: bool = False):
