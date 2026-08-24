@@ -1,16 +1,40 @@
-# Keep the deployment bundle small and free of local state.
-# Vercel respects .gitignore too, but this repo's .gitignore is an allowlist,
-# so being explicit here avoids surprises.
+# =========================================================================
+#  .vercelignore — workstream-fleetmonitor
+#
+#  DENYLIST (the opposite of .gitignore): everything ships unless it is
+#  excluded below. Vercel respects .gitignore too, but this repo's .gitignore
+#  is an allowlist, so being explicit here avoids surprises.
+#
+#  Goal: keep the deployment bundle small and free of local state. Only
+#  api/*.py becomes a serverless function; public/ is served static.
+#
+#  Bundle getting large?  ->  sections 2 and 4.
+#  Something local leaking into the deploy?  ->  sections 3 and 4.
+#
+#  CONTENTS
+#    1. Vendored / build output
+#    2. Not part of the serverless deployment
+#    3. Local secrets and runtime state
+#    4. Generated reports — csv + raw json dumps
+#    5. Generated logs
+#    6. OS noise
+#
+#  Companion file: .gitignore, which decides what is committed at all.
+#  Both are listed in README.md under "Repository layout".
+# =========================================================================
 
-# Local-only working directory: caches, generated logs, secrets, and the
-# unused Fly.io / Docker / npm leftovers. None of it belongs in the bundle.
-local/
-
+# ── 1. Vendored / build output ───────────────────────────────────────────
 node_modules/
 __pycache__/
 *.py[cod]
 .venv/
 venv/
+
+
+# ── 2. Not part of the serverless deployment ─────────────────────────────
+# Local-only working directory: caches, generated logs, secrets, and the
+# unused Fly.io / Docker / npm leftovers. None of it belongs in the bundle.
+local/
 
 # Local-only long-running build — not used by the serverless deployment.
 fleet_monitor.py
@@ -18,9 +42,18 @@ fleet_monitor.py
 # Superseded Vercel-KV / WSGI implementation, kept for reference only.
 legacy/
 
-# Local secrets and runtime state.
+# Local CLI tools and their reference data. Neither is part of the serverless
+# deployment (only api/*.py becomes a function), and between them they carry a
+# 100MB+ raw payload and a plaintext fleet password, so the whole folders stay
+# out of the bundle — same reasoning as fleet_monitor.py above.
+categorize_tasks_0728/
+query_tasks/
+
+
+# ── 3. Local secrets and runtime state ───────────────────────────────────
 secrets.json
 categorize_config.txt
+query_config.txt
 .env
 .env.*
 *.local
@@ -31,16 +64,29 @@ categorize_config.txt
 .pi_session_cache.json
 .task_history.json
 .device_locations.json
-task_report.raw.json
 
-# Generated logs.
+
+# ── 4. Generated reports — csv + raw json dumps ──────────────────────────
+# Output of categorize_tasks.py and query_tasks.py. Section 2 already keeps
+# their folders out; these patterns catch a report written anywhere else, and
+# are what stops a 100MB+ dump being uploaded on a deploy.
+*.csv
+*.raw.json
+task_report*.json
+task_report*.csv
+query_report*.json
+query_report*.csv
+# Root-level dump of the fleet API's session listing.
+sessions.json
+
+
+# ── 5. Generated logs ────────────────────────────────────────────────────
 operator_sessions/
 recording_logs/
 daily_recording_log_*.txt
 operator_sessions_*.txt
 *.log
-task_report.csv
-task_report_sheets.csv
-task_report.raw.json
 
+
+# ── 6. OS noise ──────────────────────────────────────────────────────────
 .DS_Store

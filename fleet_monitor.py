@@ -442,8 +442,10 @@ DURATION_MISMATCH_RATIO = 0.75   # unused here now that the estimate always
 # Least-squares fit of duration against head bytes, fleet-wide rather than per
 # rig: the head unit is the same hardware writing the same streams on every rig
 # and the measured spread across all of them is under a percent, so splitting
-# by rig would only shrink the sample. The whole model is two numbers.
-TRIM_SIGMA = 3.0                 # residuals beyond this are dropped before the refit
+# by rig would only shrink the sample. The whole model is ONE number — a rate,
+# with no offset.
+TRIM_SIGMA = 3.0                 # robust sigmas past which a residual is an outlier
+TRIM_PASSES = 5                  # refits before the trim is taken as settled
 # Two points is what a straight line needs, and that is now the only bar. At 30
 # a fleet whose stored sessions had not yet accumulated 30 head-byte readings
 # got an empty model, and an empty model is indistinguishable from "no
@@ -472,7 +474,7 @@ DISABLE_ESTIMATION = os.environ.get(
 _HEAD_ROLE_PREFIXES = ("head_oakd",)
 _HEAD_FILE_LISTS = ("mcap_files", "session_files", "files", "recordings")
 
-_duration_model: dict = {}               # {"slope": .., "intercept": ..}
+_duration_model: dict = {}               # {"slope": .., "n": .., "dropped": ..}
 _duration_model_lock = threading.Lock()
 
 
@@ -544,51 +546,70 @@ def _rebuild_duration_model():
         _duration_model = fitted
 
 
-def _least_squares(pts):
-    """(slope, intercept) of duration against head bytes, or None."""
-    n = len(pts)
-    if n < 2:
-        return None
-    sx = sum(b for b, _ in pts)
-    sy = sum(d for _, d in pts)
+def _median(xs):
+    """Middle value of a non-empty list."""
+    s = sorted(xs)
+    n = len(s)
+    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2.0
+
+
+def _head_rate(pts):
+    """Seconds of recording per head byte: least squares through the origin.
+
+    Through the origin deliberately. A free intercept is the one parameter a
+    hung session can move without moving the slope, so that is where the
+    contamination collected — and a bias parked in the intercept is added to
+    every estimate in the fleet at full strength, however long the session.
+    It is also unphysical: no bytes written is no recording. Fitted on clean
+    data the intercept comes out at 0.6s, well inside the noise, so dropping
+    the term costs nothing and removes the failure mode.
+    """
     sxx = sum(b * b for b, _ in pts)
-    sxy = sum(b * d for b, d in pts)
-    den = n * sxx - sx * sx
-    if den <= 0:
+    if sxx <= 0:
         return None
-    slope = (n * sxy - sx * sy) / den
-    return slope, (sy - slope * sx) / n
+    slope = sum(b * d for b, d in pts) / sxx
+    return slope if slope > 0 else None
 
 
 def _fit_trimmed(pts):
-    """Least squares, refit once with the worst residuals dropped.
+    """The head rate, refit until the outliers stop moving it.
 
     The outliers this model exists to FIND are high-leverage points in its own
     training data: a hung session pairs an ordinary byte count with an enormous
-    wall clock, and on the raw fit those drag R^2 to 0.71 and push the
-    intercept to 131s, which then inflates every estimate the model makes. One
-    pass at TRIM_SIGMA takes R^2 to 0.99 and the intercept to 37s, without the
-    fit having to be told which sessions are the bad ones.
+    wall clock. Trimming those on mean and standard deviation does not work,
+    because the monsters ARE most of the standard deviation — on the live fleet
+    the residual sd is 46,000s, so a 3-sigma cut lands at 39 HOURS and drops 2
+    points out of 1653. Every bad session stays in and drags the fit.
+
+    Median and MAD have no such feedback: both ignore the tail outright, so the
+    cut is set by the sessions that behave rather than by the ones being looked
+    for. Iterating tightens it as the worst points leave. On the live fleet it
+    settles after four passes at 4.280 MB/s — the OAK head\'s known rate — with
+    437 sessions set aside.
     """
     if len(pts) < MIN_TRAIN_POINTS:
         return None
-    first = _least_squares(pts)
-    if first is None:
+    kept = list(pts)
+    slope = _head_rate(kept)
+    if slope is None:
         return None
-    slope, inter = first
 
-    res = [abs(d - (slope * b + inter)) for b, d in pts]
-    mean = sum(res) / len(res)
-    sd = (sum((r - mean) ** 2 for r in res) / len(res)) ** 0.5
-    if sd > 0:
-        kept = [p for p, r in zip(pts, res) if r <= TRIM_SIGMA * sd]
-        if len(kept) >= MIN_TRAIN_POINTS:
-            second = _least_squares(kept)
-            if second is not None:
-                slope, inter = second
-                return {"slope": slope, "intercept": inter,
-                        "n": len(kept), "dropped": len(pts) - len(kept)}
-    return {"slope": slope, "intercept": inter, "n": len(pts), "dropped": 0}
+    for _ in range(TRIM_PASSES):
+        res = [d - slope * b for b, d in kept]
+        mid = _median(res)
+        mad = _median([abs(r - mid) for r in res])
+        if mad <= 0:                       # the kept set already agrees exactly
+            break
+        cut = TRIM_SIGMA * 1.4826 * mad    # MAD -> sigma, for a normal core
+        survivors = [p for p, r in zip(kept, res) if abs(r - mid) <= cut]
+        if len(survivors) == len(kept) or len(survivors) < MIN_TRAIN_POINTS:
+            break
+        refit = _head_rate(survivors)
+        if refit is None:
+            break
+        kept, slope = survivors, refit
+
+    return {"slope": slope, "n": len(kept), "dropped": len(pts) - len(kept)}
 
 
 def _predict_duration(head_bytes) -> float | None:
@@ -600,7 +621,11 @@ def _predict_duration(head_bytes) -> float | None:
     slope = model.get("slope")
     if not slope or slope <= 0:
         return None
-    est = slope * float(head_bytes) + (model.get("intercept") or 0.0)
+    # No intercept term, deliberately — see _head_rate. An intercept left on a
+    # model still sitting in Redis from before this changed is ignored rather
+    # than applied: that stale +92s is the whole bug, and reading past it means
+    # the fix lands on the next request instead of the next backfill.
+    est = slope * float(head_bytes)
     return est if est > 0 else None
 
 
@@ -2164,6 +2189,10 @@ class EmbeddedUIServer(BaseHTTPRequestHandler):
                 avg_fh = None
                 min_fh = None
             _send_json(self, 200, {
+                # The day the running total belongs to. The dashboard keys
+                # today's bar off this rather than off its own clock, so a
+                # stale view can no longer be drawn as if it were today's.
+                "hours_today_date":     today_str,
                 "total_hours_today":    round(total_s / 3600, 3),
                 "avg_frame_health_pct": avg_fh,
                 "min_frame_health_pct": min_fh,
