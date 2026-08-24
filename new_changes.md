@@ -1,4 +1,10 @@
-# What's new — 08/18
+# What's new — 08/21
+
+release 1.2.1 8/24
+- removed y-intercept from linear regression (a recording with no time should be 0 bytes)
+
+release 1.2.0 8/21
+- adding value labels to hours recorded per day
 
 release 1.1.8 08/18
 - created toggle for estimates/APIs
@@ -6,7 +12,3 @@ release 1.1.8 08/18
     - orange numbers if 5-20% off
     - red numbers if >20% off
     - parentheses for API numbers
-
-release 1.1.7 08/12
-- **API DURATIONS ARE WRONG** (finding workaround)
-- added readable notes

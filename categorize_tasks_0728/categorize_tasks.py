@@ -306,8 +306,12 @@ class _EmbeddedClient:
 
 
 def make_client(base_url: str):
-    """Prefers the repo's api_client.py; falls back to the embedded copy."""
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    """Prefers the repo's api_client.py; falls back to the embedded copy.
+
+    The repo root is one level up now that this script lives in its own
+    folder — without that hop the import always misses and every run
+    silently takes the embedded fallback."""
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     try:
         from api_client import FleetAPIClient        # type: ignore
         return FleetAPIClient(base_url=base_url), "api_client.py"
@@ -316,7 +320,16 @@ def make_client(base_url: str):
 
 
 # ── Configuration ────────────────────────────────────────────────────────
-def load_config(config_file: str = "categorize_config.txt") -> dict:
+# Lives in this script's own folder alongside the report it configures, so the
+# whole categorize_tasks set is one self-contained directory. Anchored to the
+# file rather than the working directory, so a run started from anywhere still
+# finds it. It holds a fleet password — .gitignore and .vercelignore both match
+# it by bare name at any depth, so it stays ignored here exactly as before.
+DEFAULT_CONFIG = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "categorize_config.txt")
+
+
+def load_config(config_file: str = None) -> dict:
     """Load config from file, or prompt user if file doesn't exist.
 
     Config file format:
@@ -330,6 +343,8 @@ def load_config(config_file: str = "categorize_config.txt") -> dict:
         sheets_output=n
         disable_estimation=y
     """
+    config_file = config_file or DEFAULT_CONFIG
+
     config = {
         "email": "",
         "password": "",
@@ -915,7 +930,8 @@ DURATION_MISMATCH_RATIO = 0.75
 # and the measured spread across all of them is under a percent, so splitting
 # by rig would only shrink the sample. The whole model is two numbers, so it
 # costs nothing to carry between processes.
-TRIM_SIGMA = 3.0        # residuals beyond this are dropped before the refit
+TRIM_SIGMA = 3.0        # robust sigmas past which a residual is an outlier
+TRIM_PASSES = 5         # refits before the trim is taken as settled
 MIN_TRAIN_POINTS = 2    # a straight line needs two points; that is the only bar
 
 # The head camera's files, by the role the API labels them with. Segmented
@@ -985,51 +1001,70 @@ def build_duration_model(raw: list[dict]) -> dict:
     return _fit_trimmed(pts) or {}
 
 
-def _least_squares(pts):
-    """(slope, intercept) of duration against head bytes, or None."""
-    n = len(pts)
-    if n < 2:
-        return None
-    sx = sum(b for b, _ in pts)
-    sy = sum(d for _, d in pts)
+def _median(xs):
+    """Middle value of a non-empty list."""
+    s = sorted(xs)
+    n = len(s)
+    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2.0
+
+
+def _head_rate(pts):
+    """Seconds of recording per head byte: least squares through the origin.
+
+    Through the origin deliberately. A free intercept is the one parameter a
+    hung session can move without moving the slope, so that is where the
+    contamination collected — and a bias parked in the intercept is added to
+    every estimate in the fleet at full strength, however long the session.
+    It is also unphysical: no bytes written is no recording. Fitted on clean
+    data the intercept comes out at 0.6s, well inside the noise, so dropping
+    the term costs nothing and removes the failure mode.
+    """
     sxx = sum(b * b for b, _ in pts)
-    sxy = sum(b * d for b, d in pts)
-    den = n * sxx - sx * sx
-    if den <= 0:
+    if sxx <= 0:
         return None
-    slope = (n * sxy - sx * sy) / den
-    return slope, (sy - slope * sx) / n
+    slope = sum(b * d for b, d in pts) / sxx
+    return slope if slope > 0 else None
 
 
 def _fit_trimmed(pts):
-    """Least squares, refit once with the worst residuals dropped.
+    """The head rate, refit until the outliers stop moving it.
 
     The outliers this model exists to FIND are high-leverage points in its own
     training data: a hung session pairs an ordinary byte count with an enormous
-    wall clock, and on the raw fit those drag R^2 to 0.71 and push the
-    intercept to 131s, which then inflates every estimate the model makes. One
-    pass at TRIM_SIGMA takes R^2 to 0.99 and the intercept to 37s, without the
-    fit having to be told which sessions are the bad ones.
+    wall clock. Trimming those on mean and standard deviation does not work,
+    because the monsters ARE most of the standard deviation — on the live fleet
+    the residual sd is 46,000s, so a 3-sigma cut lands at 39 HOURS and drops 2
+    points out of 1653. Every bad session stays in and drags the fit.
+
+    Median and MAD have no such feedback: both ignore the tail outright, so the
+    cut is set by the sessions that behave rather than by the ones being looked
+    for. Iterating tightens it as the worst points leave. On the live fleet it
+    settles after four passes at 4.280 MB/s — the OAK head\'s known rate — with
+    437 sessions set aside.
     """
     if len(pts) < MIN_TRAIN_POINTS:
         return None
-    first = _least_squares(pts)
-    if first is None:
+    kept = list(pts)
+    slope = _head_rate(kept)
+    if slope is None:
         return None
-    slope, inter = first
 
-    res = [abs(d - (slope * b + inter)) for b, d in pts]
-    mean = sum(res) / len(res)
-    sd = (sum((r - mean) ** 2 for r in res) / len(res)) ** 0.5
-    if sd > 0:
-        kept = [p for p, r in zip(pts, res) if r <= TRIM_SIGMA * sd]
-        if len(kept) >= MIN_TRAIN_POINTS:
-            second = _least_squares(kept)
-            if second is not None:
-                slope, inter = second
-                return {"slope": slope, "intercept": inter,
-                        "n": len(kept), "dropped": len(pts) - len(kept)}
-    return {"slope": slope, "intercept": inter, "n": len(pts), "dropped": 0}
+    for _ in range(TRIM_PASSES):
+        res = [d - slope * b for b, d in kept]
+        mid = _median(res)
+        mad = _median([abs(r - mid) for r in res])
+        if mad <= 0:                       # the kept set already agrees exactly
+            break
+        cut = TRIM_SIGMA * 1.4826 * mad    # MAD -> sigma, for a normal core
+        survivors = [p for p, r in zip(kept, res) if abs(r - mid) <= cut]
+        if len(survivors) == len(kept) or len(survivors) < MIN_TRAIN_POINTS:
+            break
+        refit = _head_rate(survivors)
+        if refit is None:
+            break
+        kept, slope = survivors, refit
+
+    return {"slope": slope, "n": len(kept), "dropped": len(pts) - len(kept)}
 
 
 def predict_duration(head_bytes, model: dict):
@@ -1039,7 +1074,11 @@ def predict_duration(head_bytes, model: dict):
     slope = model.get("slope")
     if not slope or slope <= 0:
         return None
-    est = slope * float(head_bytes) + (model.get("intercept") or 0.0)
+    # No intercept term, deliberately — see _head_rate. An intercept left on a
+    # model still sitting in Redis from before this changed is ignored rather
+    # than applied: that stale +92s is the whole bug, and reading past it means
+    # the fix lands on the next request instead of the next backfill.
+    est = slope * float(head_bytes)
     return est if est > 0 else None
 
 
@@ -1665,12 +1704,21 @@ def write_csv(path: str, fields: list[str], rows: list[dict], append_mode: bool 
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────
+# The report, its _sheets copy and the .raw.json all derive from --out, so
+# this one default decides where all three land. They sit in this script's own
+# folder; api/_lib/logic.py appends live sessions to the same task_report.csv
+# and points _TASK_REPORT_PATH here to match. Anchored to this file rather than
+# the working directory so a run started from anywhere still writes one report.
+DEFAULT_OUT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "task_report.csv")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--email", help="skip the email prompt (password is still asked for)")
     ap.add_argument("--base-url", default=BASE_URL)
-    ap.add_argument("--out", default="task_report.csv")
+    ap.add_argument("--out", default=DEFAULT_OUT)
     ap.add_argument("--rules", help='JSON: {"codes": {...}, "keywords": {...}}')
     ap.add_argument("--limit", type=int, default=500,
                     help="max sessions requested per device (default 500)")

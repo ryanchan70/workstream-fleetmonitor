@@ -815,6 +815,11 @@ def _build_view(st, rigs, alerts, by_pi, by_op, by_pi_api, by_op_api,
                      "operator_api": C.ranked(by_op_api),
                      "active": True, "source": "api"},
         "stats": {
+            # The day these running totals were computed for. Without it the
+            # client had to assume "today", and a view replayed from its
+            # localStorage cache the next morning drew yesterday's total on
+            # today's bar — 36.01h on a day /stats_range correctly called 0.
+            "hours_today_date": C.get_date_str(),
             "total_hours_today": round(total_s / 3600, 3),
             "total_hours_today_api": round(total_s_api / 3600, 3),
             "avg_frame_health_pct": avg_fh,
@@ -1076,9 +1081,14 @@ _TASK_REPORT_FIELDS = [
 # never gets a real session_id at all, so this stays the only record of it.
 LIVE_SESSION_PREFIX = "live|"
 
+# Kept in categorize_tasks_0728/ beside the script that owns the report, not
+# in api/ or the repo root: the report and its _sheets/.raw siblings are that
+# tool's reference data, not working files. categorize_tasks.py's --out default
+# resolves to this same path, so both writers keep feeding one report — moving
+# one without the other silently splits it in two.
 _TASK_REPORT_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    "task_report.csv")
+    "categorize_tasks_0728", "task_report.csv")
 
 
 def _append_task_report(finished):

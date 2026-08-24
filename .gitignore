@@ -1,20 +1,40 @@
-# ─────────────────────────────────────────────────────────────────────────
-# Allowlist. Everything is ignored unless explicitly permitted below.
+# =========================================================================
+#  .gitignore — workstream-fleetmonitor
 #
-# Deliberately inverted: this repo sits next to secrets.json, .env.local and
-# a pile of generated caches. With a normal denylist, any new secret or cache
-# file is committed by default and you only find out afterwards. Here the
-# default is "ignored", so a new file has to be opted in.
+#  ALLOWLIST, not a denylist: line 1 of the rules is `*`, so EVERYTHING is
+#  ignored unless it is opted back in under section 1.
 #
-# (The previous version used `*.json`, which also excluded package.json and
-# vercel.json — files the build actually needs.)
-# ─────────────────────────────────────────────────────────────────────────
+#  Deliberately inverted: this repo sits next to secrets.json, .env.local,
+#  a plaintext fleet password and 100MB+ of generated report data. With a
+#  normal denylist, any new secret or dump is committed by default and you
+#  find out afterwards. Here a new file has to be opted in on purpose.
+#
+#  Adding a file to the repo?  ->  section 1, add a `!` rule.
+#  Something generated getting committed?  ->  sections 2c-2f.
+#
+#  CONTENTS
+#    1.  Allowlist — the only things that ARE committed
+#        1a. Source
+#        1b. Config / manifests
+#    2.  Re-ignored after the allowlist (later rules win)
+#        2a. Local-only working directory
+#        2b. Secrets — never commit
+#        2c. Vendored / build output
+#        2d. Runtime state written by fleet_monitor.py
+#        2e. Generated reports — csv + raw json dumps
+#        2f. Generated logs
+#        2g. OS noise
+#
+#  Companion file: .vercelignore, which trims the deployment bundle.
+#  Both are listed in README.md under "Repository layout".
+# =========================================================================
 *
 
 # Descend into directories so the rules below can match inside them.
 !*/
 
-# ── Source ───────────────────────────────────────────────────────────────
+
+# ── 1a. Source ───────────────────────────────────────────────────────────
 !.gitignore
 !.vercelignore
 !*.py
@@ -31,7 +51,8 @@
 # — it is edited and deployed, and the API reads its statuses back out.
 !feedback.txt
 
-# ── Config / manifests ───────────────────────────────────────────────────
+
+# ── 1b. Config / manifests ───────────────────────────────────────────────
 !pyproject.toml
 !requirements.txt
 !package.json
@@ -41,24 +62,29 @@
 !Dockerfile
 !.dockerfile
 
-# ─────────────────────────────────────────────────────────────────────────
-# Re-ignored AFTER the allowlist, because later rules win. Without this,
-# `!*.py` above would happily pull in every .py inside node_modules.
-# ─────────────────────────────────────────────────────────────────────────
 
-# ── Local-only working directory ─────────────────────────────────────────
+# =========================================================================
+#  2. Re-ignored AFTER the allowlist, because later rules win. Without this,
+#  `!*.py` above would happily pull in every .py inside node_modules.
+# =========================================================================
+
+# ── 2a. Local-only working directory ─────────────────────────────────────
 # Runtime caches, generated logs, secrets, and the unused Fly.io/Docker/npm
 # leftovers. Ignored wholesale — the allowlist above would otherwise pull in
 # local/package.json, local/*.md and every .py under local/node_modules.
 local/
 
-# ── Secrets — never commit ───────────────────────────────────────────────
+
+# ── 2b. Secrets — never commit ───────────────────────────────────────────
 secrets.json
 .env
 .env.*
 *.local
+categorize_config.txt
+query_config.txt
 
-# ── Vendored / build output ──────────────────────────────────────────────
+
+# ── 2c. Vendored / build output ──────────────────────────────────────────
 node_modules/
 __pycache__/
 *.py[cod]
@@ -70,7 +96,8 @@ dist/
 .venv/
 venv/
 
-# ── Runtime state written by fleet_monitor.py ────────────────────────────
+
+# ── 2d. Runtime state written by fleet_monitor.py ────────────────────────
 # Rebuilt automatically from the fleet API. Committing it causes merge
 # conflicts and puts operator names into git history.
 .daily_hours_cache.json
@@ -80,18 +107,34 @@ venv/
 .pi_session_cache.json
 .task_history.json
 .device_locations.json
-task_report_raw.json
 *.tmp
 
-# ── Generated logs ───────────────────────────────────────────────────────
+
+# ── 2e. Generated reports — csv + raw json dumps ─────────────────────────
+# Output of categorize_tasks.py and query_tasks.py. Every one of these is
+# reproducible by re-running the script, and between them they are 100MB+ of
+# session data carrying operator names — nothing that belongs in git history.
+#
+# The allowlist above already ignores them by default; these rules are
+# written out anyway so the intent survives someone adding a broad `!` rule.
+*.csv
+*.raw.json
+task_report*.json
+task_report*.csv
+query_report*.json
+query_report*.csv
+# Root-level dump of the fleet API's session listing.
+sessions.json
+
+
+# ── 2f. Generated logs ───────────────────────────────────────────────────
 operator_sessions/
 recording_logs/
 daily_recording_log_*.txt
 operator_sessions_*.txt
 *.log
-task_report.raw.json
-categorize_config.txt
 
-# ── OS noise ─────────────────────────────────────────────────────────────
+
+# ── 2g. OS noise ─────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db

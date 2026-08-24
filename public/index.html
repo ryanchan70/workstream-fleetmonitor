@@ -1493,6 +1493,11 @@
                 <span class="notif-track"><span class="notif-thumb"></span></span>
                 <span id="sound-label-text">Alert sound on</span>
             </label>
+            <label class="notif-toggle" title="Show every time on this page as 12-hour AM/PM instead of 24-hour">
+                <input type="checkbox" id="clock-switch" onchange="onClockSwitch(this)">
+                <span class="notif-track"><span class="notif-thumb"></span></span>
+                <span id="clock-label-text">24-hour clock</span>
+            </label>
             <span id="loop-status-top" class="loop-status loop-status-inline status-off">CONNECTING...</span>
         </div>
         <div id="poll-error" class="poll-error hidden"></div>
@@ -1986,7 +1991,7 @@
             const data = await res.json().catch(() => ({}));
             if (res.ok && data.ok) {
                 localStorage.setItem(TOKEN_KEY, data.token);
-                enterDashboard(email, true);
+                enterDashboard(email);
                 return;
             }
 
@@ -2063,13 +2068,36 @@
                 return;
             }
             localStorage.setItem(TOKEN_KEY, data.token);
-            enterDashboard(email, true);
+            enterDashboard(email);
         } catch (e) {
             errEl.textContent = 'Could not reach the local dashboard server at ' + API_BASE + '.';
         } finally {
             btn.disabled = false;
         }
     }
+
+    // Enter in any sign-in field presses the button underneath it. Neither
+    // auth step is wrapped in a <form>, so the browser's implicit submit never
+    // fires and Enter used to do nothing at all — the button had to be
+    // clicked. isComposing is excluded because Enter commits an IME candidate
+    // there rather than meaning "go".
+    function submitOnEnter(inputId, btnId, action) {
+        const el = document.getElementById(inputId);
+        if (!el) return;
+        el.addEventListener('keydown', ev => {
+            if (ev.key !== 'Enter' || ev.isComposing) return;
+            ev.preventDefault();
+            // The button is disabled for exactly as long as a request is in
+            // flight, so this is also what stops a held-down Enter from
+            // stacking one sign-in attempt per key repeat.
+            const btn = document.getElementById(btnId);
+            if (btn && btn.disabled) return;
+            action();
+        });
+    }
+    submitOnEnter('auth-email',    'auth-send-btn',   tryLogin);
+    submitOnEnter('auth-password', 'auth-send-btn',   tryLogin);
+    submitOnEnter('auth-code',     'auth-verify-btn', verifyCode);
 
     async function logout() {
         try {
@@ -2086,11 +2114,11 @@
         resetAuth();
     }
 
-    // `fromLogin` is true only when the user has just pressed Sign in or
-    // Verify. That press is the user gesture the Notifications API requires,
-    // and it is the one moment where being asked makes sense — restoring a
-    // stored session later is not a gesture and must not prompt.
-    function enterDashboard(email, fromLogin) {
+    // Reached three ways — password sign-in, code sign-in, and restoring a
+    // stored session on load. It used to be told which, so it could prompt for
+    // notification permission on the two that were a user gesture; nothing
+    // prompts from here any more, so it no longer needs to know.
+    function enterDashboard(email) {
         document.getElementById('auth-gate').classList.add('hidden');
         document.getElementById('dashboard').classList.remove('hidden');
         document.getElementById('session-email').textContent = email;
@@ -2109,21 +2137,19 @@
         if (!SECURE_OK || !NOTIF_SUPPORTED) {
             notifHelp(notifBlockedReason());
         }
-        // Asked once, on the way in. Chrome permanently blocks a site that
-        // requests outside a gesture, and only 'default' is worth asking about
-        // — 'denied' cannot be re-prompted and 'granted' has nothing to ask.
-        if (fromLogin && NOTIF_SUPPORTED && SECURE_OK &&
-            Notification.permission === 'default') {
-            Notification.requestPermission().then(p => {
-                if (p !== 'granted') return;
-                notifEnabled = true;
-                try { localStorage.setItem('fleet_notif_enabled', '1'); } catch (e) {}
-                setNotifUI();
-            }).catch(() => {});
-        }
+        // Nothing is asked for here any more. Signing in used to fire
+        // Notification.requestPermission() the instant the dashboard
+        // appeared, so the first thing anyone saw was a browser permission
+        // dialog they had not asked for — and a "block" answered in that
+        // moment is permanent, which cost the feature the users who would
+        // have wanted it. Permission is now requested only from the two
+        // places that are an explicit request for it: the Push notifications
+        // switch (onNotifSwitch) and the test-alert button. Both are real
+        // user gestures, which is also what the API wants.
         setNotifUI();
         setPollUI();
         setSoundUI();
+        setClockUI();
         setPollRateUI();
         syncSortUI();
         hydrateFromCache();
@@ -2397,7 +2423,7 @@
         if (r.service_since) {
             const d = new Date(r.service_since * 1000);
             bits.push('since ' + d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) +
-                      ' ' + d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' }));
+                      ' ' + localeClock(d));
         }
         if (r.service_by) bits.push('flagged by ' + esc(r.service_by));
         return '<div class="service-note">' +
@@ -2436,7 +2462,7 @@
         else rel = Math.round(mins / 1440) + 'd ago';
 
         const sameDay = d.toDateString() === new Date().toDateString();
-        const time = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+        const time = localeClock(d);
         const stamp = sameDay ? time
             : d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ', ' + time;
         return stamp + ' (' + rel + ')';
@@ -2444,13 +2470,62 @@
 
     // hh:mm:ss mm/dd — the fixed-width form used for the rig status stamp,
     // where the exact second matters more than "how long ago".
+    // ── Clock format ─────────────────────────────────────────────────
+    //
+    // One switch behind every time this page prints. They were previously
+    // split two ways with no way to change either: the fixed-width stamps
+    // were hard-coded 24-hour, while the relative ones followed the browser
+    // locale — so the same screen showed a rig tile at "14:32" and an alert
+    // three panels over at "2:32 PM".
+    let use12Hour = false;
+    try { use12Hour = localStorage.getItem('fleet_clock_12h') === '1'; } catch (e) {}
+
+    // hh:mm[:ss], zero-padded in both modes so a column of stamps stays
+    // aligned, with AM/PM appended only in 12-hour mode.
+    function fmtClock(d, withSeconds) {
+        const p = n => String(n).padStart(2, '0');
+        const secs = withSeconds ? ':' + p(d.getSeconds()) : '';
+        const h = d.getHours();
+        if (!use12Hour) return p(h) + ':' + p(d.getMinutes()) + secs;
+        // Midnight and noon are both 12, not 0 — the one case % 12 gets wrong.
+        return p(h % 12 || 12) + ':' + p(d.getMinutes()) + secs +
+               (h < 12 ? ' AM' : ' PM');
+    }
+
+    // The conversational stamps ("Aug 21, 2:32 PM") answer to the switch too,
+    // rather than to whatever the browser locale happens to be.
+    function localeClock(d) {
+        return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit',
+                                          hour12: use12Hour });
+    }
+
+    function setClockUI() {
+        const sw = document.getElementById('clock-switch');
+        const label = document.getElementById('clock-label-text');
+        if (sw) sw.checked = use12Hour;
+        if (label) label.textContent = use12Hour ? 'AM/PM clock' : '24-hour clock';
+    }
+
+    function onClockSwitch(el) {
+        use12Hour = !!el.checked;
+        try { localStorage.setItem('fleet_clock_12h', use12Hour ? '1' : '0'); } catch (e) {}
+        setClockUI();
+        // Every stamp on screen is text drawn on an earlier tick, so the
+        // switch has to repaint rather than wait for the next one. Replaying
+        // the last view through the normal path keeps this correct as panels
+        // are added, instead of hard-coding which renderers print a time.
+        const view = lastView || loadCached(VIEW_KEY, null);
+        if (!view) return;
+        lastRev = null;              // the rev guard would skip an identical view
+        applySummary(view, 'cache');
+    }
+
     function fmtStamp(ms) {
         if (!ms) return '';
         const d = new Date(ms);
         if (Number.isNaN(d.getTime())) return '';
         const p = n => String(n).padStart(2, '0');
-        return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds()) +
-               ' ' + p(d.getMonth() + 1) + '/' + p(d.getDate());
+        return fmtClock(d, true) + ' ' + p(d.getMonth() + 1) + '/' + p(d.getDate());
     }
 
     function badgeClass(status) {
@@ -2594,8 +2669,7 @@
         const d = new Date(best.end * 1000);
         if (Number.isNaN(d.getTime())) return '';
         const p = n => String(n).padStart(2, '0');
-        const when = p(d.getHours()) + ':' + p(d.getMinutes()) +
-                     ' ' + p(d.getMonth() + 1) + '/' + p(d.getDate());
+        const when = fmtClock(d, false) + ' ' + p(d.getMonth() + 1) + '/' + p(d.getDate());
         const bits = [taskLabel(best.t)];
         const op = String(best.t.operator || '').trim();
         if (op && !/^(unknown|none|n\/a|-)$/i.test(op)) bits.push(op);
@@ -2704,8 +2778,7 @@
         if (Number.isNaN(d.getTime())) return '';
         const opts = { month: 'short', day: 'numeric' };
         if (d.getFullYear() !== new Date().getFullYear()) opts.year = 'numeric';
-        const stamp = d.toLocaleDateString([], opts) + ', ' +
-                      d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+        const stamp = d.toLocaleDateString([], opts) + ', ' + localeClock(d);
         const mins = Math.round((Date.now() - ms) / 60000);
         let rel;
         if (mins < 1) rel = 'just now';
@@ -3196,8 +3269,7 @@
         const p = n => String(n).padStart(2, '0');
         const d = new Date(ms);
         return '<span class="alert-item-since" title="Since ' +
-               esc(p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds()) +
-                   ' ' + p(d.getMonth() + 1) + '/' + p(d.getDate())) + '">' +
+               esc(fmtClock(d, true) + ' ' + p(d.getMonth() + 1) + '/' + p(d.getDate())) + '">' +
                esc(ago) + '</span>';
     }
 
@@ -3451,6 +3523,39 @@
             ? { bg: 'rgba(' + rgb + ',0.88)', border: edge }
             : { bg: 'rgba(' + rgb + ',0.22)', border: 'rgba(' + rgb + ',0.55)' });
     }
+
+    // Prints each bar's hours above it. Chart.js has no value labels of its
+    // own and the datalabels plugin is a second CDN script this page does not
+    // load, so it is drawn by hand in afterDatasetsDraw — after the bars, so
+    // the text is never painted over.
+    //
+    // The daily chart is 150px tall; at that height reading a value off the y
+    // axis is guesswork, and the tooltip only answers for one bar at a time.
+    const barValueLabels = {
+        id: 'barValueLabels',
+        afterDatasetsDraw(chart) {
+            const meta = chart.getDatasetMeta(0);
+            if (!meta || meta.hidden) return;
+            const data = chart.data.datasets[0].data;
+            const ctx = chart.ctx;
+            ctx.save();
+            ctx.font = '600 10px ' + Chart.defaults.font.family;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'bottom';
+            meta.data.forEach((bar, i) => {
+                const v = Number(data[i]);
+                // A zero-hour day has no bar to label, and a row of "0.0"
+                // along the axis reads as noise.
+                if (!isFinite(v) || v <= 0) return;
+                // Same idea as the bar alpha: the days feeding the totals
+                // below are legible, the rest stay in the background.
+                const sel = selectedDays && selectedDays.has(lastDayDates[i]);
+                ctx.fillStyle = sel ? '#e5e7eb' : '#6b7280';
+                ctx.fillText(v.toFixed(1), bar.x, bar.y - 3);
+            });
+            ctx.restore();
+        }
+    };
 
     // The range totals were re-fetched after every tick, and answering that
     // request meant walking every session hash in the database. Nothing about
@@ -3836,7 +3941,7 @@
         }
         if (!d) return '—';
         const p = n => String(n).padStart(2, '0');
-        return `${p(d.getMonth() + 1)}/${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+        return `${p(d.getMonth() + 1)}/${p(d.getDate())} ${fmtClock(d, true)}`;
     }
 
     // The human task name ("First aid"), never the raw session folder name.
@@ -3897,7 +4002,7 @@
     function renderStats(s) {
         if (s.last_updated_ms) {
             const d = new Date(s.last_updated_ms);
-            const hms = d.toLocaleTimeString('en-US', {hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});
+            const hms = fmtClock(d, true);
             const mdy = (d.getMonth()+1).toString().padStart(2,'0') + '/' + d.getDate().toString().padStart(2,'0');
             const el = document.getElementById('stat-last-updated');
             if (el) el.textContent = 'updated ' + hms + ' ' + mdy;
@@ -3969,6 +4074,7 @@
             const ctxD = document.getElementById('chart-daily').getContext('2d');
             dailyChart = new Chart(ctxD, {
                 type: 'bar',
+                plugins: [barValueLabels],
                 data: {
                     labels: dayLabels,
                     datasets: [{
@@ -3984,6 +4090,9 @@
                     responsive: true,
                     maintainAspectRatio: false,
                     animation: false,
+                    // Headroom for the value labels: without it the tallest
+                    // bar's number is drawn off the top of the canvas.
+                    layout: { padding: { top: 14 } },
                     onClick: (evt, elements) => {
                         if (!elements.length) return;
                         const idx = elements[0].index;
@@ -4025,9 +4134,7 @@
         const hist = s.frame_health_history || [];
         const labels = hist.map(h => {
             const d = new Date(h.t);
-            return d.getHours().toString().padStart(2,'0') + ':' +
-                   d.getMinutes().toString().padStart(2,'0') + ':' +
-                   d.getSeconds().toString().padStart(2,'0');
+            return fmtClock(d, true);
         });
         const avgData = hist.map(h => h.avg);
         const minData = hist.map(h => h.min);
@@ -4326,9 +4433,18 @@
     let lastStats = null;
 
     function mergedStats(s) {
-        const days = (histCache.hours_by_day || []).filter(d => d.date !== todayISO());
+        // The running total is stamped with the day the POLLER computed it
+        // for, not with this browser's idea of today. hydrateFromCache()
+        // replays the last view out of localStorage before any request goes
+        // out, so a tab reopened the next morning arrives here holding
+        // yesterday's total_hours_today — and labelling that with today's date
+        // drew yesterday's hours on today's bar (36.01h on a day /stats_range
+        // correctly reported as 0). Falls back to the browser date for a
+        // backend too old to send the stamp.
+        const liveDate = s.hours_today_date || todayISO();
+        const days = (histCache.hours_by_day || []).filter(d => d.date !== liveDate);
         if (s.total_hours_today != null) {
-            days.push({ date: todayISO(), hours: s.total_hours_today,
+            days.push({ date: liveDate, hours: s.total_hours_today,
                         hours_api: s.total_hours_today_api != null
                                    ? s.total_hours_today_api : s.total_hours_today });
         }
@@ -4340,11 +4456,15 @@
     }
 
     let lastRev = null;
+    // The last view applied from any source. Kept so a display-only setting
+    // (the clock switch) can repaint the page without a request.
+    let lastView = null;
 
     // `source` is 'net', 'peer' (another tab's fetch) or 'cache' (this tab's
     // last good copy, replayed from localStorage before the first request).
     function applySummary(d, source) {
         if (!d) return;
+        lastView = d;
         if (d.poll && d.poll.error) {
             setLoopStatus("POLL ERROR", "status-off", d.poll.error);
         } else if (source === 'peer') {
@@ -4412,7 +4532,7 @@
         if (!histCache.v) fetchHistory();
     }
 
-    // `force`      — bypass this tab's visibility/lease gates (local)
+    // `force`      — bypass this tab's lease gate (local)
     // `forcePoll`  — also bypass the SERVER's cadence gate (the Refresh button)
     async function fetchUpdates(force, forcePoll) {
         // Checked before `force`, unlike the visibility and lease gates: a
@@ -4423,7 +4543,12 @@
         if (pollInFlight) return;          // never stack requests on a slow link
         // A background tab does not need live data. This is the single biggest
         // saving: tabs left open overnight stop costing anything at all.
-        if (!force && document.visibilityState === 'hidden') return;
+        // No visibility gate. A backgrounded tab used to skip its ticks
+        // entirely, so a dashboard parked on a second monitor sat on whatever
+        // was on screen when it lost focus. It now polls on the chosen cadence
+        // focused or not. (Browsers still throttle setInterval in a hidden tab
+        // to roughly once a minute — nothing in the page can override that, so
+        // rates faster than 1m are approximate while hidden.)
         if (!force && !claimPollLease()) return;
 
         pollInFlight = true;
@@ -4469,8 +4594,9 @@
         }
     }
 
-    // Coming back to a hidden tab, refresh at once rather than showing data
-    // frozen at whenever it was backgrounded.
+    // A hidden tab keeps polling, but the browser throttles its timer to about
+    // once a minute, so the first thing on screen on return can be up to that
+    // stale. Refresh immediately rather than waiting out the tick.
     document.addEventListener('visibilitychange', () => {
         if (document.visibilityState !== 'visible') return;
         if (document.getElementById('dashboard').classList.contains('hidden')) return;

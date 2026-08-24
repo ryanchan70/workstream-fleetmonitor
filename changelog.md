@@ -1,5 +1,11 @@
 # changelog
 
+## 08/24
+- removed y-intercept from linear regression (a recording with no time should be 0 bytes)
+
+## 08/21
+- added value labels to hours recorded per day
+
 ## 08/19
 
 - code cleanup & reorganization
@@ -12,9 +18,7 @@
 
 - every recording in the ranked timings and completed tasks shows the estimate first and the API's own duration in parentheses after, colored grey / amber / red for 0-5% / 5-20% / 20%+ discrepancy
 
-- aggregate fleet stats now has a Estimates | API toggle (estimated durations in aquamarine, API durations in blue)
-
-
+- aggregate fleet stats now   has a Estimates | API toggle (estimated durations in aquamarine, API durations in blue)
 
 ## 08/13
 
@@ -149,15 +153,10 @@
 
 - **migrate to web socket**
 
-- fix disappearing alerts issue
-
-- fix rankings (why is there an Unknown operator?)
-
-- add back task name to terminal dump
+- long-term: add scheduling integration
 
 - hours of tasks per type
   - break it down into by day
-  - x`rig operator & an actual task name
 
 - add location to pis, save presets to selected pis
 
@@ -169,4 +168,4 @@
 
 - custom sound effects 
 
-###### last updated 07/29 10:22AM
+###### last updated 08/24 4:44PM PDT
