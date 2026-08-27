@@ -339,8 +339,14 @@ def _merge_pi_sessions(hostname: str, label: str, sessions: list[dict]) -> bool:
             # uploading reports no size at all, so a stored None is refreshed
             # the moment the API starts reporting one, not left forever.
             head_bytes = _extract_head_bytes(rec)
+            # Unlike head_bytes this is expected to move — waiting ->
+            # uploading -> uploaded — so it is part of the dirty check as
+            # well. Without that a session cached mid-upload would keep
+            # claiming "uploading" long after it had landed.
+            upload_state = _extract_upload_state(rec)
             if (existing is None or existing.get("duration_s", 0) != dur
                     or "start_unix" not in existing
+                    or existing.get("upload_state", "") != upload_state
                     or (head_bytes is not None and existing.get("head_bytes") != head_bytes)):
                 entry["sessions"][sid] = {
                     "date": _session_date(rec),
@@ -353,6 +359,7 @@ def _merge_pi_sessions(hostname: str, label: str, sessions: list[dict]) -> bool:
                     "task": clean_str(rec.get("task")),
                     "start_unix": _session_start_unix(rec),
                     "head_bytes": head_bytes,
+                    "upload_state": upload_state,
                 }
                 changed = True
     return changed
@@ -476,6 +483,20 @@ _HEAD_FILE_LISTS = ("mcap_files", "session_files", "files", "recordings")
 
 _duration_model: dict = {}               # {"slope": .., "n": .., "dropped": ..}
 _duration_model_lock = threading.Lock()
+
+
+# Mirrors core.extract_upload_state in api/_lib. This module runs standalone
+# on the rig-side box and imports nothing from api/, so it is duplicated
+# rather than shared; keep the two in step.
+def _extract_upload_state(rec: dict) -> str:
+    """The session's upload state, lowercased, or "" if the API said nothing.
+
+    Values seen from the fleet API are uploaded / uploading / waiting. Older
+    builds carry none of them, and "" is what tells the dashboard to say
+    nothing rather than to claim a finished session is still going up.
+    """
+    v = rec.get("upload_state") or rec.get("upload_label")
+    return str(v or "").strip().lower()
 
 
 def _extract_head_bytes(rec: dict) -> int | None:
@@ -804,6 +825,12 @@ def backfill_daily_hours(client: "FleetAPIClient"):
                     # sweep, so re-apply the current verdict rather than
                     # leaving the first run's duration frozen in place.
                     prior["duration_s"] = dur
+                    # Rows archived before the link existed pick it up here
+                    # rather than waiting to be re-created, which never happens.
+                    if "session_id" not in prior:
+                        link_id = real_session_id(sid)
+                        if link_id:
+                            prior["session_id"] = link_id
                     if api_dur is None:
                         prior.pop("duration_api_s", None)
                     else:
@@ -833,6 +860,11 @@ def backfill_daily_hours(client: "FleetAPIClient"):
                     "start_time": start_unix,   # may be None -> UI shows "—"
                     "_session_id": sid
                 }
+                link_id = real_session_id(sid)
+                if link_id:
+                    record["session_id"] = link_id
+                if sess.get("upload_state"):
+                    record["upload_state"] = sess["upload_state"]
                 if api_dur is not None:
                     record["duration_api_s"] = api_dur
                 # Listed under the rig and the operator, greyed out, but left
@@ -1899,6 +1931,17 @@ def get_status(device: dict) -> str:
     if cs == "recording": return "recording"
     if (device.get("upload_queue") or 0) > 0: return "uploading"
     return cs or "idle"
+
+# The session-cache key is the fleet API's own id where there is one, and a
+# synthetic "label|name" pair where there is not. Only the former addresses a
+# recording in the ops console, so the dashboard is handed the key only when
+# it is the real thing — a link built from the fallback would 404.
+_REAL_SESSION_ID_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$')
+
+def real_session_id(sid):
+    sid = str(sid or "").strip()
+    return sid if _REAL_SESSION_ID_RE.match(sid) else None
+
 
 _UNNAMED_PI_RE = re.compile(r'^rpi\d*-[0-9a-f]{4}-[0-9a-f]{4}$', re.IGNORECASE)
 

@@ -557,6 +557,23 @@
         .group-btn.g-idle      { border-color: #10b981; color: #34d399; }
         .group-btn.g-servicing { border-color: #f59e0b; color: #fbbf24; }
         .group-btn.g-offline   { border-color: #6b7280; color: #9ca3af; }
+        /* Hardware generation, not status — a violet pair set apart from the
+           status colours above so the two kinds of button do not read as one
+           scale. */
+        .group-btn.g-v20 { border-color: #8b5cf6; color: #c4b5fd; }
+        .group-btn.g-v21 { border-color: #ec4899; color: #f9a8d4; }
+        .group-btn.g-v20.all-on { background: rgba(139,92,246,0.16); }
+        .group-btn.g-v21.all-on { background: rgba(236,72,153,0.16); }
+
+        /* Keeps the generation pair from butting straight up against the
+           status run when both wrap onto one line. */
+        .group-sep {
+            width: 1px;
+            align-self: stretch;
+            margin: 2px 3px;
+            background: #283245;
+        }
+
         .group-btn.g-recording.all-on { background: rgba(239,68,68,0.16); }
         .group-btn.g-uploading.all-on { background: rgba(59,130,246,0.16); }
         .group-btn.g-idle.all-on      { background: rgba(16,185,129,0.16); }
@@ -962,13 +979,123 @@
             grid-template-columns: 108px 1fr auto auto;
             gap: 10px;
             align-items: baseline;
-            color: var(--text-color);
+            color: var(--text-main);
         }
         .rank-task-when { color: var(--text-muted); font-family: 'Geist Mono', monospace; font-size: 0.72rem; }
         .rank-task-name { overflow-wrap: anywhere; }
+        /* Blue and underlined means one specific thing: the recording is in
+           the cloud AND there is an ops session to open. A recording still
+           uploading or queued stays white until its bytes land, as does one
+           whose upload state the API never reported — so the colour is a
+           claim about the bytes, not decoration. Both are still clickable
+           where there is an id to click through to; the underline appears on
+           hover so a white name does not look inert.
+
+           #60a5fa rather than --accent-blue: the darker blue reads fine on a
+           border but not as body text on #111827. Weight is left alone and
+           the rule is a normal 1px — skip-ink: none is what keeps it legible
+           at 0.78rem, by running unbroken through descenders instead of
+           dashing around them. */
+        .task-link {
+            color: var(--text-main);
+            text-decoration: none;
+        }
+        .task-link:hover {
+            color: #93c5fd;
+            text-decoration: underline;
+            text-decoration-skip-ink: none;
+            text-underline-offset: 3px;
+        }
+        .task-link-uploaded {
+            color: #60a5fa;
+            text-decoration: underline;
+            text-decoration-thickness: 1px;
+            text-decoration-skip-ink: none;
+            text-underline-offset: 3px;
+        }
+        .task-link:focus-visible { outline: 2px solid var(--accent-blue); outline-offset: 2px; }
+        .task-name-plain { color: var(--text-main); }
+        /* Only rendered for a session the fleet API gave no task name for.
+           Click, not hover: these tables get read on a phone and on the wall
+           display, and neither has a pointer to hover with. */
+        .task-info-btn {
+            font-family: 'Geist Mono', monospace;
+            font-size: 0.62rem;
+            font-weight: 700;
+            line-height: 13px;
+            width: 14px;
+            height: 14px;
+            padding: 0;
+            margin-left: 5px;
+            cursor: pointer;
+            background: transparent;
+            border: 1px solid #3f4a5f;
+            border-radius: 50%;
+            color: var(--text-muted);
+            vertical-align: baseline;
+        }
+        .task-info-btn:hover { color: var(--accent-blue); border-color: var(--accent-blue); }
+        /* Inline, not block: in the task history it shares a line with the
+           duration, and in a rank row it has to wrap inside its grid cell. */
+        .task-unknown-note {
+            color: var(--text-muted);
+            font-size: 0.72rem;
+            margin-left: 6px;
+        }
         .rank-task-who { color: #7c8798; }
         .rank-task-dur { font-family: 'Geist Mono', monospace; color: #93c5fd; }
         .rank-empty { color: var(--text-muted); }
+        /* Whether the recording has actually reached the cloud yet. A task
+           that is still going up is the one worth spotting — a rig powered
+           down now would lose it — so "uploading" and "waiting" are tinted
+           and "uploaded" is deliberately quiet: a whole column of green ticks
+           would drown the two rows that need attention. A session the API
+           said nothing about gets no chip at all rather than a guess. */
+        .upload-chip {
+            display: inline-block;
+            margin-left: 6px;
+            padding: 1px 5px;
+            border-radius: 4px;
+            font-size: 0.6rem;
+            font-weight: 700;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+            vertical-align: middle;
+            white-space: nowrap;
+        }
+        .upload-done     { background: rgba(148,163,184,0.14); color: #94a3b8; }
+        .upload-going    { background: rgba(59,130,246,0.18);  color: #93c5fd; }
+        .upload-waiting  { background: rgba(245,158,11,0.18);  color: #fbbf24; }
+        /* The dot carries the same three states into the task history, where
+           a full chip on every line would double the length of the list. */
+        .upload-dot {
+            display: inline-block;
+            width: 6px; height: 6px;
+            border-radius: 50%;
+            margin-right: 6px;
+            vertical-align: middle;
+        }
+        .upload-dot.upload-done    { background: #64748b; }
+        .upload-dot.upload-going   { background: #60a5fa; }
+        .upload-dot.upload-waiting { background: #f59e0b; }
+        .rank-task-excluded .upload-chip { opacity: 0.5; }
+        /* The rig's current status, beside its name in Ranked Pi Timings, so
+           a rig high on the board that is offline or in service says so
+           without opening the fleet grid. Same colours as the tile badges;
+           the recording pulse is dropped, because a table of them flashing
+           in unison is noise rather than an alert. */
+        .rank-status {
+            display: inline-block;
+            margin-left: 8px;
+            padding: 2px 6px;
+            border-radius: 5px;
+            font-size: 0.6rem;
+            font-weight: 700;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            vertical-align: middle;
+            animation: none;
+        }
         /* A test session: listed under the rig and the operator so the time is
            still accounted for visibly, but greyed because none of it is in the
            total above. Each child carries its own colour, so they are all
@@ -977,6 +1104,11 @@
         .rank-task-excluded .rank-task-name,
         .rank-task-excluded .rank-task-who,
         .rank-task-excluded .rank-task-dur { color: #6b7280; }
+        /* The link and the plain name both set their own colour, so greying
+           the row has to reach them explicitly too. */
+        .rank-task-excluded .task-link,
+        .rank-task-excluded .task-link-uploaded,
+        .rank-task-excluded .task-name-plain { color: #6b7280; }
         @media (max-width: 600px) {
             .rank-task { grid-template-columns: 1fr auto; }
             .rank-task-when, .rank-task-who { font-size: 0.7rem; }
@@ -2208,6 +2340,19 @@
         CHANGE: 'log-change',
     };
 
+    // The server writes its stamps 24-hour and they arrive as text, so the
+    // clock switch reformats the string rather than a Date — no timezone is
+    // guessed on the way through, which a parse-and-reprint would do.
+    function logClock(hms) {
+        if (!use12Hour) return hms;
+        const p = hms.split(':');
+        const h = parseInt(p[0], 10);
+        if (!Number.isFinite(h)) return hms;
+        // Midnight and noon are both 12, not 0 — the one case % 12 gets wrong.
+        return String(h % 12 || 12).padStart(2, '0') + ':' + p[1] + ':' + p[2] +
+               (h < 12 ? ' AM' : ' PM');
+    }
+
     function renderLogLine(raw) {
         const m = String(raw).match(/^\[(\d{2}:\d{2}:\d{2})\]\s+([A-Z]+)\s+([\s\S]*)$/);
         if (!m) return '<span class="log-line log-plain">' + parseAnsi(raw) + '</span>';
@@ -2221,12 +2366,13 @@
                    parseAnsi(m[3].slice(named[1].length));
         }
         return '<span class="log-line ' + cls + '">' +
-               '<span class="log-ts">[' + m[1] + ']</span> ' +
+               '<span class="log-ts">[' + logClock(m[1]) + ']</span> ' +
                '<span class="log-tag">' + esc(m[2]) + '</span> ' + rest + '</span>';
     }
 
     function renderTerminal() {
         const terminalEl = document.getElementById('terminal');
+        if (!terminalEl) return;      // clock switch can fire before the card exists
         const lines = hideWarnings ? lastLogs.filter(l => !l.includes('WARN')) : lastLogs;
 
         // Store current scroll position before update
@@ -2362,12 +2508,38 @@
     // group is already fully selected.
     const GROUP_ORDER = ['recording', 'uploading', 'idle', 'servicing', 'offline'];
 
+    // ── Hardware generation ──────────────────────────────────────────────
+    // Selected on hostname, not on the display name: a v2.0 rig is given a
+    // person's name and a v2.1 rig a city's, so the label a operator sees
+    // says nothing about which board is in the box. The hostname prefix is
+    // the only part that does.
+    //
+    // The prefix must not run into a longer one — plain startsWith would let
+    // a future rpi50 answer to the v2.0 button — so each is anchored and
+    // followed by a boundary.
+    const VERSION_GROUPS = [
+        { key: 'v20', label: 'v2.0', prefix: 'rpi5',   note: 'Raspberry Pi 5' },
+        { key: 'v21', label: 'v2.1', prefix: 'rock5c', note: 'Rock 5C' },
+    ];
+    const VERSION_RE = {};
+    VERSION_GROUPS.forEach(v => {
+        VERSION_RE[v.key] = new RegExp('^' + v.prefix + '(?![a-z0-9])', 'i');
+    });
+
     function rigsWithStatus(status) {
         return knownRigs.filter(r => r.status === status).map(r => r.hostname);
     }
 
-    function toggleStatusGroup(status) {
-        const group = rigsWithStatus(status);
+    function rigsWithVersion(key) {
+        const re = VERSION_RE[key];
+        if (!re) return [];
+        return knownRigs.filter(r => re.test(String(r.hostname || '')))
+                        .map(r => r.hostname);
+    }
+
+    // Shared by both rows: on if any of the group is unselected, off once the
+    // group is already fully selected.
+    function applyGroupToggle(group) {
         if (!group.length) return;
         if (!Array.isArray(monitoredRigs)) monitoredRigs = knownRigs.map(r => r.hostname);
 
@@ -2383,6 +2555,14 @@
         // All pill and the counts stay consistent.
         if (monitoredRigs.length === knownRigs.length) monitoredRigs = null;
         saveMonitored();
+    }
+
+    function toggleStatusGroup(status) {
+        applyGroupToggle(rigsWithStatus(status));
+    }
+
+    function toggleVersionGroup(key) {
+        applyGroupToggle(rigsWithVersion(key));
     }
 
     function renderGroupButtons() {
@@ -2403,7 +2583,22 @@
                    ' onclick="toggleStatusGroup(\'' + status + '\')">' +
                    label + ' <span class="gb-n">' + group.length + '</span></button>';
         }).join('');
-        host.innerHTML = html;
+
+        // Same rules as the status run above — always rendered, even at zero,
+        // so neither row moves out from under a finger as the fleet changes.
+        const versionHtml = VERSION_GROUPS.map(v => {
+            const group = rigsWithVersion(v.key);
+            const empty = group.length === 0;
+            const on = !empty && (all || group.every(h => monitoredRigs.includes(h)));
+            return '<button type="button" class="group-btn g-' + v.key +
+                   (empty ? ' g-empty' : '') + (on ? ' all-on' : '') +
+                   '"' + (empty ? ' disabled' : '') +
+                   ' title="' + esc(v.note + ' (' + v.prefix + '-*)') + '"' +
+                   ' onclick="toggleVersionGroup(\'' + v.key + '\')">' +
+                   v.label + ' <span class="gb-n">' + group.length + '</span></button>';
+        }).join('');
+
+        host.innerHTML = html + '<span class="group-sep"></span>' + versionHtml;
     }
 
     function esc(s) {
@@ -2518,6 +2713,11 @@
         // switch has to repaint rather than wait for the next one. Replaying
         // the last view through the normal path keeps this correct as panels
         // are added, instead of hard-coding which renderers print a time.
+        //
+        // The terminal is repainted straight from its own buffer first. It is
+        // the one panel that survives a view with no `logs` on it, and it must
+        // not sit at the old format behind the early return below.
+        renderTerminal();
         const view = lastView || loadCached(VIEW_KEY, null);
         if (!view) return;
         lastRev = null;              // the rev guard would skip an identical view
@@ -2593,6 +2793,7 @@
         lastUpdatedMs = data.updated || null;
         renderUpdatedStamp();
         renderFilter();
+        refreshRankStatuses();
 
         const allCounts = countRigs(data.rigs);
         const allEl = document.getElementById('rig-counts-all');
@@ -3606,6 +3807,34 @@
 
     function rankKey(kind, name) { return kind + '|' + name; }
 
+    // The ranking tables key on the rig's label; the fleet grid keys on its
+    // hostname. This is the only place the two have to meet.
+    function rigStatusByLabel(label) {
+        const r = (knownRigs || []).find(x => String(x.label || '') === String(label));
+        return r ? String(r.status || '') : '';
+    }
+
+    // Always emitted, even before the first device poll has named a status,
+    // so refreshRankStatuses() has something to fill in later rather than
+    // the row having to be rebuilt.
+    function rankStatusHtml(label) {
+        const status = rigStatusByLabel(label);
+        return '<span class="rank-status ' + (status ? badgeClass(status) : 'hidden') +
+               '" data-label="' + esc(label) + '">' + esc(status) + '</span>';
+    }
+
+    // The rankings are rendered from range data, which refreshes on its own
+    // clock; the status comes from the device poll instead. Patch the badges
+    // in place rather than re-running renderRangeStats, which would rebuild
+    // both charts on every device poll.
+    function refreshRankStatuses() {
+        document.querySelectorAll('#pi-rankings .rank-status').forEach(el => {
+            const status = rigStatusByLabel(el.dataset.label || '');
+            el.className = 'rank-status ' + (status ? badgeClass(status) : 'hidden');
+            el.textContent = status;
+        });
+    }
+
     function rankRow(kind, i, entry) {
         const key = rankKey(kind, entry.name);
         const open = openRanks.has(key);
@@ -3613,7 +3842,8 @@
                    '" onclick="toggleRank(\'' + jsAttr(key) + '\')">' +
                 '<td>' + (i + 1) + '</td>' +
                 '<td><span class="rank-caret">' + (open ? '▾' : '▸') + '</span>' +
-                    '<strong>' + esc(entry.name) + '</strong></td>' +
+                    '<strong>' + esc(entry.name) + '</strong>' +
+                    (kind === 'pi' ? rankStatusHtml(entry.name) : '') + '</td>' +
                 '<td style="text-align: right;"><span class="time-badge" ' +
                     'style="color:' + aggColor() + '">' +
                     esc(entry.duration) + '</span></td></tr>' +
@@ -3682,13 +3912,13 @@
             '<div class="rank-task' + (t.test ? ' rank-task-excluded' : '') + '"' +
                 (t.test ? ' title="Test session — listed, but not counted in the total"' : '') + '>' +
                 '<span class="rank-task-when">' + esc(formatStart(t)) + '</span>' +
-                '<span class="rank-task-name">' + esc(taskLabel(t)) + '</span>' +
+                '<span class="rank-task-name">' + taskNameHtml(t) + '</span>' +
                 // A rig row lists who ran each task; an operator row lists
                 // which rig they ran it on. Neither repeats the row's own name.
                 '<span class="rank-task-who">' +
                     esc(kind === 'pi' ? (t.operator || '') : (t.label || '')) + '</span>' +
                 '<span class="rank-task-dur">' + esc(formatDuration(t.duration_s)) +
-                    apiDurationHtml(t) + '</span>' +
+                    apiDurationHtml(t) + uploadChipHtml(t) + '</span>' +
             '</div>').join('');
     }
 
@@ -3955,6 +4185,132 @@
         return 'Untitled task';
     }
 
+    // ── Link out to the recording ────────────────────────────────────────
+    // Only sessions swept in since the backend started storing the id carry
+    // one, so the name falls back to plain text rather than to a link that
+    // would land on an ops 404.
+    const OPS_SESSION_URL = 'https://ops.usephysical.ai/sessions/';
+    // Deliberately strict: the id goes into a URL path, and the backend's
+    // fallback key for a session with no id is a "label|name" pair, which
+    // must never be linked. A real id is a uuid.
+    const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+    function sessionUrl(task) {
+        const id = String((task && task.session_id) || '').trim();
+        if (!id || !SESSION_ID_RE.test(id)) return '';
+        return OPS_SESSION_URL + encodeURIComponent(id);
+    }
+
+    // A session the fleet API returned no task for. The backend writes the
+    // literal "Unknown"; taskLabel turns a bare session-folder name into
+    // "Untitled task". They are the same thing to a reader — no label was
+    // recorded — so both get the button that explains it.
+    const UNKNOWN_TASK_LABELS = ['Unknown', 'Untitled task'];
+    const UNKNOWN_TASK_HELP =
+        'No task name came back for this session: the recording was started ' +
+        'without one being picked, or the rig is on a build older than task ' +
+        'labels. The recording itself is fine \u2014 only the label is missing.';
+
+    // ── Upload state ────────────────────────────────────────────────────
+    // The fleet API reports one of uploaded / uploading / waiting per session.
+    // Anything else it grows later is shown verbatim in the neutral style
+    // rather than being forced into one of the three.
+    const UPLOAD_DONE = 'uploaded';
+    const UPLOAD_CLASS = {
+        uploaded:  'upload-done',
+        uploading: 'upload-going',
+        waiting:   'upload-waiting'
+    };
+    const UPLOAD_TITLE = {
+        uploaded:  'Uploaded — this recording is in the cloud.',
+        uploading: 'Uploading now — bytes are still moving off the rig.',
+        waiting:   'Waiting — queued for the uploader, which has not started ' +
+                   'on it yet. Nothing has left the rig.'
+    };
+
+    function uploadState(task) {
+        return String((task && task.upload_state) || '').trim().toLowerCase();
+    }
+
+    // Full chip, for the ranked drill-down, which has room for a word.
+    function uploadChipHtml(task) {
+        const st = uploadState(task);
+        if (!st) return '';
+        return '<span class="upload-chip ' + (UPLOAD_CLASS[st] || 'upload-done') +
+               '" title="' + esc(UPLOAD_TITLE[st] || ('Upload state: ' + st)) +
+               '">' + esc(st) + '</span>';
+    }
+
+    // Dot, for the task history, where a chip per line would double the list.
+    function uploadDotHtml(task) {
+        const st = uploadState(task);
+        if (!st) return '';
+        return '<span class="upload-dot ' + (UPLOAD_CLASS[st] || 'upload-done') +
+               '" title="' + esc(UPLOAD_TITLE[st] || ('Upload state: ' + st)) +
+               '"></span>';
+    }
+
+    function taskNameHtml(task) {
+        const label = taskLabel(task);
+        const name = esc(label);
+        const url = sessionUrl(task);
+        // Blue + underlined is reserved for a recording that has actually
+        // landed. A session with no id cannot be opened at all, so it stays a
+        // plain name however complete its upload is — colouring an unclickable
+        // name like a link would be the misleading half of the trade.
+        const uploaded = uploadState(task) === UPLOAD_DONE;
+        const body = url
+            ? '<a class="task-link' + (uploaded ? ' task-link-uploaded' : '') +
+              '" href="' + esc(url) + '" target="_blank" rel="noopener noreferrer" ' +
+              'title="' + esc(uploaded
+                  ? 'Open this recording in ops.'
+                  : 'Open this recording in ops. It has not finished uploading, ' +
+                    'so the cloud copy may be incomplete.') + '">' +
+              name + '</a>'
+            : '<span class="task-name-plain">' + name + '</span>';
+        return body + (UNKNOWN_TASK_LABELS.includes(label) ? unknownTaskInfoHtml() : '');
+    }
+
+    function unknownTaskInfoHtml() {
+        return '<button type="button" class="task-info-btn" ' +
+                   'onclick="toggleTaskInfo(event)" ' +
+                   'aria-label="Why is this task name unknown?" ' +
+                   'title="' + esc(UNKNOWN_TASK_HELP) + '">i</button>' +
+               '<span class="task-unknown-note hidden">' +
+                   esc(UNKNOWN_TASK_HELP) + '</span>';
+    }
+
+    // The button sits inside the rank row, whose own click expands the row.
+    // Without the guard, reading the explanation would also collapse what
+    // is being read.
+    function toggleTaskInfo(evt) {
+        evt.preventDefault();
+        evt.stopPropagation();
+        const note = evt.currentTarget.nextElementSibling;
+        if (note) note.classList.toggle('hidden');
+    }
+
+    // ── Completed task history: one number when the two agree ────────────
+    // Showing "01:04:58 (01:05:01)" spends a whole column on a three-second
+    // disagreement that means nothing. Inside the window the two figures are
+    // the same measurement, so only the API's own number is printed — it is
+    // the measured one — and the estimate is dropped rather than shown twice.
+    // Outside it the pair still renders, because then the gap is the point.
+    const DUR_AGREE_S = 5;
+
+    function taskDurationHtml(task) {
+        const api = task.duration_api_s;
+        if (api === null || api === undefined) {
+            return '(' + esc(formatDuration(task.duration_s)) + ')';
+        }
+        if (Math.abs(Number(api) - Number(task.duration_s)) <= DUR_AGREE_S) {
+            return '<span title="Fleet API duration. The head-camera byte ' +
+                   'estimate agreed within ' + DUR_AGREE_S + 's, so it is not ' +
+                   'shown separately.">(' + esc(formatDuration(api)) + ')</span>';
+        }
+        return '(' + esc(formatDuration(task.duration_s)) + ')' + apiDurationHtml(task);
+    }
+
     let taskHistoryReverse = false;
     try { taskHistoryReverse = localStorage.getItem('fleet_task_history_reverse') === '1'; } catch (e) {}
 
@@ -3992,11 +4348,9 @@
             const ordered = [...tasks].sort((x, y) => (y.start_time || 0) - (x.start_time || 0));
             ordered.slice(0, 10).forEach(task => {
                 const startStr = formatStart(task);
-                const dur = formatDuration(task.duration_s);
-                const taskName = taskLabel(task);
                 const cls = task.test ? 'task-entry task-excluded' : 'task-entry';
                 const tip = task.test ? ' title="Test session — not counted in the ranked totals"' : '';
-                html += `<div class="${cls}"${tip}>${esc(startStr)} — ${esc(task.operator)} / ${esc(taskName)} (${dur})${apiDurationHtml(task)}</div>`;
+                html += `<div class="${cls}"${tip}>${uploadDotHtml(task)}${esc(startStr)} — ${esc(task.operator)} / ${taskNameHtml(task)} ${taskDurationHtml(task)}</div>`;
             });
             html += '</div>';
         });

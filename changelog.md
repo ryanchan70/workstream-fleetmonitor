@@ -1,5 +1,15 @@
 # changelog
 
+## 08/26
+- added pi status to ranked pi timing to tell if tasks are outdated because a pi is offline
+- made data capture links more obvious + upload status
+
+## 08/25
+- added v2.0 and v2.1 buttons to select a whole hardware generation at once (rpi5 = v2.0, rock5c = v2.1)
+- added AM/PM or 24hr toggle for entire page
+- if API and estimates are within 5 seconds, assumes API is correct
+- added hyperlinks straight to **Data Capture**
+
 ## 08/24
 - removed y-intercept from linear regression (a recording with no time should be 0 bytes)
 
@@ -155,6 +165,12 @@
 
 - long-term: add scheduling integration
 
+- long-term: add multiple programs if given permission
+
+- option to adjust time zone
+
+- more obvious toggles at the top of page
+
 - hours of tasks per type
   - break it down into by day
 
@@ -164,8 +180,6 @@
 
 - export completed tasks to csv/txt
 
-- option to have AM/PM displayed in terminal dump
-
 - custom sound effects 
 
-###### last updated 08/24 4:44PM PDT
+###### last updated 08/25 2:28PM PDT

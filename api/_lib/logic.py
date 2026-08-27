@@ -1192,6 +1192,10 @@ def _reconcile_unknown(entries, fresh):
             e["duration_s"] = f["duration_s"]
             e["start_time"] = f["start_time"]
             e["src"] = "api"
+            # The live row was written before the API knew this session's id,
+            # so the link arrives with the reconciliation or not at all.
+            if f.get("session_id"):
+                e["session_id"] = f["session_id"]
             # f's duration is the byte estimate wherever there is one; carry
             # the API's own span across too, or this row would show an
             # estimated duration with nothing to compare it against.
@@ -1334,10 +1338,18 @@ def backfill(force: bool = False) -> dict:
                 if dur <= 0:
                     continue
                 session_count += 1
-                sid = rec.get("id") or rec.get("session_uuid") or f"{label}|{rec.get('name')}"
+                # The ops console addresses a recording by its own id. Kept
+                # apart from `sid` below: sid falls back to a label|name pair
+                # so the hash always has a key, and that synthetic string is
+                # not something ops can resolve — only a real id is stored,
+                # and a session without one simply gets no link.
+                real_id = C.clean_str(rec.get("id") or rec.get("session_id")
+                                      or rec.get("session_uuid"), "") or None
+                sid = real_id or f"{label}|{rec.get('name')}"
                 entry = {
                     "date": C.session_date(rec),
                     "duration_s": dur,
+                    "session_id": real_id,
                     # Stored so past-day rankings can name the rig. Every
                     # hostname is of the form rpi5-xxxx-xxxx, which trips
                     # is_unnamed_pi() — without the label the session gets
@@ -1357,6 +1369,12 @@ def backfill(force: bool = False) -> dict:
                     # gap back.
                     "head_bytes": (C.extract_head_bytes(rec)
                                    or (existing.get(sid) or {}).get("head_bytes")),
+                    # Whether the recording has actually reached the cloud.
+                    # Unlike head_bytes there is no falling back to the stored
+                    # value: this one is expected to change — waiting ->
+                    # uploading -> uploaded — and a stale "uploading" outlives
+                    # the upload it described.
+                    "upload_state": C.extract_upload_state(rec),
                 }
                 if existing.get(sid) != entry:
                     new_sessions[sid] = entry
@@ -1399,6 +1417,10 @@ def backfill(force: bool = False) -> dict:
                     "start_time": entry["start_unix"],
                     "src": "api",
                 }
+                if entry.get("session_id"):
+                    task["session_id"] = entry["session_id"]
+                if entry.get("upload_state"):
+                    task["upload_state"] = entry["upload_state"]
                 if api_dur is not None:
                     task["duration_api_s"] = api_dur
                 # Listed under the rig and the operator, greyed out, but left
@@ -1441,7 +1463,7 @@ def backfill(force: bool = False) -> dict:
             # correcting. Keyed off the days that moved, so settled days are
             # not re-fetched every sweep.
             for d in changed:
-                R.cmd("DEL", R.P + "daytasks:" + d)
+                R.cmd("DEL", R.P + "daytasks:v2:" + d)
 
         # Stamped only once the sweep has actually succeeded. Stamping up front
         # meant any failure — an unreachable fleet API, missing credentials —

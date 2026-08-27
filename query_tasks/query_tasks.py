@@ -46,11 +46,10 @@ OUTPUT
 
                            core     row_type, date, weekday, pi_id, pi_name,
                                     operator, operator_user_id, task_name,
-                                    instruction, folder, session_id, link,
+                                    folder, session_id, link,
                                     start_time, end_time, start_iso,
                                     duration_s, duration_hhmmss, duration_hours
-                           program  environment, location, mission_id,
-                                    is_test
+                           program  location, is_test
                            sizes    total_bytes, size_label, mcap_count,
                                     mcap_files, upload_status
                                     — from the sessions listing, NOT from
@@ -62,8 +61,13 @@ OUTPUT
                                     mounts — head, chest, wrist_left,
                                     wrist_right):
                                     <pos>_device_kind, <pos>_streams, and
-                                    <pos>_video_codec/_fps/_resolution/
-                                    _topic/_mcap
+                                    <pos>_video_codec/_fps/_resolution;
+                                    head also gets head_video_mcap
+
+                           The groups decide WHICH columns are written; the
+                           order they appear in is FIELD_ORDER, which front-
+                           loads task_name, duration_hhmmss, link and the two
+                           timestamps rather than following the group order.
                            outcome  status, stop_reason, restart_reason,
                                     failure_reason, failed_roles,
                                     start_waived_roles, trigger_source,
@@ -691,13 +695,13 @@ def _start_unix(manifest: dict, rec: dict):
 COLUMN_GROUPS: dict[str, list[str]] = {
     "core": [
         "row_type", "date", "weekday", "pi_id", "pi_name",
-        "operator", "operator_user_id", "task_name", "instruction",
+        "operator", "operator_user_id", "task_name",
         "folder", "session_id", "link",
         "start_time", "end_time", "start_iso",
         "duration_s", "duration_hhmmss", "duration_hours",
     ],
     "program": [
-        "environment", "location", "mission_id", "is_test",
+        "location", "is_test",
     ],
     "sizes": [
         "total_bytes", "size_label", "mcap_count", "mcap_files", "upload_status",
@@ -724,8 +728,55 @@ GROUP_ORDER = ["core", "program", "sizes", "capture", "outcome"]
 # by which rigs answered this run. See POSITIONS in the module docstring.
 POSITION_COLUMNS = [
     "device_kind", "streams",
-    "video_codec", "video_fps", "video_resolution", "video_topic", "video_mcap",
+    "video_codec", "video_fps", "video_resolution",
 ]
+
+# Columns only some positions carry. The head camera is the one every rig
+# mounts and the one whose mcap actually gets opened for review, so it keeps
+# a video_mcap column; repeating it for the other three widened the header
+# without anyone reading it.
+POSITION_EXTRA_COLUMNS: dict[str, list[str]] = {
+    "head": ["video_mcap"],
+}
+
+
+def position_columns(pos: str) -> list[str]:
+    return POSITION_COLUMNS + POSITION_EXTRA_COLUMNS.get(pos, [])
+
+
+# Where the per-position blocks are spliced into FIELD_ORDER.
+POSITION_BLOCK = "\x00positions"
+
+# The header order, spelled out. It deliberately no longer follows
+# GROUP_ORDER: the columns a reader scans first — task, duration, link, the
+# two timestamps — are pulled to the front regardless of which group owns
+# them, and the bulkier identity and byte-count columns sit behind them. So
+# the groups decide only WHICH columns are written, and this list decides
+# where each one lands.
+FIELD_ORDER = [
+    "row_type", "date", "weekday", "pi_id", "pi_name",
+    "operator", "task_name", "duration_hhmmss", "link",
+    "start_time", "end_time", "size_label", "duration_s",
+    "start_iso", "duration_hours", "location", "total_bytes",
+    "session_id", "folder", "camera_roles", "operator_user_id",
+    "is_test", "mcap_count", "mcap_files", "upload_status",
+    "capture_format", "role_sources", "stream_count",
+    POSITION_BLOCK,
+    "status", "stop_reason", "restart_reason", "failure_reason",
+    "failed_roles", "start_waived_roles",
+    "trigger_source", "trigger_client",
+    "software_version", "capture_script_revision", "capture_script_branch",
+    "capture_script_dirty", "depthai_version", "platform", "python_version",
+    "stereo_complete_pairs", "stop_elapsed_s", "process_start_unix",
+]
+
+# A column added to a group but forgotten here would not be dropped loudly —
+# it would simply never reach the file. Fail at import instead.
+_missing_from_order = [c for g in GROUP_ORDER for c in COLUMN_GROUPS[g]
+                       if c not in FIELD_ORDER]
+if _missing_from_order:
+    raise RuntimeError("FIELD_ORDER is missing grouped column(s): "
+                       + ", ".join(_missing_from_order))
 
 
 def resolve_groups(spec: str) -> list[str]:
@@ -750,15 +801,19 @@ REQUIRED_FIELDS = ["row_type", "session_id"]
 
 
 def build_fields(groups: list[str], positions: list[str]) -> list[str]:
-    fields: list[str] = []
+    selected = set(REQUIRED_FIELDS)
     for g in groups:
-        fields.extend(COLUMN_GROUPS[g])
-        if g == "capture":
-            for pos in positions:
-                fields.extend(f"{pos}_{c}" for c in POSITION_COLUMNS)
-    for i, name in enumerate(REQUIRED_FIELDS):
-        if name not in fields:
-            fields.insert(i, name)
+        selected.update(COLUMN_GROUPS[g])
+    want_positions = "capture" in groups
+
+    fields: list[str] = []
+    for name in FIELD_ORDER:
+        if name == POSITION_BLOCK:
+            if want_positions:
+                for pos in positions:
+                    fields.extend(f"{pos}_{c}" for c in position_columns(pos))
+        elif name in selected:
+            fields.append(name)
     return fields
 
 
@@ -856,6 +911,10 @@ def enrich(entry: dict, positions: list[str]) -> dict:
                      or "Unknown").strip(),
         "operator_user_id": _joined(manifest.get("operator_user_id")),
         "task_name": task or "(no task)",
+        # instruction, environment, mission_id and <pos>_video_topic are still
+        # gathered but are not in FIELD_ORDER, so write_csv drops them
+        # (extrasaction="ignore"). Putting one back into COLUMN_GROUPS and
+        # FIELD_ORDER is all it takes to have it in the report again.
         "instruction": _joined(manifest.get("instruction")),
         # The rig's own YYYYMMDD_HHMMSS directory name. session-json calls it
         # session_id, which is NOT the UUID the rest of the fleet means by
@@ -1187,6 +1246,17 @@ def read_existing_rows(path: str) -> dict[str, dict[str, str]]:
         return {}
 
 
+def existing_header(path: str) -> list[str]:
+    """The header row already in the file, or [] if there isn't one."""
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            return csv.reader(f).__next__()
+    except (OSError, csv.Error, StopIteration):
+        return []
+
+
 def ends_with_newline(path: str) -> bool:
     try:
         with open(path, "rb") as f:
@@ -1231,6 +1301,24 @@ def write_csv(path: str, fields: list[str], rows: list[dict],
         os.makedirs(d, exist_ok=True)
 
     if append_mode:
+        # Appending writes values positionally against the header already in
+        # the file. If this run's columns differ from that header — a column
+        # added or dropped, or FIELD_ORDER changed — every appended row would
+        # land one or more columns out of step, silently. Refuse instead.
+        prior = existing_header(path)
+        if prior and prior != fields:
+            pad = [None] * max(len(prior), len(fields))
+            diff = next((f"column {i + 1}: file has {a!r}, this run writes {b!r}"
+                         for i, (a, b) in enumerate(zip(prior + pad, fields + pad))
+                         if a != b), "length only")
+            sys.exit(f"cannot append to {path}: its header does not match this "
+                     f"run's columns.\n"
+                     f"  file has {len(prior)} column(s), this run writes "
+                     f"{len(fields)}\n"
+                     f"  {diff}\n"
+                     f"  set append=n to rewrite the file, or move the old one "
+                     f"aside.")
+
         existing = set(read_existing_rows(path))
         rows_to_write = [r for r in rows
                          if r.get("row_type") != "SESSION"

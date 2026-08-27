@@ -592,7 +592,12 @@ class handler(BaseHTTPRequestHandler):
         if not date or C.is_weekend(date):
             return {"date": date, "tasks": []}
 
-        key = "daytasks:" + date
+        # Versioned: a cached day is kept forever and only dropped when its
+        # total moves, so a change to the ROW SHAPE — session_id and
+        # upload_state here — would otherwise never reach a day that had
+        # already settled. Bump this suffix whenever a field is added to the
+        # task dicts below.
+        key = "daytasks:v3:" + date
         cached = R.jget(key)
         if isinstance(cached, list):
             return {"date": date, "tasks": cached, "cached": True}
@@ -621,6 +626,16 @@ class handler(BaseHTTPRequestHandler):
                     "duration_s": dur,
                     "start_time": sess.get("start_unix"),
                 }
+                # Links the row through to the recording in the ops console.
+                # Only sessions swept in since the id was first stored carry
+                # one; the dashboard renders a plain name for the rest.
+                if sess.get("session_id"):
+                    task["session_id"] = sess["session_id"]
+                # Whether the recording is actually in the cloud yet. Absent on
+                # sessions swept in before this was stored, which the dashboard
+                # reads as "unknown" and leaves unmarked.
+                if sess.get("upload_state"):
+                    task["upload_state"] = sess["upload_state"]
                 # Present on every estimated session; the dashboard shows it in
                 # parentheses next to the duration above, tinted by how far the
                 # two have drifted apart.
@@ -633,7 +648,16 @@ class handler(BaseHTTPRequestHandler):
                 out.append(task)
 
         out.sort(key=lambda t: t.get("start_time") or 0, reverse=True)
-        if date != C.get_date_str():
+        # A past day is cached forever and never invalidated, so it must only
+        # be frozen once it is genuinely settled. Upload state is the one field
+        # here that keeps moving after the day is over: a recording still
+        # uploading or queued at midnight lands sometime the next morning, and
+        # caching the day now would leave it claiming "uploading" for good.
+        # Unknown state ("" — a session swept in before this was stored) is
+        # NOT pending; treating it as such would make every old day uncacheable.
+        upload_settled = not any(C.upload_pending(t.get("upload_state", ""))
+                                 for t in out)
+        if date != C.get_date_str() and upload_settled:
             R.jset(key, out)
         return {"date": date, "tasks": out}
 

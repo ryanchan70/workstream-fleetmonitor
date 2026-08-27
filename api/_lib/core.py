@@ -759,6 +759,37 @@ def _positive_number(value):
     return n if n > 0 else None
 
 
+def extract_upload_state(rec: dict) -> str:
+    """The session's upload state, lowercased, or "" if the API said nothing.
+
+    The fleet API reports "uploaded" once every recording has landed,
+    "uploading" while bytes are moving, and "waiting" when a recording is
+    queued but the uploader has not started on it. Anything else it grows
+    later is passed through as-is rather than forced into one of the three.
+
+    Older fleet builds carry no upload_state at all. "" is what tells the
+    dashboard to say nothing, rather than to claim a finished session is
+    still going up — which is why the caller must not read "not uploaded"
+    as "still uploading".
+    """
+    v = rec.get("upload_state") or rec.get("upload_label")
+    return str(v or "").strip().lower()
+
+
+UPLOAD_DONE = "uploaded"
+
+
+def upload_pending(state: str) -> bool:
+    """True while a session still owes bytes to the cloud.
+
+    Deliberately not `state != UPLOAD_DONE`: "" means the API reported no
+    state at all, and an unknown session must not be treated as one that is
+    still going up — sessions swept in before upload_state was stored would
+    otherwise all read as pending forever.
+    """
+    return bool(state) and state != UPLOAD_DONE
+
+
 def extract_head_bytes(rec: dict):
     """Bytes written by the head camera for one session, or None.
 
